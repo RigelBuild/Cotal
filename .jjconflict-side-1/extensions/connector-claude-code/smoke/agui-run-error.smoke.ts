@@ -1,0 +1,319 @@
+/**
+ * A FAILED CLAUDE TURN MUST NOT BE PUBLISHED AS A FINISHED ONE (#596).
+ *
+ * **THE DEFECT.** Claude Code ends a turn on one of two hooks, and it picks between them itself:
+ * `Stop` when the model finished responding, `StopFailure` when the turn died on an API error. The
+ * connector registers both (`hooks/hooks.json`) and used to handle them in ONE arm, closing the run
+ * the same way for each — so a turn killed by `rate_limit`, `billing_error` or `server_error` was
+ * published as `RUN_FINISHED`, byte-identical to a turn that succeeded. `RUN_ERROR` is in the
+ * vocabulary, the bracket machine accepts it as a close and the dashboard renders it with its code;
+ * the shared close path simply had no way to say it.
+ *
+ * **THE STARTUP-CURSOR DEFECT.** A positional prompt is already a complete JSONL record when
+ * `SessionStart` reaches the connector. The generic fresh-adopt contract correctly parks at the
+ * current boundary to avoid replaying retained history, but on a genuinely new `source: "startup"`
+ * session that parks AFTER the only record that can open the first run. Assistant/tool records then
+ * map to nothing and the subject stays empty. This suite writes the prompt first, drives the real
+ * SessionStart source through the holder, appends the answer, and requires both turns on the broker.
+ *
+ * **THE LIVE FOLLOW-UP.** Claude runs hooks in separate processes. On the released 0.33.4 path the
+ * positional prompt's `UserPromptSubmit` relay reached the MCP handler before `SessionStart`; the
+ * early flush started the holder with `undefined`, and the new source guard correctly stopped with
+ * “unsupported source undefined”. This suite now carries the reordering through `StopFailure` before
+ * SessionStart, so adopt → flush → close must be restored by the shipped handler itself.
+ *
+ * **THE HANDLER IS THE SHIPPED ONE AND THE BROKER IS REAL.** `createClaudeHandle` from `src` runs
+ * against a real `nats-server`, over a real `AguiEmitterHolder` reading a real transcript file
+ * through a real write-ahead log — the holder is assembled here exactly as `mcp.ts` assembles it.
+ * Every claim below is read back OFF THE SUBJECT by a second endpoint, because the claim is about
+ * what an observer of the channel sees, in order.
+ *
+ * **WHAT WOULD MAKE THIS THE WRONG EXPERIMENT**, named before the run rather than found after:
+ *   - an emitter that never started publishes nothing, and a suite that reads zero everywhere
+ *     "confirms" whatever it was pointed at. Both turns' text is graded on its own cell.
+ *   - the `StopFailure` payload is the harness's, not this file's invention: `hook_event_name`,
+ *     a REQUIRED `error` naming one of eleven failure kinds, and an optional free-text
+ *     `error_details`. A fixture that fabricated a different field name would prove the mapping
+ *     reads something Claude Code never sends. It is driven here in the shape the harness ships.
+ *   - a blanket "the turn ended, so call it an error" would pass every failure cell here and still
+ *     be wrong. The `Stop` phase is the positive control for that, and it is why this file drives
+ *     two turn-ends rather than one.
+ *
+ * Run: pnpm smoke:claude-run-error   (needs nats-server on PATH; starts its own broker)
+ */
+import { strict as assert } from "node:assert";
+import { spawn } from "node:child_process";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, appendFileSync } from "node:fs";
+import { once } from "node:events";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { randomUUID } from "node:crypto";
+import { CotalEndpoint, seedChannelRegistry, isReachable, principalKey } from "@cotal-ai/core";
+import {
+  MeshAgent,
+  configFromEnv,
+  AguiEmitter,
+  AguiEmitterHolder,
+  EventWal,
+  FileSubjectFrontier,
+  ensureEventWalDir,
+  resolveEventsStateRoot,
+  type HookEvent,
+  JsonlFileSource,
+} from "@cotal-ai/connector-core";
+import { createClaudeMapper, type ClaudeEntry, type ClaudeMapper } from "../src/agui-map.js";
+import { createClaudeHandle } from "../src/hooks.js";
+import { createClaudeTranscriptSource } from "../src/agui-source.js";
+import { SMOKE_BROKER_TOKEN, awaitBrokerReady, freePort, teardownOnSignal } from "@cotal-ai/smoke-kit";
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+const PORT = await freePort();
+const servers = `nats://127.0.0.1:${PORT}`;
+const SPACE = "ccrunerr";
+// The identity the session authenticates as decides the subject, so the channel is named from it.
+const CHANNEL = "events.local.cass";
+const THREAD = "sess-run-error";
+
+const dir = mkdtempSync(join(tmpdir(), SMOKE_BROKER_TOKEN));
+mkdirSync(join(dir, "ws"), { recursive: true });
+const transcript = join(dir, `${THREAD}.jsonl`);
+writeFileSync(transcript, "");
+const broker = spawn("nats-server", ["-js", "-p", String(PORT), "-sd", join(dir, "js")], { stdio: "ignore" });
+const releaseBroker = teardownOnSignal(broker, dir);
+
+let pass = 0;
+let fail = 0;
+const check = (name: string, cond: boolean, extra?: unknown): void => {
+  if (cond) {
+    pass++;
+    console.log(`  ✓ ${name}`);
+    return;
+  }
+  fail++;
+  console.log(`  ✗ ${name}${extra !== undefined ? ` - ${JSON.stringify(extra)}` : ""}`);
+};
+
+/** One prompt, in the transcript's own shape. Kept separate from the assistant record because a
+ *  positional `--prompt` launch writes this record BEFORE SessionStart reaches the connector. */
+function prompt(n: number): string {
+  return (
+    JSON.stringify({
+      type: "user",
+      uuid: `u-${n}`,
+      sessionId: THREAD,
+      timestamp: new Date(1_700_000_000_000 + n * 1000).toISOString(),
+      origin: { kind: "human" },
+      message: { content: `prompt ${n}` },
+    }) + "\n"
+  );
+}
+
+/** The assistant text carries the turn number so a cell can LOCATE one turn in the replayed stream
+ *  instead of counting and hoping. */
+function answer(n: number): string {
+  return (
+    JSON.stringify({
+      type: "assistant",
+      uuid: `a-${n}`,
+      sessionId: THREAD,
+      timestamp: new Date(1_700_000_000_000 + n * 1000 + 1).toISOString(),
+      message: { id: `msg-${n}`, content: [{ type: "text", text: `answer-${n}` }] },
+    }) + "\n"
+  );
+}
+
+function turn(n: number): string {
+  return prompt(n) + answer(n);
+}
+
+// The connector reads its identity from COTAL_* env. Scrub what this process inherited: a live
+// seat's creds would point these cells at someone else's broker.
+for (const k of Object.keys(process.env)) if (k.startsWith("COTAL_")) delete process.env[k];
+Object.assign(process.env, {
+  COTAL_NAME: "Cass",
+  COTAL_ID: "cass",
+  COTAL_SPACE: SPACE,
+  COTAL_SERVERS: servers,
+  COTAL_ROLE: "generalist",
+  COTAL_EVENTS: "1",
+  COTAL_WORKSPACE_ROOT: join(dir, "ws"),
+});
+
+const config = configFromEnv();
+config.connector = "claude";
+const agent = new MeshAgent(config);
+agent.on?.("error", () => {});
+
+// The holder, ASSEMBLED AS `mcp.ts` ASSEMBLES IT. Copied rather than imported because `mcp.ts` is a
+// process entry point that owns a control server and an MCP transport; what is under test is the
+// hook arm above it, and the seam between them is this object.
+let mapper: ClaudeMapper | undefined;
+const events = new AguiEmitterHolder<ClaudeEntry, unknown>(
+  async (transcriptPath: string, sessionSource: unknown) => {
+    const workspaceRoot = resolveEventsStateRoot(process.env);
+    const threadId = THREAD;
+    const principal = principalKey(agent.ep.principal.owner, agent.ep.principal.actor).key;
+    const { walPath, subjectPath } = await ensureEventWalDir({ workspaceRoot, space: config.space, principal, threadId });
+    const subjectFrontier = await FileSubjectFrontier.open(subjectPath, { space: config.space, principal });
+    const wal = await EventWal.open(walPath, { space: config.space, threadId, principal, subjectMayExist: false });
+    mapper = createClaudeMapper({ threadId, mintRunId: () => randomUUID() });
+    return AguiEmitter.start<ClaudeEntry>({
+      endpoint: agent.ep,
+      wal,
+      subjectFrontier,
+      source: createClaudeTranscriptSource(transcriptPath, sessionSource),
+      map: mapper.map,
+    });
+  },
+  {
+    onError: (e: Error) => console.log(`  [emitter stopped] ${e.message}`),
+    onRunClosed: (runId: string) => mapper?.forgetOpenRun(runId),
+    sourceEnd: (path: string) => new JsonlFileSource<ClaudeEntry>(path).end(),
+  },
+);
+
+const claude = createClaudeHandle({ events: () => events });
+
+try {
+  await awaitBrokerReady(() => isReachable(servers), { servers, attempts: 50, delayMs: 200 });
+  await seedChannelRegistry({
+    servers,
+    space: SPACE,
+    // Replay is on so the whole stream can be read back at the end and graded as an ORDER.
+    file: { defaults: { replay: false }, channels: { [CHANNEL]: { replay: true } } },
+  });
+  agent.start();
+  await sleep(2_000);
+
+  const hook = (ev: Record<string, unknown>): Promise<unknown> =>
+    claude.handle(agent, { transcript_path: transcript, ...ev } as HookEvent);
+
+  // THE LIVE POSITIONAL-PROMPT ORDER. Claude writes the run-opening prompt record before its
+  // SessionStart hook reaches this connector. A generic fresh adopt parks after that complete record,
+  // so the later assistant/tool records have no run to attach to and the whole event plane stays
+  // empty. `source: "startup"` is Claude's explicit discriminator for a new session; resume, fork,
+  // clear and compact must still adopt at the current boundary rather than replaying history.
+  writeFileSync(transcript, prompt(1));
+  // LIVE RACE: Claude launches separate hook processes, and the positional prompt's
+  // UserPromptSubmit relay can reach the connector before SessionStart. The first flush must wait
+  // for SessionStart's source instead of starting the holder with an undefined context.
+  await hook({ hook_event_name: "UserPromptSubmit" });
+
+  // Carry the race through the terminal so the queued flush AND close are load-bearing. The live
+  // failure only needed UserPromptSubmit to win; separate hook processes have no ordering fence, so
+  // a loaded host must not turn a later StopFailure into another undefined-context start either.
+  appendFileSync(transcript, answer(1));
+  await hook({
+    hook_event_name: "StopFailure",
+    error: "rate_limit",
+    error_details: "Claude AI usage limit reached",
+  });
+  await hook({ hook_event_name: "SessionStart", source: "startup" });
+  await sleep(2_000);
+  const failurePresence = (await agent.readRoster()).roster.find((p) => p.card.id === agent.ep.card.id)?.condition;
+  check(
+    "presence:StopFailure relays the native code and detail as a rate-limit condition",
+    failurePresence?.code === "rate_limit"
+      && failurePresence.source === "rate_limit"
+      && failurePresence.message === "Claude AI usage limit reached",
+    failurePresence,
+  );
+
+  // ---- Turn 2: a real turn that ENDS NORMALLY. The control that says the mapping is not blanket.
+  appendFileSync(transcript, turn(2));
+  await hook({ hook_event_name: "UserPromptSubmit" });
+  await sleep(500);
+  check(
+    "presence:a normal next turn clears the prior condition",
+    (await agent.readRoster()).roster.find((p) => p.card.id === agent.ep.card.id)?.condition === undefined,
+    (await agent.readRoster()).roster.find((p) => p.card.id === agent.ep.card.id),
+  );
+  await hook({ hook_event_name: "Notification", notification_type: "permission_prompt", message: "Approve Bash" });
+  await sleep(300);
+  check(
+    "presence:a permission notification relays approval",
+    (await agent.readRoster()).roster.find((p) => p.card.id === agent.ep.card.id)?.condition?.code === "approval",
+    (await agent.readRoster()).roster.find((p) => p.card.id === agent.ep.card.id),
+  );
+  await hook({ hook_event_name: "Notification", notification_type: "agent_needs_input", message: "Choose a target" });
+  await sleep(300);
+  const inputCondition = (await agent.readRoster()).roster.find((p) => p.card.id === agent.ep.card.id)?.condition;
+  check(
+    "presence:an agent-needs-input notification relays input and keeps the native source",
+    inputCondition?.code === "input" && inputCondition.source === "agent_needs_input",
+    inputCondition,
+  );
+  await hook({ hook_event_name: "Stop" });
+  await sleep(2_000);
+  await events.settled();
+
+  // ---- Read the whole stream back from the broker and grade it as an ORDER.
+  const reader = new CotalEndpoint({
+    space: SPACE, servers, card: { name: "Reader", kind: "agent", id: "reader" }, channels: [CHANNEL],
+  });
+  reader.on("error", () => {});
+  type Ev = { type: string; text: string; message: string; code: string };
+  const seen: Ev[] = [];
+  reader.on("message", (m: { channel?: string; parts?: { data?: unknown }[] }) => {
+    if (m?.channel !== CHANNEL) return;
+    for (const p of m.parts ?? []) {
+      const d = (p as { data?: { events?: unknown[] } }).data ?? p;
+      for (const e of ((d as { events?: unknown[] }).events ?? []) as Record<string, unknown>[])
+        seen.push({
+          type: String(e.type ?? "?"),
+          text: String(e.delta ?? ""),
+          message: String(e.message ?? ""),
+          code: String(e.code ?? ""),
+        });
+    }
+  });
+  await reader.start();
+  await sleep(3_000);
+  await reader.stop().catch(() => {});
+
+  check("control:the stream reads back non-empty, so the order cells below grade something",
+    seen.length > 0, { frames: seen.length });
+
+  const idx = (pred: (e: Ev) => boolean): number => seen.findIndex(pred);
+  const a1 = idx((e) => e.text.includes("answer-1"));
+  const a2 = idx((e) => e.text.includes("answer-2"));
+  check("control:BOTH turns reached the subject, in order — a stream missing one grades nothing below",
+    a1 >= 0 && a2 >= 0 && a1 < a2, { a1, a2 });
+
+  const isClose = (e: Ev): boolean => e.type === "RUN_FINISHED" || e.type === "RUN_ERROR";
+  // SECTION-BOUNDED, never a scan of the whole stream: each turn's close is looked for only in the
+  // window between that turn's own text and the next turn's. A whole-stream scan would happily
+  // match the OTHER turn's close and report the wrong evidence.
+  const closesBetween = (from: number, to: number): Ev[] =>
+    seen.slice(from + 1, to < 0 ? seen.length : to).filter(isClose);
+  const failedTurnCloses = closesBetween(a1, a2);
+  const normalTurnCloses = closesBetween(a2, -1);
+
+  check("fail:the StopFailure turn closed EXACTLY ONCE — `RUN_ERROR` closes a run, so nothing may follow it",
+    failedTurnCloses.length === 1, failedTurnCloses);
+  check("fail:and that close is RUN_ERROR, not RUN_FINISHED — THE DEFECT",
+    failedTurnCloses[0]?.type === "RUN_ERROR", failedTurnCloses[0]);
+  check("fail:the RUN_ERROR carries the fixed message and no code",
+    failedTurnCloses[0]?.message === "run failed" && !failedTurnCloses[0]?.code,
+    failedTurnCloses[0]);
+
+  check("stop:the normally-ended turn closed exactly once", normalTurnCloses.length === 1, normalTurnCloses);
+  check("stop:and THAT close is RUN_FINISHED — `Stop` is not a failure, and a blanket mapping would fail here",
+    normalTurnCloses[0]?.type === "RUN_FINISHED", normalTurnCloses[0]);
+
+  // ---- Cell count, because a harness that threw early would DELETE cells rather than fail them.
+  const EXPECTED = 11;
+  check(`every cell ran - ${EXPECTED} expected, a cell that vanishes is invisible without this`,
+    pass + fail === EXPECTED, `${pass + fail} cells reported`);
+
+  console.log(`claude-run-error smoke: ${pass} passed, ${fail} failed`);
+} finally {
+  await agent.stop?.().catch?.(() => {});
+  broker.kill("SIGKILL");
+  await sleep(150);
+  rmSync(dir, { recursive: true, force: true });
+  releaseBroker();
+}
+assert.ok(true);
+process.exit(fail === 0 ? 0 : 1);

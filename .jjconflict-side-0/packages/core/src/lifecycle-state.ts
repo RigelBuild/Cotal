@@ -1,0 +1,556 @@
+/**
+ * The §13.1 lifecycle STATE grammar: the wire-normative key shapes, closed value schemas, and
+ * state sets for the lifecycle alias head (`lifecycle.<owner>.<actor>`), the space-global UID
+ * reservation (`uid.<lifecycleUid>`), and the agent-family issuance gate (`gate.<lifecycleUid>`).
+ *
+ * This module is GRAMMAR ONLY, shared by every lifecycle executor (the user-mesh auth service
+ * and the manager's static lifecycle adapter): key construction, parse-at-the-consuming-boundary
+ * validation, and the state constants. The CAS SEQUENCING that produces these rows (activation
+ * saga, head retirement, gate transitions) and the barrier ORCHESTRATION (revoke/evict/ledger)
+ * live with their executors; a second copy of either is the dual-encoder drift this module
+ * exists to prevent.
+ */
+import { DIGEST_PREFIX, rawDigest } from "./canonical.js";
+import { parseServiceConnectionBinding, parseServiceGateAuthority, type ServiceConnectionBinding, type ServiceGateAuthority } from "./service-gate.js";
+import { EpEnvelopeError } from "./endpoint-envelope.js";
+import { LIFECYCLE_HEAD, UID_RESERVATION, recordAtomicKey, decodeRecordJson } from "./endpoint-records.js";
+import { assertLifecycleToken, endpointNameOf, endpointToken } from "./endpoint-subjects.js";
+import { parsePrincipalKey, isPrincipalOwnerToken } from "./subjects.js";
+
+const isRec = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === "object" && !Array.isArray(v);
+const uint = (v: unknown): v is number => typeof v === "number" && Number.isSafeInteger(v) && v >= 0;
+
+// ---- the head (records store) ---------------------------------------------------------------
+
+/** The `lifecycle.<owner>.<actor>` head value (§13.1, amended). One incarnation of an alias.
+ *  `mappingRevision` is NOT here: it is the head key's STORE revision (§13.1), returned beside
+ *  the mapping by the leader read. `currentCredentialId` stays ABSENT until the (3) normative
+ *  ledger mints under the reopened gate (an active head naming a released credential before the
+ *  ledger exists would be exactly the unledgered mint §13.1 forbids).
+ *
+ *  `state`: `active` is the ONLY current state. `retiring` = the terminal barrier's op-bound
+ *  containment phase (non-current, NOT replaceable). `retired` = terminal AND asserts the
+ *  completed barrier (only then may activation replace the alias, with a fresh UID). The
+ *  retirement `op` intent is REQUIRED at `retiring` and absent otherwise, as `parseLifecycleHead`
+ *  enforces it; carried in the type so a reader that has checked the state reads the op without
+ *  re-deriving the rule. */
+export type LifecycleMapping = ({ state: "active" | "retired"; op?: never } | { state: "retiring"; op: { opId: string; kind: "retirement" } }) & {
+  owner: string;
+  actor: string;
+  /** The never-reused, space-globally reserved lifecycle UID of THIS incarnation. */
+  lifecycleUid: string;
+  /** The minting/supervising authority. */
+  managerInstance: string;
+  /** The fenced process epoch (§13.1: live authority binds it; advanced only by the takeover
+   *  barrier). */
+  processEpoch: number;
+  /** The public credential fingerprint + authority epoch — absent until the ledger slice. */
+  currentCredentialId?: string;
+  /** The opId of the takeover operation that LAST advanced this epoch (SPEC 13.1: the epoch
+   *  advance and its op stamp are ONE CAS, so a completion is bound to exactly one operation).
+   *  A resuming barrier confirms the completed head carries ITS opId; a LOSING concurrent
+   *  takeover finds a foreign opId and refuses, never claiming the winner's completion. Absent
+   *  at initial activation (epoch 1), present from the first takeover. */
+  lastTakeoverOpId?: string;
+};
+
+export const LIFECYCLE_HEAD_STATES: ReadonlySet<string> = new Set(["active", "retiring", "retired"]);
+
+/** The head key `lifecycle.<owner>.<actor>` (§13.7: one atomic unsplit key). */
+export function lifecycleHeadKey(owner: string, actor: string): string {
+  return recordAtomicKey(LIFECYCLE_HEAD, [owner, actor]);
+}
+
+/** The space-global reservation key `uid.<lifecycleUid>` (§13.7: create-only, never-deleted). */
+export function uidReservationKey(lifecycleUid: string): string {
+  return recordAtomicKey(UID_RESERVATION, [lifecycleUid]);
+}
+
+/** Validate a head value at the consuming boundary — CLOSED schema (nested `op` included), and
+ *  the embedded owner/actor MUST agree with the key so a key-mismatched row never authorizes. */
+export function parseLifecycleHead(raw: Uint8Array, key: string, owner: string, actor: string): LifecycleMapping {
+  const o = decodeRecordJson(raw, key);
+  if (!isRec(o)) throw new EpEnvelopeError("internal", `the lifecycle head ${key} is not an object`);
+  const allowed = new Set(["owner", "actor", "lifecycleUid", "managerInstance", "processEpoch", "state", "currentCredentialId", "lastTakeoverOpId", "op"]);
+  for (const k of Object.keys(o)) if (!allowed.has(k)) throw new EpEnvelopeError("internal", `the lifecycle head ${key} carries the unknown field "${k}" (closed schema, SPEC 13.1)`);
+  if (
+    o.owner !== owner || o.actor !== actor ||
+    typeof o.lifecycleUid !== "string" || typeof o.managerInstance !== "string" || o.managerInstance.length === 0 ||
+    !uint(o.processEpoch) || o.processEpoch < 1 || typeof o.state !== "string" || !LIFECYCLE_HEAD_STATES.has(o.state) ||
+    (o.currentCredentialId !== undefined && (typeof o.currentCredentialId !== "string" || o.currentCredentialId.length === 0)) ||
+    (o.lastTakeoverOpId !== undefined && typeof o.lastTakeoverOpId !== "string")
+  )
+    throw new EpEnvelopeError("internal", `the lifecycle head ${key} does not validate (owner/actor/uid/epoch/state); a garbled or key-mismatched head never authorizes (SPEC 13.1/13.3)`);
+  try {
+    assertLifecycleToken(o.lifecycleUid);
+    if (o.lastTakeoverOpId !== undefined) assertLifecycleToken(o.lastTakeoverOpId);
+  } catch {
+    throw new EpEnvelopeError("internal", `the lifecycle head ${key} carries a malformed lifecycleUid/lastTakeoverOpId (SPEC 13.1)`);
+  }
+  // The retirement op intent: REQUIRED at `retiring`, forbidden elsewhere; itself closed.
+  if (o.state === "retiring") {
+    if (!isRec(o.op)) throw new EpEnvelopeError("internal", `the lifecycle head ${key} is retiring without its durable op intent (SPEC 13.1: retiring is op-bound)`);
+  } else if (o.op !== undefined) {
+    throw new EpEnvelopeError("internal", `the lifecycle head ${key} carries an op intent in state "${o.state}" (SPEC 13.1: only retiring is op-bound)`);
+  }
+  if (o.op !== undefined) {
+    const op = o.op as Record<string, unknown>;
+    for (const k of Object.keys(op)) if (k !== "opId" && k !== "kind") throw new EpEnvelopeError("internal", `the lifecycle head ${key} op intent carries the unknown field "${k}" (closed schema)`);
+    if (typeof op.opId !== "string" || op.kind !== "retirement")
+      throw new EpEnvelopeError("internal", `the lifecycle head ${key} op intent does not validate (SPEC 13.1)`);
+    try {
+      assertLifecycleToken(op.opId);
+    } catch {
+      throw new EpEnvelopeError("internal", `the lifecycle head ${key} op intent carries a malformed opId (SPEC 13.1)`);
+    }
+  }
+  return o as unknown as LifecycleMapping;
+}
+
+// ---- the issuance gate (auth store, agent family `gate.<lifecycleUid>`) ---------------------
+
+/** A gate's durable op intent (§13.1), one shape for both gate families. `successor` is a
+ *  per-kind summary token: only `takeover`/`registration` may carry one (their authoritative
+ *  successor artifacts live under `stage.<opId>.`); `activation`/`retirement` never do. */
+export interface GateOp {
+  opId: string;
+  kind: "activation" | "takeover" | "registration" | "retirement";
+  successor?: string;
+}
+
+/** A gate's state bound to its op intent as both gate parsers enforce it (§13.1): the op is
+ *  REQUIRED at `frozen` (which operation owns this freeze and may advance it) AND at `retired`
+ *  (the terminalizing op, audit + same-op idempotence), and absent at `open`. Carried in the
+ *  type so a reader that has checked the state reads the op without re-deriving the rule. */
+export type GateStateOp = { state: "open"; op?: never } | { state: "frozen" | "retired"; op: GateOp };
+
+/** The agent-family issuance gate row (§13.1, amended): the embedded uid MUST agree with the
+ *  key. (The disjoint ENDPOINT family `epgate.<endpoint>.<instanceId>` is separate.) */
+export type EpGateRow = GateStateOp & {
+  lifecycleUid: string;
+  /** Mint generation: born 0 under the activation freeze, first mintable generation is 1 (the
+   *  activation's reopen), and every barrier reopen advances it. */
+  generation: number;
+};
+
+export const ISSUANCE_GATE_STATES: ReadonlySet<string> = new Set(["open", "frozen", "retired"]);
+export const ISSUANCE_GATE_OP_KINDS: ReadonlySet<string> = new Set(["activation", "takeover", "registration", "retirement"]);
+
+/** The gate key `gate.<lifecycleUid>` (§13.7). */
+export function issuanceGateKey(lifecycleUid: string): string {
+  return `gate.${assertLifecycleToken(lifecycleUid)}`;
+}
+
+/** The §13.1 op-intent grammar, one copy for both gate families (`gate.` and `epgate.`) so they
+ *  cannot disagree on it: required at `frozen`/`retired`, absent at `open`, closed, and held to
+ *  the per-kind STATE x KIND and successor invariants. `label` names the gate in every refusal. */
+function assertGateOp(op: unknown, state: string, label: string): void {
+  if (state === "open") {
+    if (op !== undefined) throw new EpEnvelopeError("internal", `${label} is open but carries an op intent (SPEC 13.1: open gates are not op-bound)`);
+    return;
+  }
+  if (!isRec(op))
+    throw new EpEnvelopeError("internal", `${label} is ${state} without its durable op intent (SPEC 13.1: a frozen gate is op-bound, and a retired gate retains its terminalizing op)`);
+  for (const k of Object.keys(op)) if (k !== "opId" && k !== "kind" && k !== "successor") throw new EpEnvelopeError("internal", `${label} op intent carries the unknown field "${k}" (closed schema)`);
+  if (typeof op.opId !== "string" || typeof op.kind !== "string" || !ISSUANCE_GATE_OP_KINDS.has(op.kind))
+    throw new EpEnvelopeError("internal", `${label} op intent does not validate (SPEC 13.1)`);
+  // STATE x KIND invariant (SPEC 13.1 per-kind transition sets): only an activation orphan or
+  // a retirement produces a `retired` gate, so a persisted `retired` gate carrying a
+  // takeover/registration kind is IMPOSSIBLE state — refuse it at parse, never let the terminal
+  // idempotence path return it as a settled success (fail-closed on corruption, not open).
+  if (state === "retired" && op.kind !== "activation" && op.kind !== "retirement")
+    throw new EpEnvelopeError("internal", `${label} is retired under a ${op.kind} op; only an activation orphan or a retirement terminalizes (SPEC 13.1); impossible persisted state, refused`);
+  if (op.successor !== undefined && (typeof op.successor !== "string" || op.successor.length === 0 || (op.kind !== "takeover" && op.kind !== "registration")))
+    throw new EpEnvelopeError("internal", `${label} op intent carries an invalid successor (SPEC 13.1: only takeover/registration stage successors, and the summary is a non-empty token)`);
+  try {
+    assertLifecycleToken(op.opId);
+  } catch {
+    throw new EpEnvelopeError("internal", `${label} op intent carries a malformed opId (SPEC 13.1)`);
+  }
+}
+
+/** Validate a gate row at the consuming boundary — CLOSED schema; key/uid agreement; the
+ *  per-kind STATE x KIND transition invariants (§13.1). */
+export function parseIssuanceGate(raw: Uint8Array, key: string, lifecycleUid: string): EpGateRow {
+  const o = decodeRecordJson(raw, key);
+  if (!isRec(o)) throw new EpEnvelopeError("internal", `the issuance gate ${key} is not an object`);
+  for (const k of Object.keys(o)) if (k !== "lifecycleUid" && k !== "state" && k !== "generation" && k !== "op") throw new EpEnvelopeError("internal", `the issuance gate ${key} carries the unknown field "${k}" (closed schema, SPEC 13.1)`);
+  if (o.lifecycleUid !== lifecycleUid || typeof o.state !== "string" || !ISSUANCE_GATE_STATES.has(o.state) || !uint(o.generation))
+    throw new EpEnvelopeError("internal", `the issuance gate ${key} does not validate (uid/state/generation); a garbled or key-mismatched gate never authorizes (SPEC 13.1)`);
+  assertGateOp(o.op, o.state, `the issuance gate ${key}`);
+  return o as unknown as EpGateRow;
+}
+
+// ---- the credential-ledger row grammar (auth store, `cred.` / `epcred.` families) -----------
+
+/** One KV key segment: no dots (a segment separator), no wildcards, KV-safe. */
+const KEY_SEGMENT = /^[A-Za-z0-9_-]+$/;
+
+export function assertKeySegment(v: unknown, what: string): string {
+  if (typeof v !== "string" || !KEY_SEGMENT.test(v))
+    throw new EpEnvelopeError("failed-precondition", `${what} ${JSON.stringify(v)} is not a KV-safe key segment (SPEC 13.1)`);
+  return v;
+}
+
+/** A credential id: one or more KV-safe segments (dots allowed BETWEEN segments — the session
+ *  families use `<sessionId>.c` / `<sessionId>.s` — but never wildcards or empty segments). */
+export function assertCredentialIdTail(v: unknown, what: string): string {
+  if (typeof v !== "string" || v.length === 0 || v.length > 256 || !v.split(".").every((s) => KEY_SEGMENT.test(s)))
+    throw new EpEnvelopeError("failed-precondition", `${what} ${JSON.stringify(v)} is not a bounded dotted credential id (SPEC 13.1)`);
+  return v;
+}
+
+/** The key-safe per-credential ledger id `sha256-<hex>` over raw credential bytes or UTF-8 text:
+ *  the id becomes a segment of the durable `cred.`, `epcred.` and `bysrc.` KV keys, whose grammar
+ *  forbids the `:` in the §13.7 `sha256:` artifact form. */
+export function credentialIdOf(credential: Uint8Array | string): string {
+  return `sha256-${rawDigest(credential).slice(DIGEST_PREFIX.length)}`;
+}
+
+/** A holder principal `<owner>.<actor>` with a REAL owner (derived `u_…`, platform `p_…` or the dev owner) —
+ *  eviction is BY PRINCIPAL, so a row that cannot name an evictable principal never ledgers. */
+export function assertHolderPrincipal(v: unknown, what: string): string {
+  const p = typeof v === "string" ? parsePrincipalKey(v) : null;
+  if (!p || !isPrincipalOwnerToken(p.owner, { allowLocal: true, allowPlatform: true }))
+    throw new EpEnvelopeError("failed-precondition", `${what} ${JSON.stringify(v)} is not a principal dot-form the barrier can evict (SPEC 13.1)`);
+  return v as string;
+}
+
+export const SOURCE_ROOT = "root";
+
+/** Validate ONE sourceChain member — `root`, `handle.<issuerKeyId>.<id>`, or
+ *  `session.<sessionId>` (SPEC 13.1) — and return its parsed shape. */
+export function parseSourceMember(member: unknown): { kind: "root" } | { kind: "handle"; issuerKeyId: string; id: string } | { kind: "session"; sessionId: string } {
+  if (member === SOURCE_ROOT) return { kind: "root" };
+  if (typeof member === "string" && member.startsWith("handle.")) {
+    const rest = member.slice("handle.".length).split(".");
+    if (rest.length === 2 && KEY_SEGMENT.test(rest[0]) && KEY_SEGMENT.test(rest[1]))
+      return { kind: "handle", issuerKeyId: rest[0], id: rest[1] };
+  }
+  if (typeof member === "string" && member.startsWith("session.")) {
+    const sid = member.slice("session.".length);
+    if (KEY_SEGMENT.test(sid)) return { kind: "session", sessionId: sid };
+  }
+  throw new EpEnvelopeError("failed-precondition", `sourceChain member ${JSON.stringify(member)} is not root | handle.<issuerKeyId>.<id> | session.<sessionId> (SPEC 13.1)`);
+}
+
+export function assertSourceChain(v: unknown, what: string): string[] {
+  if (!Array.isArray(v) || v.length === 0)
+    throw new EpEnvelopeError("failed-precondition", `${what} must be a non-empty sourceChain (SPEC 13.1: the FULL verified lineage, never absent)`);
+  for (const m of v) parseSourceMember(m);
+  return v as string[];
+}
+
+/** The agent-family ledger key `cred.<lifecycleUid>.<credentialId>`. */
+export function credRowKey(lifecycleUid: string, credentialId: string): string {
+  return `cred.${assertLifecycleToken(lifecycleUid)}.${assertCredentialIdTail(credentialId, "credentialId")}`;
+}
+/** The native-issuance evidence key `natkey.<userNkey>` (SPEC 13.1): `userNkey` is the broker-generated
+ *  per-connection user public key of one callout success, never a client nonce or display label. */
+export function nativeIssuanceKey(userNkey: string): string {
+  if (typeof userNkey !== "string" || !/^U[A-Z2-7]{55}$/.test(userNkey))
+    throw new EpEnvelopeError("failed-precondition", `natkey: ${JSON.stringify(userNkey)} is not a broker user public key (SPEC 13.1)`);
+  return `natkey.${userNkey}`;
+}
+/** The endpoint-family ledger key `epcred.<endpoint>.<instanceId>.<credentialId>` (disjoint by
+ *  explicit prefix, never arity, SPEC 13.1). */
+export function epcredRowKey(endpoint: string, instanceId: string, credentialId: string): string {
+  return `epcred.${endpointToken(endpoint)}.${assertLifecycleToken(instanceId, "instanceId")}.${assertCredentialIdTail(credentialId, "credentialId")}`;
+}
+
+/** The endpoint-family ledger KEY PREFIX `epcred.<endpoint>.<instanceId>` (no credentialId tail) —
+ *  the exact family a barrier enumerates and a key-pinned executor grant scopes to (`…​.>`). Built
+ *  from the core tokenizers so a grant never spells the prefix by hand (guard-the-core). */
+export function epcredFamilyPrefix(endpoint: string, instanceId: string): string {
+  return `epcred.${endpointToken(endpoint)}.${assertLifecycleToken(instanceId, "instanceId")}`;
+}
+
+/** Durable interrupted-repair cursor for ONE frozen registration (`eprepair.<endpoint>.<instanceId>`).
+ *  Distinct from the closed-schema gate and from `epcred` rows: those cannot carry a verification
+ *  journal. Bound to the freeze op, freeze token, and current holder set so old liveness evidence
+ *  is never reused for a different repair. */
+export function eprepairKey(endpoint: string, instanceId: string): string {
+  return `eprepair.${endpointToken(endpoint)}.${assertLifecycleToken(instanceId, "instanceId")}`;
+}
+
+export interface EndpointRepairCursor {
+  v: 1;
+  opId: string;
+  freezeToken: number;
+  /** Sorted unique holders this freeze must verify-evict. */
+  holders: string[];
+  /** Holders whose eviction was already verified under THIS binding. Subset of `holders`. */
+  verified: string[];
+}
+
+export function parseEndpointRepairCursor(raw: Uint8Array, key: string): EndpointRepairCursor {
+  const o = decodeRecordJson(raw, key);
+  if (!isRec(o)) throw new EpEnvelopeError("internal", `the repair cursor ${key} is not an object`);
+  const allowed = new Set(["v", "opId", "freezeToken", "holders", "verified"]);
+  for (const k of Object.keys(o)) if (!allowed.has(k)) throw new EpEnvelopeError("internal", `the repair cursor ${key} carries the unknown field "${k}" (closed schema)`);
+  if (o.v !== 1 || typeof o.opId !== "string" || !uint(o.freezeToken) || o.freezeToken < 1)
+    throw new EpEnvelopeError("internal", `the repair cursor ${key} does not validate (v/opId/freezeToken)`);
+  try {
+    assertLifecycleToken(o.opId, "opId");
+  } catch {
+    throw new EpEnvelopeError("internal", `the repair cursor ${key} carries a malformed opId`);
+  }
+  if (!Array.isArray(o.holders) || !Array.isArray(o.verified))
+    throw new EpEnvelopeError("internal", `the repair cursor ${key} holders/verified are not arrays`);
+  const holders: string[] = [];
+  for (const h of o.holders) holders.push(assertHolderPrincipal(h, `repair cursor ${key} holder`));
+  const verified: string[] = [];
+  for (const h of o.verified) verified.push(assertHolderPrincipal(h, `repair cursor ${key} verified holder`));
+  const sortedHolders = [...new Set(holders)].sort();
+  if (holders.length !== sortedHolders.length || holders.some((h, i) => h !== sortedHolders[i]))
+    throw new EpEnvelopeError("internal", `the repair cursor ${key} holders are not unique and sorted`);
+  const holderSet = new Set(sortedHolders);
+  const sortedVerified = [...new Set(verified)].sort();
+  if (verified.length !== sortedVerified.length || verified.some((h, i) => h !== sortedVerified[i]))
+    throw new EpEnvelopeError("internal", `the repair cursor ${key} verified holders are not unique and sorted`);
+  for (const h of sortedVerified) {
+    if (!holderSet.has(h))
+      throw new EpEnvelopeError("internal", `the repair cursor ${key} verified holder ${h} is not in the bound holder set`);
+  }
+  const parts = key.split(".");
+  if (parts.length !== 3 || parts[0] !== "eprepair")
+    throw new EpEnvelopeError("internal", `the repair cursor key ${key} is not an eprepair key`);
+  try {
+    if (eprepairKey(endpointNameOf(parts[1]), parts[2]) !== key) throw new Error("rebuild mismatch");
+  } catch {
+    throw new EpEnvelopeError("internal", `the repair cursor key ${key} does not rebuild from its endpoint/instanceId`);
+  }
+  return { v: 1, opId: o.opId, freezeToken: o.freezeToken, holders: sortedHolders, verified: sortedVerified };
+}
+
+// ---- the endpoint-instance issuance gate (auth store, endpoint family `epgate.<endpoint>.<instanceId>`) ----
+
+/** The ENDPOINT-instance issuance gate row (§13.1: a DISJOINT family from the agent
+ *  `gate.<lifecycleUid>`, distinguished by explicit PREFIX and never token arity; it carries the
+ *  endpoint fence coordinates of §13.5/§13.7). Closed schema; `frozen`/`retired` are op-bound
+ *  exactly like the agent family. Lifted to core (guarded-core: ONE encoder shared by the auth
+ *  session ledger and the manager's endpoint-serve wiring; a second dialect is the dual-encoder
+ *  drift this module bans). */
+export type EndpointGateRow = GateStateOp & {
+  /** Host-only admission discriminator, retained through every gate transition. Raw-row
+   * write permission cannot enforce its immutability; environment guests hold none. */
+  authorityFamily?: "environment-manager" | "service";
+  serviceAuthority?: ServiceGateAuthority;
+  generation: number;
+  processEpoch: number;
+  registrationRevision: number;
+  nameAuthorityRevision: number;
+  /** The serving instance's CONNZ-attributable connection principal (`<owner>.<actor>` dot-form)
+   *  — the eviction target when the endpoint is taken over or a serving credential is revoked
+   *  (§13.1: eviction is BY PRINCIPAL). Recorded at endpoint registration; the serving ledger
+   *  rows (`epcred.`) copy it as their `holderPrincipal`, so the endpoint KEY identity
+   *  (`endpoint`) and the evictable principal stay disjoint. */
+  principal: string;
+};
+
+/** The endpoint gate key `epgate.<endpoint>.<instanceId>` (an instanceId is unique ONLY within
+ *  `(space, endpoint)`, so the key is endpoint-qualified — equal instanceIds under two endpoints
+ *  never collide on the gate or the credential family, §13.1/§13.6). */
+export function epgateKey(endpoint: string, instanceId: string): string {
+  return `epgate.${endpointToken(endpoint)}.${assertLifecycleToken(instanceId, "instanceId")}`;
+}
+
+/** Validate an endpoint gate row at the consuming boundary — CLOSED schema; a real owner-grammar
+ *  serving principal; the per-kind STATE x KIND + successor invariants (§13.1). Byte-for-byte the
+ *  parser the auth session ledger carried, now shared. */
+export function parseEndpointGate(raw: Uint8Array, key: string): EndpointGateRow {
+  const o = decodeRecordJson(raw, key);
+  if (!isRec(o)) throw new EpEnvelopeError("internal", `the endpoint gate ${key} is not an object`);
+  const allowed = new Set(["state", "generation", "processEpoch", "registrationRevision", "nameAuthorityRevision", "principal", "op", "authorityFamily", "serviceAuthority"]);
+  for (const k of Object.keys(o)) if (!allowed.has(k)) throw new EpEnvelopeError("internal", `the endpoint gate ${key} carries the unknown field "${k}" (closed schema, SPEC 13.1)`);
+  if (typeof o.state !== "string" || !ISSUANCE_GATE_STATES.has(o.state) || !uint(o.generation) || !uint(o.processEpoch) || !uint(o.registrationRevision) || !uint(o.nameAuthorityRevision))
+    throw new EpEnvelopeError("internal", `the endpoint gate ${key} does not validate (SPEC 13.1)`);
+  const principal = typeof o.principal === "string" ? parsePrincipalKey(o.principal) : null;
+  if (principal === null || !isPrincipalOwnerToken(principal.owner, { allowLocal: true, allowPlatform: true }))
+    throw new EpEnvelopeError("internal", `the endpoint gate ${key} does not carry a CONNZ-attributable serving principal (owner-grammar owner.actor, SPEC 13.1)`);
+  if (o.authorityFamily !== undefined && o.authorityFamily !== "environment-manager" && o.authorityFamily !== "service")
+    throw new EpEnvelopeError("internal", `the endpoint gate ${key} carries an invalid authorityFamily (closed schema, SPEC 13.1)`);
+  if (o.authorityFamily === "service") {
+    const service = parseServiceGateAuthority(o.serviceAuthority);
+    if (o.registrationRevision !== 0 && !service.registration)
+      throw new EpEnvelopeError("internal", `the service gate ${key} has registered coordinates without completion provenance`);
+    if (service.registration && (service.registration.processEpoch !== o.processEpoch
+      || service.registration.registrationRevision !== o.registrationRevision || service.registration.nameAuthorityRevision !== o.nameAuthorityRevision))
+      throw new EpEnvelopeError("internal", `the service gate ${key} completion stamp disagrees with its coordinates`);
+    const registrationOp = o.state === "frozen" && isRec(o.op) && o.op.kind === "registration";
+    if (registrationOp !== (service.pendingRegistration !== undefined)
+      || (service.pendingRegistration && (!isRec(o.op) || service.pendingRegistration.operationId !== o.op.opId)))
+      throw new EpEnvelopeError("internal", `the service gate ${key} pending registration does not bind its freeze`);
+    if (!isPrincipalOwnerToken(principal.owner, { allowLocal: false, allowPlatform: false }))
+      throw new EpEnvelopeError("internal", `the service gate ${key} requires a derived user owner`);
+  } else if (o.serviceAuthority !== undefined) {
+    throw new EpEnvelopeError("internal", `the endpoint gate ${key} has service authority without its family`);
+  }
+  assertGateOp(o.op, o.state, `the endpoint gate ${key}`);
+  return o as unknown as EndpointGateRow;
+}
+
+/** The §13.1 credential-ledger row, closed. `lifecycleUid` is the HOLDER's KEY identity
+ *  component: the managed agent's lifecycle UID in the `cred.` family, the endpoint instance's
+ *  `instanceId` in the `epcred.` family (SPEC 13.1: `instanceId` is to an endpoint what
+ *  `lifecycleUid` is to a managed agent). `endpoint` is present ONLY in the `epcred.` family
+ *  (it forms the key there and is absent in `cred.`), so the KEY identity is never conflated
+ *  with the eviction target. `holderPrincipal` is who the barrier KICKs: ALWAYS a CONNZ-
+ *  attributable `<owner>.<actor>` dot-form (the caller principal in the `cred.` family; the
+ *  serving instance's own connection principal in the `epcred.` family, recorded from the
+ *  endpoint gate), NEVER the endpoint name (which CONNZ cannot attribute). */
+export interface CredentialLedgerRow {
+  credentialId: string;
+  holderPrincipal: string;
+  lifecycleUid: string;
+  /** The endpoint NAME whose token forms the `epcred.` key; present iff this is an endpoint-
+   *  family row, absent in the `cred.` family (which the lifecycleUid keys). */
+  endpoint?: string;
+  /** Present only for service-callout epcred evidence; never a cred-root authorization. */
+  serviceConnection?: ServiceConnectionBinding;
+  /** The FULL verified lineage at mint: `root` | `handle.<issuerKeyId>.<id>`… |
+   *  `session.<sessionId>` (SPEC 13.1 — for a handle redemption EVERY handle in the presented
+   *  chain, never only the leaf). */
+  sourceChain: string[];
+  /** Monotonic: `active → revoked` only; a revoked row is never deleted. */
+  state: "active" | "revoked";
+  exp: number;
+}
+
+/** Parse + validate a ledger row at its consuming boundary — closed schema, and the embedded
+ *  identity MUST rebuild the row's own key, so a key-mismatched or family-swapped poison row
+ *  never authorizes (SPEC 13.1/13.3). */
+export function parseLedgerRow(raw: Uint8Array, key: string): CredentialLedgerRow {
+  const o = decodeRecordJson(raw, key);
+  if (!isRec(o)) throw new EpEnvelopeError("internal", `the credential-ledger row ${key} is not an object`);
+  const allowed = new Set(["credentialId", "holderPrincipal", "lifecycleUid", "endpoint", "serviceConnection", "sourceChain", "state", "exp"]);
+  for (const k of Object.keys(o)) if (!allowed.has(k)) throw new EpEnvelopeError("internal", `the credential-ledger row ${key} carries the unknown field "${k}" (closed schema, SPEC 13.1)`);
+  if (
+    typeof o.credentialId !== "string" || typeof o.holderPrincipal !== "string" || typeof o.lifecycleUid !== "string" ||
+    (o.state !== "active" && o.state !== "revoked") || !uint(o.exp)
+  )
+    throw new EpEnvelopeError("internal", `the credential-ledger row ${key} does not validate (id/holder/uid/state/exp); a garbled row never authorizes (SPEC 13.1)`);
+  try {
+    assertSourceChain(o.sourceChain, `row ${key} sourceChain`);
+    assertCredentialIdTail(o.credentialId, `row ${key} credentialId`);
+    // holderPrincipal is ALWAYS a CONNZ-attributable principal, in BOTH families (the barrier
+    // KICKs it; the endpoint name is NOT attributable and never sits here).
+    assertHolderPrincipal(o.holderPrincipal, `row ${key} holderPrincipal`);
+  } catch (e) {
+    throw new EpEnvelopeError("internal", `the credential-ledger row ${key} carries a malformed lineage/id/holder: ${(e as Error).message}`);
+  }
+  // KEY BINDING, per family: the row's own identity must rebuild its key exactly. The endpoint
+  // family keys on its own `endpoint` field (NOT holderPrincipal), so the key identity and the
+  // eviction target stay disjoint.
+  let expected: string;
+  if (key.startsWith("cred.")) {
+    if (o.endpoint !== undefined || o.serviceConnection !== undefined)
+      throw new EpEnvelopeError("internal", `the agent-family row ${key} carries an endpoint field (that belongs to the epcred family, SPEC 13.1)`);
+    expected = credRowKey(o.lifecycleUid, o.credentialId);
+  } else if (key.startsWith("epcred.")) {
+    if (typeof o.endpoint !== "string" || o.endpoint.length === 0)
+      throw new EpEnvelopeError("internal", `the endpoint-family row ${key} is missing its endpoint field (it forms the key, SPEC 13.1)`);
+    try {
+      expected = epcredRowKey(o.endpoint, o.lifecycleUid, o.credentialId);
+    } catch (e) {
+      throw new EpEnvelopeError("internal", `the credential-ledger row ${key} does not validate for the endpoint family: ${(e as Error).message}`);
+    }
+  } else {
+    throw new EpEnvelopeError("internal", `the credential-ledger row key ${key} is under neither ledger family prefix (SPEC 13.1)`);
+  }
+  if (o.serviceConnection !== undefined) o.serviceConnection = parseServiceConnectionBinding(o.serviceConnection);
+  if (expected !== key)
+    throw new EpEnvelopeError("internal", `the credential-ledger row at ${key} embeds an identity that rebuilds ${expected}; a key-mismatched row never authorizes (SPEC 13.1)`);
+  return o as unknown as CredentialLedgerRow;
+}
+
+// ---- the static manager's durable slot mapping (records store) ------------------------------
+
+/** Phases of one static managed slot: the F3 outer spawn intent (`provisioning`, persisted
+ *  BEFORE head activation), the owned slot (`active`), the terminal in flight (`terminalizing`),
+ *  and the completed terminal (`retired` — the row is never deleted; a same-alias successor
+ *  CASes over it). */
+export const STATIC_SLOT_PHASES: ReadonlySet<string> = new Set(["provisioning", "active", "terminalizing", "retired"]);
+export type StaticSlotPhase = "provisioning" | "active" | "terminalizing" | "retired";
+
+/** The static manager's durable alias -> (owner, actor, lifecycleUid) slot mapping
+ *  (split-coordinates design): the ALIAS is routing/display, protected by this
+ *  name-keyed row plus the uid reservation and the manager's freeSlot hold; the AUTHORITY
+ *  coordinate is the incarnation-unique wire `actor` (the nkey) recorded here as DATA. The row
+ *  lives in the records store — the same durability domain as the head — and survives manager
+ *  restart (the boot sweep re-drives any non-retired phase). `credentialIds` is the incarnation's
+ *  full mint set (root + renewals): the terminal's B1 revoke enumerates from HERE (recorded
+ *  BEFORE each mint), never from a store listing. */
+export interface StaticManagedSlotRow {
+  owner: string;
+  /** The manager-visible agent name (routing identity; never sufficient authority, SPEC 13.1). */
+  alias: string;
+  /** The incarnation-unique wire principal actor (the connection nkey) — the authority coordinate. */
+  actor: string;
+  lifecycleUid: string;
+  phase: StaticSlotPhase;
+  /** Every credentialId minted for this incarnation, recorded BEFORE its mint (crash-safe:
+   *  a cred never exists without its id recorded here and its ledger row appended first). */
+  credentialIds: string[];
+  /** The minting/supervising authority (the manager's own per-PROCESS incarnation uid — audit only). */
+  managerInstance: string;
+  /** The owning LOGICAL manager instance id: stable across manager restart, so
+   *  the boot reconcile filters to rows THIS logical instance owns and never sweep-terminalizes a
+   *  SIBLING manager's rows (multi-manager-per-space). Optional for backward-compat: a legacy row
+   *  (no owner recorded) predates multi-manager, so a reconciling manager treats
+   *  it as its own (the single-manager past). An orphaned sibling row is claimed only by an explicit
+   *  operator CAS takeover, never auto-adopted. */
+  ownerInstanceId?: string;
+  /** Set true, on the `terminalizing` row, once the terminal's footprint cleanup has finished and
+   *  BEFORE the final CAS to `retired`. It lets a resumed terminal tell "cleanup already completed"
+   *  (the process died between cleanup and the `retired` CAS) from "cleanup never ran or was in
+   *  flight", so the resume skips a completed cleanup instead of re-running it as the only total
+   *  option. Absent on a legacy row and on every phase before the cleanup step, which a resume reads
+   *  as not-known-complete and re-runs the idempotent cleanup — the totality-preserving default. */
+  cleanupComplete?: boolean;
+  /** The runtime's durable reference to the incarnation's process custody (an `AgentHandle.reference`),
+   *  recorded when the slot goes `active` and re-recorded when a same-lifecycle restart or resume binds
+   *  a new handle. A successor's terminal reaps the orphaned OS process through it, so a manager crash
+   *  never leaves a seat running outside every manager. Absent for a runtime without durable custody
+   *  (nothing to reap by reference) and on a row written before this field existed. */
+  runtime?: { kind: string; id: string };
+}
+
+/** The slot key prefix in the records store. Core-owned so permission builders and the manager
+ *  share ONE encoder (a second literal is the drift class this module bans). */
+export const STATIC_SLOT_PREFIX = "mgrslot";
+
+/** The slot key `mgrslot.<owner>.<alias>`. */
+export function staticSlotKey(owner: string, alias: string): string {
+  return `${STATIC_SLOT_PREFIX}.${assertKeySegment(owner, "slot owner")}.${assertKeySegment(alias, "slot alias")}`;
+}
+
+/** Validate a slot row at the consuming boundary — CLOSED schema, and the embedded identity
+ *  MUST rebuild the row's own key, so a key-mismatched row never drives a resume or terminal. */
+function isRuntimeReference(v: unknown): v is { kind: string; id: string } {
+  if (!isRec(v)) return false;
+  for (const k of Object.keys(v)) if (k !== "kind" && k !== "id") return false;
+  return typeof v.kind === "string" && v.kind.length > 0 && typeof v.id === "string" && v.id.length > 0;
+}
+
+export function parseStaticSlotRow(raw: Uint8Array, key: string): StaticManagedSlotRow {
+  const o = decodeRecordJson(raw, key);
+  if (!isRec(o)) throw new EpEnvelopeError("internal", `the static slot row ${key} is not an object`);
+  const allowed = new Set(["owner", "alias", "actor", "lifecycleUid", "phase", "credentialIds", "managerInstance", "ownerInstanceId", "cleanupComplete", "runtime"]);
+  for (const k of Object.keys(o)) if (!allowed.has(k)) throw new EpEnvelopeError("internal", `the static slot row ${key} carries the unknown field "${k}" (closed schema)`);
+  if (
+    typeof o.owner !== "string" || typeof o.alias !== "string" || typeof o.actor !== "string" ||
+    typeof o.lifecycleUid !== "string" || typeof o.managerInstance !== "string" || o.managerInstance.length === 0 ||
+    typeof o.phase !== "string" || !STATIC_SLOT_PHASES.has(o.phase) ||
+    (o.ownerInstanceId !== undefined && (typeof o.ownerInstanceId !== "string" || o.ownerInstanceId.length === 0)) ||
+    (o.cleanupComplete !== undefined && typeof o.cleanupComplete !== "boolean") ||
+    (o.runtime !== undefined && !isRuntimeReference(o.runtime)) ||
+    !Array.isArray(o.credentialIds) || !o.credentialIds.every((c) => typeof c === "string" && c.length > 0)
+  )
+    throw new EpEnvelopeError("internal", `the static slot row ${key} does not validate (owner/alias/actor/uid/phase/credentialIds/managerInstance/ownerInstanceId/cleanupComplete/runtime)`);
+  assertLifecycleToken(o.lifecycleUid);
+  for (const c of o.credentialIds) assertCredentialIdTail(c, `slot row ${key} credentialId`);
+  if (staticSlotKey(o.owner, o.alias) !== key)
+    throw new EpEnvelopeError("internal", `the static slot row at ${key} embeds an identity that rebuilds ${staticSlotKey(o.owner, o.alias)}; a key-mismatched row never drives supervision`);
+  return o as unknown as StaticManagedSlotRow;
+}

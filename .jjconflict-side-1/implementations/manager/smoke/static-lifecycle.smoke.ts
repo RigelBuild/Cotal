@@ -1,0 +1,652 @@
+/**
+ * STATIC §13.1 LIFECYCLE smoke (control-surface P2 slice 1, Unit B) — proves BY EXECUTION, over a
+ * real JWT broker with real provisioning and real key-pinned `lifecycle-executor` credentials
+ * (fake runtime: nothing launches), the static executor's durable behavior:
+ *
+ *  1. ACTIVATION (F3/F4): a static spawn persists the durable outer intent (slot row, phase
+ *     `provisioning`) and drives the SHARED activation saga — after spawn the slot is `active`
+ *     at the incarnation's uid, the head `lifecycle.local.<nkey>` is active (PRINCIPAL-keyed:
+ *     the wire authority coordinate is the nkey, never the alias — F5-bind), the uid is
+ *     reserved, the gate is open @gen1, and the credential is LEDGERED (`cred.<uid>.<credId>`,
+ *     state active) with a BOUNDED exp (F5(b)) before it was materialized.
+ *  2. F5(a) membership gate: a live managed principal passes; a terminalizing, retiring, or
+ *     retired incarnation's principal is refused; an unknown principal is not claimed.
+ *  3. F5(b) renewal: the manager push-remints the SAME identity with a fresh bounded exp — a
+ *     second ledger row appears, the file re-signs for the same nkey — and renewal REFUSES once
+ *     the lifecycle is terminalizing. On a clock moved forward, a renewal shortly before the
+ *     generation's 30-day horizon is capped at it, and none is minted at it (SPEC 13.15).
+ *  4. TERMINAL (F1, the (b2) order): despawn drives freeze -> head retiring -> B1 revoke (ALL
+ *     ledger rows, incl. renewals) -> cleanup -> gate retired (op-pinned) -> head retired ->
+ *     slot retired -> alias free; the retiring hold gates same-name reuse meanwhile.
+ *  5. Same-name respawn after the terminal: a FRESH uid, the slot CASed over the retired row,
+ *     the predecessor's gate/head stay terminally retired (never reused).
+ *  6. FAILED STATIC RETIREMENT: a non-reap authentication timeout keeps the provisioning slot held,
+ *     schedules bounded in-process retries, recovers after a transient failure, and permits a
+ *     same-name spawn to re-drive retirement after retry exhaustion.
+ *  7. F3 rollback: a spawn that throws AFTER activation (buildLaunch) drives the exact-op static
+ *     terminal — no active orphan survives.
+ *  8. RECONCILE (boot sweep): an active slot with no live process is terminalized by
+ *     reconcileStaticLifecycles (no active orphan across manager restarts). A ledgerless
+ *     orphan (never minted) retires without a broker eviction. A ledgered orphan whose
+ *     eviction is unverified stays terminalizing so the alias cannot land in two owners.
+ *
+ * Run: pnpm smoke:static-lifecycle   (needs nats-server + node on PATH; boots its own broker)
+ */
+import { createHash, randomUUID } from "node:crypto";
+import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { connect } from "@nats-io/transport-node";
+import { Kvm } from "@nats-io/kv";
+import { Manager, type FreeSlotCause } from "../src/manager.js";
+import {
+  createSpaceAuth,
+  registry,
+  mintCreds,
+  newIdentity,
+  principalKey,
+  setupSpaceStreams,
+  standaloneConnectOpts,
+  DEV_OWNER,
+  mintLifecycleUid,
+  recordsBucket,
+  RECORD_KINDS,
+  recordSpecKey,
+  epAuthBucket,
+  credRowKey,
+  parseLedgerRow,
+  headCandidate,
+  gateObserve,
+  inspectCredHealth,
+  idFromCreds,
+  issuedHorizon,
+  STANDING_RENEWABLE_TTL_SEC,
+  STATIC_GENERATION_HORIZON_SEC,
+  type Connector,
+  type LaunchSpec,
+  type AgentHandle,
+  type Presence,
+  type CredentialLedgerRow,
+  type LifecycleMapping,
+  type EpGateRow,
+  type StaticManagedSlotRow,
+  type EvictionResult,
+  type LifecycleStateTransport,
+  type DeprovisionResourceAccounting,
+} from "@cotal-ai/core";
+import { workspaceSecretStore } from "@cotal-ai/workspace";
+import {
+  staticLifecycleTransport,
+  readStaticSlot,
+  activateStaticLifecycle,
+  casStaticSlot,
+  recordSlotCredential,
+  appendStaticCredentialRow,
+  runStaticTerminal,
+} from "../src/static-lifecycle.js";
+import { bootBroker } from "./_boot-broker.js";
+import { requestDeliveryAdminZeroMemberships } from "./_fake-delivery-admin.js";
+
+let failures = 0;
+let ran = 0;
+/**
+ * How many assertions this suite intends to run. Declared, and enforced at the bottom.
+ *
+ * A private failure counter is honest about assertions that RAN and BLIND to assertions that never
+ * ran: skip a block, return early, or lose one to a conditional, and the suite prints OK and exits 0
+ * with nothing in its output different except the number of ✓ lines — a number it never emitted, so
+ * nobody was counting. One assertion here IS conditional (the crashed-spawn head/gate check, under
+ * `if (cSlot)`), so a slot that failed to materialize silently removes a proof rather than failing.
+ *
+ * THIS NUMBER IS INTENT, NOT A MEASUREMENT. Do NOT update it to match a run that came in lower —
+ * that reconciles the claim to the symptom and deletes the only evidence a proof went missing. A
+ * shortfall means an assertion stopped executing; find out which one and why. The number moves ONLY
+ * when a `check` is deliberately added or removed, because completeness is something only this
+ * suite knows, so it has to be the thing that says it.
+ */
+const EXPECTED_CHECKS = 72;
+function check(label: string, cond: boolean, extra?: unknown): void {
+  console.log(`${cond ? "✓" : "✗"} ${label}${cond ? "" : ` — ${JSON.stringify(extra) ?? ""}`}`);
+  ran++;
+  if (!cond) failures++;
+}
+const retireOpId = (uid: string): string => createHash("sha256").update(`retire:${uid}`).digest("hex").slice(0, 26);
+async function until(cond: () => Promise<boolean> | boolean, ms: number, what: string): Promise<boolean> {
+  const deadline = Date.now() + ms;
+  for (;;) {
+    if (await cond()) return true;
+    if (Date.now() > deadline) {
+      console.log(`… timed out waiting for ${what}`);
+      return false;
+    }
+    await new Promise((r) => setTimeout(r, 250));
+  }
+}
+
+const space = `static-lifecycle-${randomUUID().slice(0, 8)}`;
+const auth = await createSpaceAuth(space);
+const { servers: SERVERS, stop: stopBroker } = await bootBroker(auth);
+
+const workspaceRoot = mkdtempSync(join(tmpdir(), "cotal-static-lifecycle-ws-"));
+mkdirSync(join(workspaceRoot, ".cotal", "agents"), { recursive: true });
+for (const alias of ["worker", "crashy", "retryable", "retry-exhausted"])
+  writeFileSync(
+    join(workspaceRoot, ".cotal", "agents", `${alias}.md`),
+    `---\nname: ${alias}\nrole: worker\nsubscribe: [general]\nallowSubscribe: [general]\nallowPublish: [general]\n---\nbody\n`,
+  );
+
+const mgr = new Manager({ space, servers: SERVERS, runtime: "pty", workspaceRoot });
+(mgr as unknown as { auth: unknown }).auth = auth;
+const fakeSession = { cols: 80, rows: 24, backlog: () => Buffer.alloc(0), onData: () => () => {}, onExit: () => () => {}, write: () => {}, resize: () => {} };
+const fakeHandle = (name: string): AgentHandle => {
+  let running = true;
+  return { name, kind: "fake", status: () => running ? "running" : "exited", stop: () => { running = false; }, waitForExit: async () => { running = false; }, interrupt: () => {}, attach: () => fakeSession };
+};
+(mgr as unknown as { runtime: { kind: string; spawn: (n: string, s: LaunchSpec) => AgentHandle; reap: (locator: string) => Promise<void> } }).runtime = { kind: "fake", spawn: (name) => fakeHandle(name), reap: async () => {} };
+(mgr as unknown as { ep: Record<string, unknown> }).ep = {
+  ref: () => ({ id: "smoke-mgr" }),
+  on: () => {},
+  off: () => {},
+  waitForPresenceSnapshot: () => Promise.resolve(),
+  requestDeliveryAdmin: requestDeliveryAdminZeroMemberships,
+  getRoster: (): Presence[] =>
+    [...(mgr as unknown as { agents: Map<string, { id: string; name: string; lifecycleUid: string }> }).agents.values()].map(
+      (a): Presence => ({ card: { id: principalKey(DEV_OWNER, a.id).key, name: a.name, role: "worker", kind: "agent", description: "", tags: [] }, status: "idle", lifecycleUid: a.lifecycleUid, ts: 0 }),
+    ),
+};
+
+let crashLaunch = false;
+let failRetirementExecutor = false;
+let retirementFailsRemaining = 0;
+let failedRetirementAlias: string | undefined;
+const con: Connector = {
+  kind: "connector",
+  name: "smoke-sl",
+  requires: ["node"],
+  buildLaunch: (opts) => {
+    if (crashLaunch) {
+      if (opts.name === "retryable" || opts.name === "retry-exhausted") {
+        failRetirementExecutor = true;
+        failedRetirementAlias = opts.name;
+        retirementFailsRemaining = opts.name === "retryable" ? 2 : 5;
+      }
+      throw new Error("smoke: injected buildLaunch crash");
+    }
+    return { command: "true", args: [], env: {} };
+  },
+};
+registry.register(con);
+
+type LifecycleExecutorPin = { owner: string; actor: string; lifecycleUid: string; alias: string };
+type StaticLifecycleItem = { alias: string; lifecycleUid: string; attempts: number; maxAttempts: number; disposition: string; nextRetryAt?: string; lastError?: string; remedy?: string; timer?: NodeJS.Timeout };
+
+const M = mgr as unknown as {
+  managerInstanceId: string;
+  agents: Map<string, { id: string; name: string; lifecycleUid: string; terminalizing?: boolean; secretPaths?: { creds?: string }; seed?: string }>;
+  retiring: Map<string, { target: { lifecycleUid: string }; lastError?: string }>;
+  retiredPrincipals: Set<string>;
+  freeSlot: (a: unknown, floor: boolean, cause: FreeSlotCause) => void;
+  holdFailedStaticRetirement: (target: { id: string; name: string; lifecycleUid: string }, phase: StaticManagedSlotRow["phase"], error: unknown, queueRetry: boolean) => void;
+  deprovision: (a: { id: string; name: string; lifecycleUid: string; secretPaths?: { creds?: string } }) => Promise<void>;
+  lifecycleMembershipRefusal: (caller: string) => string | undefined;
+  renewManagedStaticCred: (a: unknown) => Promise<void>;
+  retryStaticReconcile: (key: string) => Promise<void>;
+  scheduleStaticReconcileRetry: (key: string, item: StaticLifecycleItem) => void;
+  reconcileStaticLifecycles: (postAdoption?: boolean) => Promise<void>;
+  staticReconcileRetryDelaysMs: readonly number[];
+  staticReconcileItems: Map<string, StaticLifecycleItem>;
+  deprovisionBroker: (target: { id: string; name: string; lifecycleUid: string; launch?: { allowSubscribe: readonly string[] } }) => Promise<DeprovisionResourceAccounting>;
+  withLifecycleExecutor: <T>(pin: LifecycleExecutorPin, fn: (transport: LifecycleStateTransport) => Promise<T>) => Promise<T>;
+};
+M.managerInstanceId = "smoke-manager-instance";
+const withLifecycleExecutor = M.withLifecycleExecutor.bind(mgr);
+M.withLifecycleExecutor = async (pin, fn) => {
+  if (failRetirementExecutor && pin.alias === failedRetirementAlias && retirementFailsRemaining > 0) {
+    retirementFailsRemaining--;
+    throw new Error("authentication timeout");
+  }
+  return withLifecycleExecutor(pin, fn);
+};
+let blockCleanup = false;
+let cleanupCalls = 0;
+let failCleanup = false;
+let releaseCleanup: (() => void) | undefined;
+const deprovisionBroker = M.deprovisionBroker.bind(mgr);
+M.deprovisionBroker = async (target) => {
+  if (target.name === "retryable") {
+    cleanupCalls++;
+    if (blockCleanup) await new Promise<void>((resolve) => { releaseCleanup = resolve; });
+    if (failCleanup) throw new Error("injected cleanup failure");
+  }
+  return deprovisionBroker(target);
+};
+
+// The real delivery-admin executor is covered by the restart/eviction suites. This lifecycle suite
+// grades the terminal's use of the seam and its ordering. Default verified-gone keeps existing cells
+// on their intended state-machine subject; the orphan cell below flips it false first.
+let evictionVerified = true;
+let evictionCalls: string[] = [];
+(mgr as unknown as { staticLifecycleEvict?: (principal: string) => Promise<EvictionResult> }).staticLifecycleEvict = async (principal) => {
+  evictionCalls.push(principal);
+  return { principal, kicked: evictionVerified ? 2 : 0, remaining: evictionVerified ? 0 : 1, scanComplete: true, verifiedGone: evictionVerified };
+};
+
+/** Durable-state reader: slot rows ride a provisioner cred (keyed direct-get on `mgrslot.>`);
+ *  head/gate/cred rows ride a per-lifecycle `lifecycle-executor` cred (the same key-pinned
+ *  profile the manager uses — the reads themselves prove the pin covers the executor's needs). */
+async function readState(alias: string, actor: string, uid: string): Promise<{
+  slot?: StaticManagedSlotRow;
+  head?: LifecycleMapping;
+  gate?: EpGateRow;
+  credRows: CredentialLedgerRow[];
+}> {
+  const creds = await mintCreds(auth, newIdentity(), "lifecycle-executor", {
+    lifecycleExecutor: { owner: DEV_OWNER, actor, lifecycleUid: uid, alias },
+  });
+  const nc = await connect({ servers: SERVERS, ...standaloneConnectOpts({ creds, tls: false }), maxReconnectAttempts: 0 });
+  try {
+    const kvm = new Kvm(nc);
+    const t = staticLifecycleTransport(await kvm.open(recordsBucket(space)), await kvm.open(epAuthBucket(space)));
+    const slot = await readStaticSlot(t, DEV_OWNER, alias);
+    const head = await headCandidate(t, DEV_OWNER, actor);
+    const gate = await gateObserve(t, uid);
+    const credRows: CredentialLedgerRow[] = [];
+    for (const id of slot?.row.credentialIds ?? []) {
+      const e = await t.getAuth(credRowKey(uid, id));
+      if (e !== undefined) credRows.push(parseLedgerRow(e.value, credRowKey(uid, id)));
+    }
+    return { slot: slot?.row, head: head?.mapping, gate: gate?.row, credRows };
+  } finally {
+    await nc.drain().catch(() => nc.close());
+  }
+}
+
+async function readSlotOnly(alias: string): Promise<StaticManagedSlotRow | undefined> {
+  const creds = await mintCreds(auth, newIdentity(), "provisioner");
+  const nc = await connect({ servers: SERVERS, ...standaloneConnectOpts({ creds, tls: false }), maxReconnectAttempts: 0 });
+  try {
+    const kvm = new Kvm(nc);
+    const t = staticLifecycleTransport(await kvm.open(recordsBucket(space)), await kvm.open(recordsBucket(space)));
+    return (await readStaticSlot(t, DEV_OWNER, alias))?.row;
+  } finally {
+    await nc.drain().catch(() => nc.close());
+  }
+}
+
+async function readLifecycleAudit(actor: string, uid: string): Promise<Record<string, unknown> | undefined> {
+  const creds = await mintCreds(auth, newIdentity(), "lifecycle-executor", { lifecycleExecutor: { owner: DEV_OWNER, actor, lifecycleUid: uid, alias: "worker" } });
+  const nc = await connect({ servers: SERVERS, ...standaloneConnectOpts({ creds, tls: false }), maxReconnectAttempts: 0 });
+  try {
+    const e = await (await new Kvm(nc).open(recordsBucket(space))).get(recordSpecKey(RECORD_KINDS.lifecycle, [DEV_OWNER, actor, uid]));
+    return e ? JSON.parse(new TextDecoder().decode(e.value)) as Record<string, unknown> : undefined;
+  } finally { await nc.drain().catch(() => nc.close()); }
+}
+
+async function plantActiveOrphan(alias: string, actor: string, uid: string, ledger: boolean): Promise<void> {
+  const creds = await mintCreds(auth, newIdentity(), "lifecycle-executor", {
+    lifecycleExecutor: { owner: DEV_OWNER, actor, lifecycleUid: uid, alias },
+  });
+  const nc = await connect({ servers: SERVERS, ...standaloneConnectOpts({ creds, tls: false }), maxReconnectAttempts: 0 });
+  try {
+    const kvm = new Kvm(nc);
+    const t = staticLifecycleTransport(await kvm.open(recordsBucket(space)), await kvm.open(epAuthBucket(space)));
+    await activateStaticLifecycle(t, { owner: DEV_OWNER, alias, actor, lifecycleUid: uid, managerInstance: "smoke", ownerInstanceId: M.managerInstanceId });
+    if (ledger) {
+      const credentialId = `cred-${alias}`;
+      await recordSlotCredential(t, DEV_OWNER, alias, uid, credentialId);
+      await appendStaticCredentialRow(t, {
+        lifecycleUid: uid,
+        credentialId,
+        holderPrincipal: principalKey(DEV_OWNER, actor).key,
+        // Expired, so the sweep terminalizes the unreachable orphan instead of deferring it.
+        exp: Math.floor(Date.now() / 1000) - 120,
+      });
+    }
+    const slot = await readStaticSlot(t, DEV_OWNER, alias);
+    await casStaticSlot(t, { ...slot!.row, phase: "active" }, slot!.revision);
+  } finally {
+    await nc.drain().catch(() => nc.close());
+  }
+}
+
+async function failedStaticSpawn(alias: "retryable" | "retry-exhausted"): Promise<{ actor: string; uid: string; key: string }> {
+  crashLaunch = true;
+  const spawn = await mgr.startAgent({ name: alias, agent: "smoke-sl", events: false });
+  crashLaunch = false;
+  const row = await until(async () => (await readSlotOnly(alias)) !== undefined, 5_000, `${alias} activation intent`);
+  const slot = await readSlotOnly(alias);
+  check(`${alias} spawn fails after activation`, spawn.ok === false && /injected buildLaunch crash/.test(spawn.error ?? "") && row && slot?.phase === "provisioning", { spawn, slot });
+  if (!slot) throw new Error(`${alias}: expected a durable provisioning row`);
+  const key = JSON.stringify([DEV_OWNER, alias, slot.lifecycleUid]);
+  check(`${alias} failed rollback retains a same-name retirement hold`, M.retiring.get(alias)?.target.lifecycleUid === slot.lifecycleUid, M.retiring.get(alias));
+  const queued = await until(() => M.staticReconcileItems.get(key)?.disposition === "retry-scheduled", 5_000, `${alias} bounded retry scheduling`);
+  const item = M.staticReconcileItems.get(key);
+  check(`${alias} authentication timeout schedules a bounded retry`, queued && typeof item?.nextRetryAt === "string" && /authentication timeout/.test(item.lastError ?? ""), item);
+  return { actor: slot.actor, uid: slot.lifecycleUid, key };
+}
+/** Plant a live static incarnation, latch it to `terminalizing` (optionally with the durable
+ *  `cleanupComplete` marker already set, modelling a crash AFTER cleanup finished but BEFORE the
+ *  `retired` CAS), then drive `runStaticTerminal` as a resume would — counting how many times the
+ *  footprint cleanup hook actually runs. Returns the cleanup-call count and the final slot. */
+async function driveTerminalDirect(
+  alias: string,
+  opts: { preMarkedCleanupComplete: boolean },
+): Promise<{ cleanupCalls: number; slot?: StaticManagedSlotRow }> {
+  const id = newIdentity();
+  const actor = id.id;
+  const uid = mintLifecycleUid();
+  const opId = retireOpId(uid);
+  let cleanupCalls = 0;
+  const creds = await mintCreds(auth, newIdentity(), "lifecycle-executor", {
+    lifecycleExecutor: { owner: DEV_OWNER, actor, lifecycleUid: uid, alias },
+  });
+  const nc = await connect({ servers: SERVERS, ...standaloneConnectOpts({ creds, tls: false }), maxReconnectAttempts: 0 });
+  try {
+    const kvm = new Kvm(nc);
+    const t = staticLifecycleTransport(await kvm.open(recordsBucket(space)), await kvm.open(epAuthBucket(space)));
+    await activateStaticLifecycle(t, { owner: DEV_OWNER, alias, actor, lifecycleUid: uid, managerInstance: "smoke", ownerInstanceId: M.managerInstanceId });
+    const credentialId = `cred-${alias}`;
+    await recordSlotCredential(t, DEV_OWNER, alias, uid, credentialId);
+    await appendStaticCredentialRow(t, { lifecycleUid: uid, credentialId, holderPrincipal: principalKey(DEV_OWNER, actor).key, exp: Math.floor(Date.now() / 1000) + 3600 });
+    // Latch the crashed-terminal shape: `terminalizing`, with the marker pre-set for the world-3 case.
+    const planted = await readStaticSlot(t, DEV_OWNER, alias);
+    await casStaticSlot(t, { ...planted!.row, phase: "terminalizing", ...(opts.preMarkedCleanupComplete ? { cleanupComplete: true } : {}) }, planted!.revision);
+    await runStaticTerminal(
+      t,
+      { owner: DEV_OWNER, alias, actor, lifecycleUid: uid, opId, managerInstance: "smoke", managerProcessUid: "smoke-proc" },
+      { cleanup: async () => { cleanupCalls++; }, evict: async (principal) => ({ principal, kicked: 1, remaining: 0, scanComplete: true, verifiedGone: true }), log: () => {} },
+    );
+    return { cleanupCalls, slot: (await readStaticSlot(t, DEV_OWNER, alias))?.row };
+  } finally {
+    await nc.drain().catch(() => nc.close());
+  }
+}
+
+try {
+  await setupSpaceStreams({ servers: SERVERS, space, creds: await mintCreds(auth, newIdentity(), "provisioner") });
+  const originalRetryDelays = M.staticReconcileRetryDelaysMs;
+  M.staticReconcileRetryDelaysMs = [80, 80, 80];
+
+  // ── 1. Activation: durable identity + bounded ledgered credential ─────────
+  const spawnA = await mgr.startAgent({ name: "worker", agent: "smoke-sl", events: false });
+  check("spawn A succeeds", spawnA.ok === true, spawnA);
+  const uidA = spawnA.ok ? (spawnA.data as { lifecycleUid: string }).lifecycleUid : "";
+  const managedA = M.agents.get("worker")!;
+  const idA = managedA.id;
+  const principalA = principalKey(DEV_OWNER, idA).key;
+  const s1 = await readState("worker", idA, uidA);
+  check("slot is ACTIVE at A's uid with the nkey as actor (F4: authority = incarnation, alias = routing)", s1.slot?.phase === "active" && s1.slot?.lifecycleUid === uidA && s1.slot?.actor === idA && s1.slot?.alias === "worker", s1.slot);
+  check("head lifecycle.local.<nkey> is ACTIVE at A's uid, epoch 1 (principal-keyed head)", s1.head?.state === "active" && s1.head?.lifecycleUid === uidA && s1.head?.processEpoch === 1, s1.head);
+  check("issuance gate is OPEN @gen1 (activation reopened LAST)", s1.gate?.state === "open" && s1.gate?.generation === 1, s1.gate);
+  check("ONE ledger row, ACTIVE, holder = A's wire principal (ledgered before materialization)", s1.credRows.length === 1 && s1.credRows[0].state === "active" && s1.credRows[0].holderPrincipal === principalA, s1.credRows);
+  const credsPathA = managedA.secretPaths?.creds;
+  const storedA = credsPathA ? await workspaceSecretStore(workspaceRoot).get(`auth/creds/${credsPathA.split("/").slice(-1)[0]}`) : undefined;
+  const fileHealth = credsPathA && existsSync(credsPathA) ? inspectCredHealth((await import("node:fs")).readFileSync(credsPathA, "utf8")) : { state: "unreadable" as const };
+  void storedA;
+  check("A's credential is BOUNDED (exp set, within the managed TTL) — F5(b)", fileHealth.state === "healthy" && (fileHealth.exp ?? 0) <= Math.floor(Date.now() / 1000) + STANDING_RENEWABLE_TTL_SEC + 60, fileHealth);
+  check("ledger row exp equals the JWT exp", s1.credRows[0]?.exp === fileHealth.exp, { row: s1.credRows[0]?.exp, jwt: fileHealth.exp });
+
+  // ── 2. F5(a) membership gate ───────────────────────────────────────────────
+  check("live managed principal PASSES the membership gate", M.lifecycleMembershipRefusal(principalA) === undefined);
+  check("an unknown principal is NOT claimed by the gate (operator instruments keep tier authority)", M.lifecycleMembershipRefusal(principalKey(DEV_OWNER, "UNKNOWNNKEY").key) === undefined);
+  managedA.terminalizing = true;
+  check("a TERMINALIZING principal is refused (the latch)", typeof M.lifecycleMembershipRefusal(principalA) === "string");
+  managedA.terminalizing = false;
+
+  // ── 3. F5(b) renewal ───────────────────────────────────────────────────────
+  const beforeRenew = credsPathA ? (await import("node:fs")).readFileSync(credsPathA, "utf8") : "";
+  // JWT iat/exp are second-granular: a renewal in the SAME second as the mint is byte-identical
+  // (same jti) and idempotently no-ops. Step past the second boundary so the renewal is real.
+  await new Promise((r) => setTimeout(r, 1100));
+  await M.renewManagedStaticCred(managedA);
+  const s3 = await readState("worker", idA, uidA);
+  check("renewal appended a SECOND active ledger row (same uid family)", s3.credRows.length === 2 && s3.credRows.every((r) => r.state === "active"), s3.credRows.map((r) => r.state));
+  const afterRenew = credsPathA ? (await import("node:fs")).readFileSync(credsPathA, "utf8") : "";
+  check("renewal re-signed the file for the SAME nkey identity", afterRenew !== beforeRenew && idFromCreds(afterRenew) === idA, { same: afterRenew === beforeRenew });
+  managedA.terminalizing = true;
+  let renewRefused = false;
+  try {
+    await M.renewManagedStaticCred(managedA);
+  } catch {
+    renewRefused = true;
+  }
+  check("renewal REFUSES once terminalizing (no mint after the terminal begins)", renewRefused);
+  managedA.terminalizing = false;
+
+  // The generation's horizon (SPEC 13.15), on this process's clock moved forward to it.
+  const horizonA = issuedHorizon((managedA as unknown as { issued: { generation: string } }).issued.generation);
+  const untilHorizon = horizonA - Math.floor(Date.now() / 1000);
+  check("A's generation horizon is 30 days after its spawn", untilHorizon <= STATIC_GENERATION_HORIZON_SEC && untilHorizon > STATIC_GENERATION_HORIZON_SEC - 300, untilHorizon);
+  const realNow = Date.now;
+  let refusal = "";
+  try {
+    Date.now = () => (horizonA - 600) * 1000;
+    await M.renewManagedStaticCred(managedA);
+    const capped = credsPathA ? readFileSync(credsPathA, "utf8") : "";
+    check("a renewal ten minutes before the horizon is capped at it", inspectCredHealth(capped, horizonA - 600).exp === horizonA, inspectCredHealth(capped, horizonA - 600));
+    Date.now = () => horizonA * 1000;
+    await M.renewManagedStaticCred(managedA).catch((e: unknown) => { refusal = e instanceof Error ? e.message : String(e); });
+  } finally {
+    Date.now = realNow;
+  }
+  check("no renewal is minted at the horizon, and the refusal says to respawn (#4942)", /reached its horizon .* respawn the agent .*#4942/.test(refusal), refusal);
+
+  // ── 4. Terminal (F1) ───────────────────────────────────────────────────────
+  M.freeSlot(managedA, false, "process-exit");
+  check("the name is HELD pending the static retirement (freeSlot -> retiring hold)", M.retiring.has("worker"));
+  await M.deprovision({ id: idA, name: "worker", lifecycleUid: uidA, secretPaths: managedA.secretPaths });
+  const settled = await until(async () => !M.retiring.has("worker"), 30_000, "the static terminal to clear the hold");
+  check("the terminal completed and FREED the alias (hold cleared)", settled);
+  const s4 = await readState("worker", idA, uidA);
+  check("gate is terminally RETIRED under the retirement op (op-pinned recovery coordinate)", s4.gate?.state === "retired" && s4.gate?.op?.opId === retireOpId(uidA), s4.gate);
+  check("head is RETIRED (terminal tail: gate first, head LAST)", s4.head?.state === "retired" && s4.head?.lifecycleUid === uidA, s4.head);
+  check("ALL ledger rows (root + both renewals) are REVOKED — B1 covers renewals", s4.credRows.length === 3 && s4.credRows.every((r) => r.state === "revoked"), s4.credRows.map((r) => r.state));
+  check("slot is RETIRED", s4.slot?.phase === "retired", s4.slot);
+  check("A's creds file is gone (cleanup ran inside the barrier)", credsPathA !== undefined && !existsSync(credsPathA));
+  check("the RETIRED principal is now refused at the control surface (F5(a))", typeof M.lifecycleMembershipRefusal(principalA) === "string");
+  const auditA = await readLifecycleAudit(idA, uidA);
+  const brokerA = auditA?.broker as Record<string, unknown> | undefined;
+  check("terminal persisted queryable v1 broker eviction evidence before freeing the alias",
+    auditA?.v === 1 && auditA.principal === principalA && auditA.alias === "worker" && auditA.lifecycleUid === uidA &&
+      typeof auditA.managerInstance === "string" && typeof auditA.managerProcessUid === "string" && typeof auditA.timestamp === "string" &&
+      brokerA?.kicked === 2 && brokerA.remaining === 0 && brokerA.scanComplete === true && brokerA.verifiedGone === true, auditA);
+
+  // ── 5. Same-name respawn over the retired slot ─────────────────────────────
+  const spawnB = await mgr.startAgent({ name: "worker", agent: "smoke-sl", events: false });
+  check("same-name respawn AFTER the terminal succeeds", spawnB.ok === true, spawnB);
+  const uidB = spawnB.ok ? (spawnB.data as { lifecycleUid: string }).lifecycleUid : "";
+  const idB = M.agents.get("worker")!.id;
+  check("successor holds a FRESH uid + FRESH incarnation principal", uidB !== uidA && idB !== idA, { uidA, uidB });
+  const s5 = await readState("worker", idB, uidB);
+  check("slot CASed over the retired row: ACTIVE at B's uid/actor", s5.slot?.phase === "active" && s5.slot?.lifecycleUid === uidB && s5.slot?.actor === idB, s5.slot);
+  const s5a = await readState("worker", idA, uidA);
+  check("predecessor's head/gate stay terminally retired (uid never reused)", s5a.head?.state === "retired" && s5a.gate?.state === "retired");
+  M.retiring.set("worker", { target: { lifecycleUid: uidA } });
+  await M.deprovision({ id: idA, name: "worker", lifecycleUid: uidA });
+  check("a stale hold clears when the slot belongs to a successor", !M.retiring.has("worker") && (await readSlotOnly("worker"))?.lifecycleUid === uidB);
+
+  // ── 6. Failed static retirement: bounded retries and same-name re-drive ──
+  M.staticReconcileRetryDelaysMs = [60_000, 60_000, 60_000];
+  const retryable = await failedStaticSpawn("retryable");
+  const retryableItem = M.staticReconcileItems.get(retryable.key)!;
+  if (retryableItem.timer) clearTimeout(retryableItem.timer);
+  retryableItem.timer = undefined;
+  retryableItem.nextRetryAt = undefined;
+  await M.retryStaticReconcile(retryable.key);
+  check("an authentication timeout during retry schedules the next bounded attempt", retryableItem.attempts === 2 && retryableItem.disposition === "retry-scheduled", retryableItem);
+  check("failed retirement keeps its provisioning slot held", (await readSlotOnly("retryable"))?.phase === "provisioning");
+  check("failed retry retains the same lifecycle hold", M.retiring.get("retryable")?.target.lifecycleUid === retryable.uid);
+  clearTimeout(retryableItem.timer);
+  retryableItem.timer = undefined;
+  retryableItem.nextRetryAt = undefined;
+  M.staticReconcileRetryDelaysMs = [80, 80, 80];
+  M.scheduleStaticReconcileRetry(retryable.key, retryableItem);
+  blockCleanup = true;
+  const blockedRetrySpawn = await mgr.startAgent({ name: "retryable", agent: "smoke-sl", events: false });
+  const entered = await until(() => cleanupCalls > 0, 5_000, "spawn retirement cleanup");
+  const timerFired = await until(() => retryableItem.timer === undefined, 5_000, "overlapping retry timer");
+  check("spawn retirement remains held while retry timer fires", !blockedRetrySpawn.ok && entered && timerFired && M.retiring.get("retryable")?.target.lifecycleUid === retryable.uid);
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  check("spawn and timer share one retirement cleanup", cleanupCalls === 1 && retryableItem.attempts === 2, { cleanupCalls, attempts: retryableItem.attempts });
+  blockCleanup = false;
+  releaseCleanup?.();
+  const recoveredRetry = await until(async () => (await readSlotOnly("retryable"))?.phase === "retired" && !M.retiring.has("retryable"), 5_000, "retryable rollback retry");
+  check("the same manager retries and retires the failed static spawn", recoveredRetry, { slot: await readSlotOnly("retryable"), hold: M.retiring.get("retryable") });
+  const retryItem = M.staticReconcileItems.get(retryable.key);
+  check("successful retry records recovery under the original lifecycle", retryItem?.disposition === "recovered" && retryItem.lifecycleUid === retryable.uid, retryItem);
+  M.holdFailedStaticRetirement({ id: retryable.actor, name: "retryable", lifecycleUid: retryable.uid }, "terminalizing", new Error("late failure"), true);
+  check("a late failure cannot recreate a cleared hold", !M.retiring.has("retryable"));
+  M.staticReconcileRetryDelaysMs = [60_000, 60_000, 60_000];
+  const joined = await failedStaticSpawn("retryable");
+  const joinedItem = M.staticReconcileItems.get(joined.key)!;
+  retirementFailsRemaining = 0;
+  clearTimeout(joinedItem.timer);
+  joinedItem.timer = undefined;
+  joinedItem.nextRetryAt = undefined;
+  M.staticReconcileRetryDelaysMs = [80, 60_000, 60_000];
+  M.scheduleStaticReconcileRetry(joined.key, joinedItem);
+  blockCleanup = true;
+  failCleanup = true;
+  const beforeJoinedCleanup = cleanupCalls;
+  await mgr.startAgent({ name: "retryable", agent: "smoke-sl", events: false });
+  await until(() => cleanupCalls > beforeJoinedCleanup, 5_000, "failed joined cleanup");
+  await until(() => joinedItem.timer === undefined, 5_000, "failed joined timer");
+  M.staticReconcileRetryDelaysMs = [60_000, 60_000, 60_000];
+  blockCleanup = false;
+  releaseCleanup?.();
+  const joinedScheduled = await until(() => joinedItem.disposition === "retry-scheduled" && joinedItem.timer !== undefined, 5_000, "failed joined retry scheduled");
+  check("failed joined cleanup preserves budget and schedules one retry", joinedScheduled && joinedItem.attempts === 1 && joinedItem.attempts <= joinedItem.maxAttempts && cleanupCalls === beforeJoinedCleanup + 1, joinedItem);
+  for (let attempt = 0; attempt < joinedItem.maxAttempts && joinedItem.attempts < joinedItem.maxAttempts; attempt++) {
+    clearTimeout(joinedItem.timer);
+    joinedItem.timer = undefined;
+    joinedItem.nextRetryAt = undefined;
+    await M.retryStaticReconcile(joined.key);
+  }
+  check("failed joined cleanup exhausts at the budget with a remedy", joinedItem.attempts === joinedItem.maxAttempts && joinedItem.disposition === "retry-exhausted" && joinedItem.timer === undefined && /same-name spawn/.test(joinedItem.remedy ?? ""), joinedItem);
+  failCleanup = false;
+  await mgr.startAgent({ name: "retryable", agent: "smoke-sl", events: false });
+  const joinedRecovered = await until(() => !M.retiring.has("retryable"), 10_000, "failed joined cleanup recovery");
+  check("failed joined cleanup recovers on a same-name spawn", joinedRecovered && !M.retiring.has("retryable"));
+
+  const exhausted = await failedStaticSpawn("retry-exhausted");
+  for (let attempt = 0; attempt < M.staticReconcileRetryDelaysMs.length; attempt++) {
+    const item = M.staticReconcileItems.get(exhausted.key)!;
+    if (item.timer) clearTimeout(item.timer);
+    item.timer = undefined;
+    item.nextRetryAt = undefined;
+    await M.retryStaticReconcile(exhausted.key);
+  }
+  const exhaustedStatus = M.staticReconcileItems.get(exhausted.key);
+  check("persistent retirement failure exhausts its bounded retry budget", exhaustedStatus?.attempts === 4 && exhaustedStatus.disposition === "retry-exhausted", exhaustedStatus);
+  check("retry exhaustion names same-name spawn as a recovery action", /same-name spawn/.test(exhaustedStatus?.remedy ?? ""), exhaustedStatus?.remedy);
+  check("retry exhaustion keeps a same-name hold", M.retiring.get("retry-exhausted")?.target.lifecycleUid === exhausted.uid);
+  M.staticReconcileRetryDelaysMs = [1_000, 1_000, 1_000];
+  const blockedExhaustedSpawn = await mgr.startAgent({ name: "retry-exhausted", agent: "smoke-sl", events: false });
+  check("same-name spawn after exhaustion refuses and re-drives retirement", blockedExhaustedSpawn.ok === false && /reserved pending retirement/.test(blockedExhaustedSpawn.error ?? ""), blockedExhaustedSpawn);
+  const reset = await until(() => exhaustedStatus?.disposition === "retry-scheduled" && exhaustedStatus.attempts === 1, 5_000, "fresh retry budget");
+  check("failed same-name re-drive resets the budget and clears its stale remedy", reset && exhaustedStatus?.remedy === undefined && M.retiring.get("retry-exhausted")?.target.lifecycleUid === exhausted.uid, exhaustedStatus);
+  const recoveredExhausted = await until(async () => (await readSlotOnly("retry-exhausted"))?.phase === "retired", 10_000, "exhausted rollback timer retry");
+  check("real retry timer retires the lifecycle without a manager restart", recoveredExhausted && !M.retiring.has("retry-exhausted"), { slot: await readSlotOnly("retry-exhausted"), hold: M.retiring.get("retry-exhausted") });
+  M.staticReconcileRetryDelaysMs = originalRetryDelays;
+  // ── 7. F3 rollback: a crash AFTER activation drives the exact-op terminal ──
+  crashLaunch = true;
+  const spawnC = await mgr.startAgent({ name: "crashy", agent: "smoke-sl", events: false });
+  crashLaunch = false;
+  check("a spawn that throws at buildLaunch fails WITH the injected crash (not an earlier refusal)", spawnC.ok === false && /injected buildLaunch crash/.test(spawnC.error ?? ""), spawnC);
+  const cSettled = await until(async () => (await readSlotOnly("crashy"))?.phase === "retired", 30_000, "the crashed spawn's rollback terminal");
+  check("the crashed spawn's slot reached RETIRED (no active orphan — F3)", cSettled);
+  const cSlot = await readSlotOnly("crashy");
+  if (cSlot) {
+    const sc = await readState("crashy", cSlot.actor, cSlot.lifecycleUid);
+    check("the crashed spawn's head is RETIRED and its gate terminally retired", sc.head?.state === "retired" && sc.gate?.state === "retired", { head: sc.head?.state, gate: sc.gate?.state });
+  }
+  // ── 8. Reconcile: ledgerless-vacuous vs fail-closed holder ─────────────────
+  const orphanId = newIdentity();
+  const orphanUid = mintLifecycleUid();
+  await plantActiveOrphan("orphan", orphanId.id, orphanUid, false);
+  evictionVerified = false;
+  evictionCalls = [];
+  await M.reconcileStaticLifecycles();
+  check("a ledgerless orphan retires without a broker eviction (vacuous SPEC 13.1 set)",
+    (await readSlotOnly("orphan"))?.phase === "retired" && evictionCalls.length === 0,
+    { slot: await readSlotOnly("orphan"), evictionCalls });
+
+  const heldId = newIdentity();
+  const heldUid = mintLifecycleUid();
+  await plantActiveOrphan("heldorphan", heldId.id, heldUid, true);
+  evictionVerified = false;
+  evictionCalls = [];
+  await M.reconcileStaticLifecycles();
+  check("an unverified orphan eviction keeps the slot terminalizing (never frees the alias into two owners)",
+    (await readSlotOnly("heldorphan"))?.phase === "terminalizing" && evictionCalls.includes(principalKey(DEV_OWNER, heldId.id).key),
+    { slot: await readSlotOnly("heldorphan"), evictionCalls });
+  evictionVerified = true;
+  await M.reconcileStaticLifecycles();
+  const oSettled = await until(async () => (await readSlotOnly("heldorphan"))?.phase === "retired", 30_000, "the ledgered orphan's reconcile terminal");
+  check("reconcile terminalized the dead-but-active slot (no active orphan across restarts)", oSettled);
+  check("the orphan's principal is refused at the control surface after reconcile", typeof M.lifecycleMembershipRefusal(principalKey(DEV_OWNER, heldId.id).key) === "string");
+  check("the LIVE agent (worker B) survived the reconcile untouched", M.agents.get("worker")?.lifecycleUid === uidB && (await readSlotOnly("worker"))?.phase === "active");
+
+  // ── 7b. F3 RESUME-PATH orphan (distsys/security4 CONDITIONAL @ 9e13648) ─────
+  // A durable ACTIVE slot NOT backed by a live managed agent, present while a resume is pending.
+  // The BOOT sweep must DEFER it (it might be adopted); the POST-ADOPTION sweep must terminalize
+  // it (it was not) and seed retiredPrincipals so F5(a) refuses its copied JWT.
+  const resOrphanId = newIdentity();
+  const resOrphanUid = mintLifecycleUid();
+  {
+    const creds = await mintCreds(auth, newIdentity(), "lifecycle-executor", {
+      lifecycleExecutor: { owner: DEV_OWNER, actor: resOrphanId.id, lifecycleUid: resOrphanUid, alias: "resorphan" },
+    });
+    const nc = await connect({ servers: SERVERS, ...standaloneConnectOpts({ creds, tls: false }), maxReconnectAttempts: 0 });
+    try {
+      const kvm = new Kvm(nc);
+      const t = staticLifecycleTransport(await kvm.open(recordsBucket(space)), await kvm.open(epAuthBucket(space)));
+      await activateStaticLifecycle(t, { owner: DEV_OWNER, alias: "resorphan", actor: resOrphanId.id, lifecycleUid: resOrphanUid, managerInstance: "smoke", ownerInstanceId: M.managerInstanceId });
+      const slot = await readStaticSlot(t, DEV_OWNER, "resorphan");
+      await casStaticSlot(t, { ...slot!.row, phase: "active" }, slot!.revision);
+    } finally {
+      await nc.drain().catch(() => nc.close());
+    }
+  }
+  (mgr as unknown as { resumeRequired: boolean }).resumeRequired = true;
+  await M.reconcileStaticLifecycles(); // BOOT sweep (resume pending): must DEFER the active orphan
+  check("BOOT sweep DEFERS a resume-pending active orphan (does not terminalize it)", (await readSlotOnly("resorphan"))?.phase === "active");
+  check("a deferred orphan's principal is NOT yet in the refusal index (still awaiting adoption)", M.lifecycleMembershipRefusal(principalKey(DEV_OWNER, resOrphanId.id).key) === undefined);
+  await (mgr as unknown as { reconcileStaticLifecycles: (p: boolean) => Promise<void> }).reconcileStaticLifecycles(true); // POST-ADOPTION sweep: not in this.agents -> terminalize
+  (mgr as unknown as { resumeRequired: boolean }).resumeRequired = false;
+  const rSettled = await until(async () => (await readSlotOnly("resorphan"))?.phase === "retired", 30_000, "the resume-path orphan's post-adoption terminal");
+  check("POST-ADOPTION sweep terminalized the unadopted active orphan (F3 resume-path fix)", rSettled);
+  check("the resume-path orphan's principal now REFUSES at the control surface (F5(a) closed on resume)", typeof M.lifecycleMembershipRefusal(principalKey(DEV_OWNER, resOrphanId.id).key) === "string");
+  check("worker B STILL survived both resume-path sweeps (live membership adopted)", M.agents.get("worker")?.lifecycleUid === uidB && (await readSlotOnly("worker"))?.phase === "active");
+
+  // ── 7c. #1274 durable cleanup-complete marker (crash between cleanup and the retired CAS) ──
+  // A `terminalizing` row whose `cleanupComplete` is already set models world 3: cleanup finished,
+  // the process died before the `retired` CAS. A resumed terminal must READ that marker and NOT
+  // re-run cleanup, yet still reach `retired`. A `terminalizing` row WITHOUT the marker is worlds
+  // 1/2 (cleanup never ran / in flight): the resume MUST re-run the idempotent cleanup, and on
+  // success the row it settles must carry the marker (written BEFORE the retired CAS).
+  const markedResume = await driveTerminalDirect("resumemarked", { preMarkedCleanupComplete: true });
+  check("a resume over a cleanupComplete=true terminalizing slot SKIPS cleanup (world 3: already done)", markedResume.cleanupCalls === 0, markedResume.cleanupCalls);
+  check("that resume still reaches RETIRED (the marker recovers, it does not wedge)", markedResume.slot?.phase === "retired" && markedResume.slot?.cleanupComplete === true, markedResume.slot);
+  const plainResume = await driveTerminalDirect("resumeplain", { preMarkedCleanupComplete: false });
+  check("a resume over an UNMARKED terminalizing slot re-runs cleanup once, then RETIRES marking cleanup complete (write before the retired CAS)",
+    plainResume.cleanupCalls === 1 && plainResume.slot?.phase === "retired" && plainResume.slot?.cleanupComplete === true,
+    { calls: plainResume.cleanupCalls, slot: plainResume.slot });
+} finally {
+  await (mgr as unknown as { stop?: () => Promise<void> }).stop?.().catch(() => {});
+  await stopBroker();
+}
+
+if (failures > 0) {
+  console.log(`STATIC-LIFECYCLE SMOKE FAILED (${failures} failures)`);
+  process.exit(1);
+}
+// Completeness is checked AFTER failures, so a suite that failed reports the defect rather than the
+// count it never reached. Reaching here with fewer assertions than declared means proofs went
+// missing without any of them failing, which is not a pass.
+if (ran !== EXPECTED_CHECKS) {
+  console.log(`STATIC-LIFECYCLE SMOKE FAILED (ran ${ran} of ${EXPECTED_CHECKS} declared assertions; a green here would have claimed proofs this run never executed)`);
+  process.exit(1);
+}
+console.log(`STATIC-LIFECYCLE SMOKE OK ✅ (${ran}/${EXPECTED_CHECKS} assertions)`);
+console.log(`${ran} checks passed`);

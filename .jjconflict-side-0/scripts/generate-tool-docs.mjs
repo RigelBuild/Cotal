@@ -1,0 +1,310 @@
+// Generate docs/mcp-tools.mdx from the live cotal_* tool specs (run: pnpm gen:tooldocs,
+// which invokes this through tsx so the TS import below resolves).
+//
+// The names, titles, descriptions, and argument schemas come straight from
+// `extensions/connector-core/src/tool-specs.ts` — the single source every connector
+// renders — so the catalog cannot drift from the shipped surface. Side-effect labels and
+// failure notes are not modelled on the specs, so they live in the ANNOTATIONS table
+// below; the script FAILS LOUD when a tool is missing an annotation (or an annotation is
+// orphaned), so adding or removing a tool forces the catalog to keep up.
+import { existsSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { cotalToolSpecs } from "../extensions/connector-core/src/tool-specs.ts";
+import { markdownToMdx } from "@cotal-ai/docs-content/generate";
+
+const here = dirname(fileURLToPath(import.meta.url));
+const out = join(here, "..", "docs", "mcp-tools.mdx");
+
+// A representative config: open-mode-ish (no creds ⇒ the capability-gated tools are
+// included and marked below), subscribed to `general` so channel-defaulted arguments render a
+// concrete example. Channels are NOT a default: an agent whose persona lists none joins none, and
+// its `cotal_send` renders "no default" instead. The preamble below says so.
+const config = {
+  space: "main",
+  name: "you",
+  servers: "nats://127.0.0.1:4222",
+  subscribe: ["general"],
+  allowSubscribe: ["general"],
+  allowPublish: ["general"],
+  kind: "agent",
+};
+
+/** Side-effect + availability annotations, keyed by tool name. Every spec MUST have one. */
+const ANNOTATIONS = {
+  cotal_orientation: {
+    effect: "read-only",
+    availability: "always",
+    notes: "Call it first; safe to re-check anytime.",
+  },
+  cotal_connection_status: {
+    effect: "read-only",
+    availability: "always",
+    notes:
+      "Reads this session's MeshAgent directly. `lastDrainedAt` is omitted until a non-empty inbox drain has successfully committed.",
+  },
+  cotal_roster: { effect: "read-only", availability: "always" },
+  cotal_docs: {
+    effect: "read-only",
+    availability: "always",
+    notes:
+      "Serves the version-exact docs bundled with this release (offline). The connector builds the docs and their search index when the tool is first called. `refresh: true` adds an opt-in pull from docs.cotal.ai that is version-gated, so it can never return docs for a different version.",
+  },
+  cotal_inbox: {
+    effect: "clears only the messages it returns (nothing at all when peek is true)",
+    availability: "always",
+    notes:
+      "One call carries at most a receivable window; what does not fit stays buffered, is named in the reply, and comes back on the next call. A message larger than the window comes back in parts, one per call, and is cleared with its last part. A message with an empty id is tracked as itself, so it is held, named and read in parts like any other. OpenCode, Codex, Hermes, and Pi expose no arguments, and Jcode exposes only `peek`: automatic traffic remains connector-owned, while buffered quiet ambient is what this call returns and clears. In focus mode, normal channel recall is also shown read-only (replay-gated) and is never cleared by the read; an oversized recall message comes back in parts the same way, and later recall waits behind it until its last part goes out.",
+  },
+  cotal_send: {
+    effect: "publishes to a channel",
+    availability: "always (the broker enforces your post ACL)",
+    notes:
+      "Fails loud when the channel is outside your `allowPublish`. A pattern such as `team.>` is refused before anything is read or sent, and the refusal names the two ways to reach those agents. A name that is not a channel name, such as `team.**`, is refused the same way rather than rewritten onto another channel. With no `channel`, a mesh that enforces ACLs sends to the first channel you read and may post to; with none, the send is refused. An open mesh sends to the first channel you read. An unknown name in `mentions` aborts the whole broadcast. On success the tool answers `Posted to #<channel>. Agents on it see it; mention one to make it act.`, or with mentions `Posted to #<channel> and mentioned @<name>. Age: <age>.`. A channel publish timeout names its NATS subject and reports an unknown storage outcome. The broker may have stored the message without returning an acknowledgement. Check before resending.",
+  },
+  cotal_dm: {
+    effect: "sends a private message to one peer",
+    availability: "always",
+    notes:
+      "A name must match a present peer's name in full (case-insensitive) or its instance id. On a miss nothing is sent, and the refusal lists present names that start with the target so you can choose one; it never picks one for you. Your own name is refused as this session, not as a missing peer. " +
+      "A DM publish timeout names its NATS subject and reports an unknown storage outcome. A timeout is not proof that the message was rejected or not delivered. Check before resending.",
+  },
+  cotal_anycast: {
+    effect: "queues a request for one holder of a role",
+    availability: "always",
+    notes: "When no holder is online the reply says that the request waits on the role's queue.",
+  },
+  cotal_status: {
+    effect: "updates your own presence / attention",
+    availability: "always",
+    notes:
+      "With no arguments it just reports the current values. An activity with no status changes only the activity line; your status and any condition stay as they are. A timed-out presence write reports that its outcome is unknown: the broker may have stored the update. Read the roster before retrying.",
+  },
+  cotal_channel_info: {
+    effect: "read-only",
+    availability: "always",
+    notes:
+      "An unregistered name is reported as not in the channel registry. It is still a real channel if it has traffic. An agent's event channel (`events.<owner>.<actor>`) is described as one, and your own as yours.",
+  },
+  cotal_channels: { effect: "read-only", availability: "always" },
+  cotal_channel_mode: {
+    effect: "sets your own per-channel receive preference (quiet / muted / normal)",
+    availability: "always",
+    notes: "Local preference, not access control; resets on restart.",
+  },
+  cotal_join: {
+    effect: "subscribes you to a channel",
+    availability: "always, within your read ACL (`allowSubscribe`); outside it the join is refused",
+    notes: "If the channel replays, recent history lands in your inbox marked as catch-up.",
+  },
+  cotal_leave: { effect: "unsubscribes you from a channel", availability: "always" },
+  cotal_spawn: {
+    effect: "starts a new agent process via the manager",
+    availability:
+      "capability-gated: injected only for personas declaring `capabilities: [spawn]` (auth mode); open mode is permissive",
+    notes:
+      "Failure modes are distinct: a permission denial names the missing capability; an unreachable manager is reported as such; a lifecycle barrier that already holds the actor (frozen issuance gate, retiring alias) names the blocked op, head state, opId, and the remedy when one exists, rather than a wait-timeout. A started seat's result names it, any `join` channels, and the next move: `Started <name> on #<channel> (<runtime>). Post the brief there, and mention it only when it must act. Despawn it when its job is done.` A once seat is not told to be despawned, since its manager stops it. Without `join`, the result says the seat starts only on the channels its persona lists, which may be none, and names `join`. The result never names a persona's own channels, which the caller may not be allowed to read. A seat waiting at an operator screen, such as Claude's session picker, is reported as not yet on the mesh. A launch that has not joined the mesh within its readiness window returns a pending result instead of an error: it names the allocated agent, its id, and its manager, and says to watch the roster, because spawning again starts a second agent. A launch whose requested `model` pin cannot be read back returns a partial result: the pin read failed or timed out, or the manager answered without reporting a pin. The result names the seat, its id, manager and runtime, says the pin is unaudited, and gives `cotal ps --on <manager>` as the next step; its structured content carries the same facts. Spawning again would start a second agent. A recorded pin that differs from the request, or no recorded pin, is still refused.",
+  },
+  cotal_feedback: {
+    effect: "sends data to an external HTTPS intake (network egress)",
+    availability: "always",
+    notes:
+      "Keyless submissions need a contact email; never include secrets. A send is confirmed only by the intake's HTTP 202 receipt (`ok`, `id`, and `published`). Any other 2xx is an unconfirmed outcome and is not retried. A redirect is not followed.",
+  },
+  cotal_despawn: {
+    effect: "stops a teammate (or yourself)",
+    availability:
+      "self-despawn (no name) is granted to all; stopping a *named* peer rides the spawn capability's owner-mode reach (your own owner's agents only)",
+  },
+  cotal_yield: {
+    effect: "settles one run turn via the manager (done / blocked / handoff)",
+    availability: "always; only meaningful while a run turn is pending on you",
+    notes:
+      "Ending your session turn already yields `done` for every turn you were shown; call this only when blocked or handing off.",
+  },
+  cotal_run: {
+    effect: "starts, resumes, or answers a durable workflow run hosted by the manager; `status`/`ps` are read-only",
+    availability:
+      "capability-gated: injected only for personas declaring `capabilities: [run]` (auth mode). Hosted runs require issued caller authority and an execution-capable manager. Managed user-auth agents use their own bearer command and selected participant manager, with current child and direct-parent `run` grants. Open meshes and execution-free control managers refuse execution ([workflow setup](workflows.md#from-an-agent-session))",
+    notes:
+      "`start` sends the program source inline and returns the run id at once; the manager validates first and a refusal lists every problem with its line, cause, and fix. The run continues on the manager after your session ends and is taken back after a manager restart. `answer` records you as the answerer: the manager takes your name from your credential, and the tool sends none.",
+  },
+  cotal_persona: {
+    effect: "writes a persona file via the manager (becomes spawnable); posts one message ONLY if you pass `announce`",
+    availability: "capability-gated like cotal_spawn",
+    notes:
+      "Writes content (`prompt`, `model`, role, agent and channel lists) and `capabilities`, which the manager checks against what you hold before it writes; ownership has no slot. A definition that would not load back is refused before anything is written, with `Couldn't define <name>: it would not load: <reason>`. " +
+      "Defining is silent by default. `announce` is the only way it emits, and then only to the channel you name.",
+  },
+  cotal_personas: {
+    effect: "read-only",
+    availability: "capability-gated like cotal_spawn",
+    notes:
+      "Omit `name` to list spawnable names; pass `name` to show one card you own. Role, model, and description ride only on files you own; show of a name you do not own is not-found.",
+  },
+  cotal_endpoints: {
+    effect: "none; asks the space's registry which endpoints and commands your recorded grants cover",
+    availability: "always; a credential with no listing binding is told so, and where no registry answers the tool says so and lists nothing",
+    notes:
+      "The answer's `source` says where its rows came from: `recorded-ceiling` (the grants recorded at issuance, source liveness not checked) or `no-permission-system` (an open mesh, every registered endpoint).",
+  },
+  cotal_describe: {
+    effect: "none; reads an endpoint's registered command surface",
+    availability: "any session whose credential carries caller rows for the endpoint (describe rides them)",
+    notes: "The surface is digest-verified against the contract store. Unknown fields in a reply are data.",
+  },
+  cotal_invoke: {
+    effect: "whatever the named command does",
+    availability: "only the commands your own credential has caller grants for; the broker refuses the rest",
+    notes:
+      "`not-executed` means the command did not run; `unknown` means it may have. A reply over 200,000 characters of JSON is refused, not cut; ask for a smaller page. An error's message and details are held to the same limit, whether the endpoint answered with the error or the call was refused before it was sent: a message or details over it are withheld with their size, and the code and outcome still come through. Arguments refused by the input schema report outcome `not-executed`.",
+  },
+  cotal_reconnect: {
+    effect: "tears down and rebuilds your own mesh connection",
+    availability: "always",
+    notes: "The tool result is authoritative over any prose about the outcome.",
+  },
+};
+
+/** Unwrap a zod type to { type, optional, description } without depending on private API names. */
+function describeArg(name, schema) {
+  let s = schema;
+  let optional = false;
+  const description = s.description ?? s.meta?.()?.description;
+  // Walk wrapper types (optional/default/nullable) down to the base.
+  for (let i = 0; i < 6; i++) {
+    const def = s._zod?.def ?? s._def ?? s.def;
+    if (!def) break;
+    const t = def.type ?? def.typeName;
+    if (t === "optional" || t === "ZodOptional" || t === "default" || t === "ZodDefault") {
+      optional = true;
+      s = def.innerType;
+      continue;
+    }
+    if (t === "nullable" || t === "ZodNullable") {
+      s = def.innerType;
+      continue;
+    }
+    break;
+  }
+  const def = s._zod?.def ?? s._def ?? s.def;
+  let type = def?.type ?? def?.typeName;
+  if (!type) throw new Error(`cannot derive type for arg "${name}"`);
+  type = String(type).replace(/^Zod/, "").toLowerCase();
+  if (type === "enum") {
+    const values = def.entries ? Object.keys(def.entries) : (def.values ?? []);
+    type = values.map((v) => `\`${v}\``).join(" \\| ");
+  } else if (type === "array") {
+    const el = def.element ?? def.valueType;
+    const elDef = el?._zod?.def ?? el?._def;
+    type = `${String(elDef?.type ?? elDef?.typeName ?? "any").replace(/^Zod/, "").toLowerCase()}[]`;
+  } else {
+    type = `${type}`;
+  }
+  const desc = description ?? schema.description;
+  if (!desc) throw new Error(`arg "${name}" has no .describe() text`);
+  return { type, optional, description: desc };
+}
+
+const specs = cotalToolSpecs(config);
+const specNames = new Set(specs.map((s) => s.name));
+for (const s of specs) if (!ANNOTATIONS[s.name]) throw new Error(`missing annotation for ${s.name} — add it to scripts/generate-tool-docs.mjs`);
+for (const n of Object.keys(ANNOTATIONS)) if (!specNames.has(n)) throw new Error(`orphaned annotation ${n} — the tool no longer exists`);
+
+const lines = [];
+lines.push(
+  "The tools are defined once, platform-neutrally, in `@cotal-ai/connector-core` and rendered onto each host's native tool API (an MCP server for [Claude Code](connect-claude.md), [Codex](connect-codex.md) and [Jcode](connect-jcode.md), native plugin tools for [OpenCode](connect-opencode.md), [Hermes](connect-hermes.md), and [pi](connect-pi.md)), so the surface cannot drift across connectors. Argument defaults shown below are rendered for an agent subscribed to `general`; an agent reads only the channels its persona lists, so one that lists none has no default channel at all and `cotal_send` requires an explicit `channel`. Channel-scoped calls are bounded by your ACLs ([channels & permissions](channels-and-permissions.md)).",
+);
+lines.push("");
+lines.push(
+  "Hosted HTTP gateways can also implement the draft MCP Events methods through an optional `GatewayRequest.events` adapter. Only an endpoint with that adapter advertises `events` and serves `events/list`, `events/subscribe`, and `events/unsubscribe`. The gateway resolves the account from transport authentication before calling the adapter. Subscription validation, consent, callback verification, delivery, expiry, and revocation belong to the embedding service; the stock gateway does not deliver events by itself.",
+);
+lines.push("");
+lines.push(
+  "`cotal_orientation` is the entry point. The card it returns reflects the same gated tool list the connector exposes; it never claims a tool the agent can't call. In auth mode the manager-op tools (`cotal_spawn`, `cotal_persona`, `cotal_personas`) are injected only for personas declaring `capabilities: [spawn]`, and `cotal_run` only for `capabilities: [run]` ([identity & auth](identity-and-auth.md)).",
+);
+lines.push("");
+lines.push(
+  "**Arguments are closed.** Every tool accepts only the arguments listed for it and REFUSES any other key, including tools that take no arguments at all. An unlisted key is an error. A call that supplies an identity (`owner`, `actor`, `caller`) is turned away before anything runs. The identity a tool acts under comes from the connector's own credential and can never be supplied as an argument. Every refusal names the offending keys, but its shape depends on who refuses: where the host validates the published schema (Claude Code, Codex, pi) you get that host's own schema error, and where it does not (OpenCode, Hermes) the connector refuses at its own dispatch and additionally lists the arguments the tool does accept, or says it takes none. In both cases the call did not run.",
+);
+lines.push("");
+lines.push("| Tool | Does | Side-effect |");
+lines.push("|---|---|---|");
+for (const s of specs) {
+  const a = ANNOTATIONS[s.name];
+  const short = s.title.replace(/^Cotal: /, "");
+  // GitHub and the docs site both slug the `cotal_x` heading as cotal_x, underscores kept.
+  lines.push(`| [\`${s.name}\`](#${s.name}) | ${short} | ${a.effect} |`);
+}
+lines.push("");
+
+for (const s of specs) {
+  const a = ANNOTATIONS[s.name];
+  lines.push(`## \`${s.name}\``);
+  lines.push("");
+  lines.push(`*${s.title.replace(/^Cotal: /, "")}*`);
+  lines.push("");
+  lines.push(s.description);
+  lines.push("");
+  if (s.name === "cotal_inbox") {
+    lines.push(
+      "**Connector variants:** Claude Code exposes the `peek` argument and otherwise reads the whole local inbox, one receivable window per call. OpenCode, Codex, Hermes, and Pi expose no arguments: the call pulls only buffered quiet ambient, leaving automatic traffic to the connector; normal focus recall shown with it remains read-only. Jcode also pulls only buffered quiet ambient but keeps the `peek` argument. On every variant the call clears only what that response actually carried.",
+    );
+    lines.push("");
+  }
+  lines.push(`- **Side-effect:** ${a.effect}.`);
+  lines.push(`- **Available:** ${a.availability}.`);
+  if (a.notes) lines.push(`- ${a.notes}`);
+  lines.push("");
+  // `s.schema` is a closed Zod OBJECT, not the raw shape it was authored as — the field map lives
+  // on `.shape`. Enumerating the object itself yields Zod's own internals (`def`, `toJSONSchema`, …)
+  // and renders them as arguments.
+  const shape = s.schema.shape;
+  if (Object.keys(shape).length) {
+    lines.push("| Argument | Type | Required | Meaning |");
+    lines.push("|---|---|---|---|");
+    for (const [arg, zodType] of Object.entries(shape)) {
+      const d = describeArg(arg, zodType);
+      lines.push(`| \`${arg}\` | ${d.type} | ${d.optional ? "no" : "yes"} | ${d.description.replace(/\n/g, " ")} |`);
+    }
+    lines.push("");
+  } else {
+    lines.push("No arguments.");
+    lines.push("");
+  }
+  if (s.name === "cotal_dm") {
+    lines.push(
+      "On success the tool answers `Sent to <name>. Other agents can't read it. If others could use it, post it on the task's channel.`, appending ` duplicate publication.` when the publish was a duplicate. The broker stored the DM; nothing confirms the recipient read it. When the recipient was `offline`, the answer adds `<name> is offline: the DM is delivered when <name> reconnects, and a new agent spawned as <name> does not receive it.` The DM durable belongs to the recipient's lifecycle ([SPEC §8](../SPEC.md#8-nats--jetstream-binding)), so the same session receives the DM when it comes back, and a new spawn under that name starts after it. When `to` names a peer with no roster row that sent you a DM or anycast, such as a one-shot [`cotal send`](cli.md#send), the DM goes to that sender's id and the answer says it has no roster row. The space's DM history keeps the DM, so an operator's DM view shows it, but it may never reach an inbox. A name that two such senders share is refused with their ids.",
+    );
+    lines.push("");
+  }
+  if (s.name === "cotal_anycast") {
+    lines.push(
+      "On success the tool answers `Request stored as seq <N> on the @<role> queue (<k> holders online at send; delivery not confirmed).`, appending ` duplicate publication.` when the publish was a duplicate. The sequence proves the broker stored the request on the role's work queue. A role is one `[A-Za-z0-9_-]` token, and any other spelling, `*` included, is refused before anything is sent. The count is the roster's live seats holding that role a moment before the publish, you included when you hold that role, since your own task consumer can take the request like any other holder's. While the presence view is not current the count reads `holders unknown at send: the presence view was not current`, because a partial roster cannot show that no holder exists. Neither the sequence nor the count proves a holder took the request.",
+    );
+    lines.push("");
+  }
+}
+
+lines.push("---");
+lines.push("");
+lines.push(
+  "Messages arrive in an agent's context as `<channel source=\"cotal\" from=\"<name>\" role=\"<role>\" kind=\"dm|channel|anycast\" channel=\"<name>\">…</channel>`; each meta key is a tag attribute usable for routing. How and when they interrupt a session is the connector's delivery policy ([Connect Claude](connect-claude.md#how-messages-reach-the-session)).",
+);
+lines.push("");
+
+lines.push("Generated from [`tool-specs.ts`](../extensions/connector-core/src/tool-specs.ts) by `pnpm gen:tooldocs`.");
+const metadata = [
+  "---",
+  "title: MCP tool catalog",
+  "description: Arguments, availability, and effects of the Cotal tools exposed to agent sessions.",
+  "kind: \"Reference: the `cotal_*` tool surface every connected agent gets.\"",
+  "audience: agents and operators",
+  "---",
+  "",
+  "",
+].join("\n");
+const markdown = lines.join("\n").replace(/\]\(([^)\s]+\.md)(#[^)]*)?\)/g, (match, target, hash = "") => existsSync(join(dirname(out), target + "x")) ? `](${target}x${hash})` : match);
+writeFileSync(out, metadata + markdownToMdx(markdown));
+
+console.log(`gen:tooldocs — wrote ${out} (${specs.length} tools)`);

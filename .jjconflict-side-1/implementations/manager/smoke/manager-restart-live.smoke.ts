@@ -1,0 +1,155 @@
+/**
+ * FULL-STACK AUTH RESTART-SUCCEEDS smoke (control-surface P2 item 3, slice 3c fold) — the deferred
+ * "AUTH mesh + delivery daemon restart SUCCEEDS" assertion the manager-service smoke could only
+ * cover as its LOUD no-daemon refusal.
+ *
+ * A REAL JWT-auth broker (system account) + the shipped delivery-admin eviction rail, booted by the
+ * shared `bootDeliveryDaemon` fixture: `CotalEndpoint.handleDeliveryAdmin` executing core's
+ * `evictDeniedPrincipal(s)WithCreds` over the two scoped $SYS creds. A Manager registers, accepts +
+ * terminates a goal under epoch 0, then RESTARTS in the same workspace root. On an AUTH mesh the
+ * registration barrier's PHASE 2 must VERIFY-EVICT the superseded serve family before the epoch
+ * advances — so the restart drives the manager → `ctl.delivery-admin` → real eviction chain end to
+ * end and SUCCEEDS: same logical instanceId, an ADVANCED process epoch.
+ *
+ * RETARGETED, along with `manager-restart-fence`, whose inverted pair this suite carries at 3c. It
+ * used to assert that the predecessor's terminal was FENCED — invisible to the current-epoch reader
+ * — under the epoch-scoped subject `…result.<execEpoch>`. That subject is gone: §13.2 reserved subjects reserves a
+ * flat `…result` leaf, and the assertion was wrong: a verified eviction kills the predecessor, but
+ * it does not retract what the predecessor already durably committed, and the pre-restart fact is
+ * usually the real outcome rather than a corpse's guess. It now asserts the opposite and stronger
+ * thing — the terminal SURVIVES the evicting restart, and the successor's contradictory second
+ * terminal loses the create-only CAS.
+ *
+ * Run: pnpm smoke:manager-restart-live   (needs nats-server + node on PATH; boots its own JWT broker)
+ */
+import { randomUUID } from "node:crypto";
+import { spawn } from "node:child_process";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { SMOKE_BROKER_TOKEN, freePort, teardownOnSignal } from "@cotal-ai/smoke-kit";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { connect } from "@nats-io/transport-node";
+import type { ActionContext, EpCaller, ParsedEpRequest } from "@cotal-ai/core";
+import { workspaceSecretStore } from "@cotal-ai/workspace";
+import { bootDeliveryDaemon } from "./_boot-delivery.js";
+
+const dir = mkdtempSync(join(tmpdir(), SMOKE_BROKER_TOKEN));
+process.env.COTAL_HOME = join(dir, "home");
+const {
+  isReachable, createSpaceAuth, serverConfig, setupSpaceStreams, mintCreds, newIdentity,
+  mintLifecycleUid, DEV_OWNER,
+  bindGoal, createGoal, commitGoalResult, readGoalResult, goalRefOf,
+} = await import("@cotal-ai/core");
+const { authDir, saveSpaceAuth, recordMesh } = await import("@cotal-ai/workspace");
+const { Manager } = await import("../src/manager.js");
+const { MANAGER_ENDPOINT } = await import("../src/manager-service-contract.js");
+
+const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
+let pass = 0, fail = 0;
+const check = (name: string, cond: boolean, extra?: unknown) => {
+  if (cond) { pass++; console.log(`  ✓ ${name}`); }
+  else { fail++; console.log(`  ✗ FAIL: ${name}`, extra !== undefined ? JSON.stringify(extra) : ""); }
+};
+
+const PORT = await freePort();
+const SERVERS = `nats://127.0.0.1:${PORT}`;
+const SPACE = `mgrrestart-${randomUUID().slice(0, 8)}`;
+const auth = await createSpaceAuth(SPACE);
+const workspaceRoot = join(dir, "ws");
+mkdirSync(join(workspaceRoot, ".cotal", "agents"), { recursive: true });
+saveSpaceAuth(authDir(workspaceRoot), auth);
+writeFileSync(join(dir, "server.conf"), serverConfig(auth, [auth], { transport: { kind: "plaintext" }, port: PORT, storeDir: join(dir, "js") }));
+
+const caller: EpCaller = { owner: DEV_OWNER, actor: newIdentity().id, uid: mintLifecycleUid() };
+const reqFor = (goalId: string): ParsedEpRequest =>
+  ({ plane: "request", route: "one", endpoint: MANAGER_ENDPOINT, command: "spawn", caller, id: goalId } as unknown as ParsedEpRequest);
+
+type MgrPriv = { managerInstanceId: string; serviceServe?: { grant: { epoch: number; instanceId: string } }; goalWriter?: { ctx: ActionContext } };
+const kids: ReturnType<typeof spawn>[] = [];
+let releaseBroker: (() => void) | undefined;
+let mgr: InstanceType<typeof Manager> | undefined;
+let delivery: Awaited<ReturnType<typeof bootDeliveryDaemon>> | undefined;
+try {
+  const srv = spawn("nats-server", ["-c", join(dir, "server.conf")], { stdio: "ignore" });
+  kids.push(srv);
+  releaseBroker = teardownOnSignal(srv, dir);
+  let up = false;
+  for (let i = 0; i < 60; i++) { if (await isReachable(SERVERS)) { up = true; break; } await wait(200); }
+  if (!up) throw new Error(`auth nats-server did not come up on ${PORT}`);
+  await setupSpaceStreams({ servers: SERVERS, space: SPACE, creds: await mintCreds(auth, newIdentity(), "provisioner") });
+  recordMesh({ space: SPACE, server: SERVERS, root: workspaceRoot, mode: "auth", ts: new Date().toISOString() });
+
+  // ── the shipped delivery-admin rail (lease held and renewed, both eviction verbs served) ──
+  let evictCalls = 0;
+  delivery = await bootDeliveryDaemon({
+    space: SPACE, servers: SERVERS, auth, reloadStoreIdentity: workspaceSecretStore(workspaceRoot).identity,
+    onEvict: () => { evictCalls++; },
+  });
+
+  // ── incarnation 1 (epoch 0) ──
+  mgr = new Manager({ space: SPACE, servers: SERVERS, runtime: "pty", workspaceRoot });
+  await mgr.start();
+  const M1 = mgr as unknown as MgrPriv;
+  const iid1 = M1.managerInstanceId;
+  const epoch1 = M1.serviceServe!.grant.epoch;
+  check("incarnation 1 registered its persisted instanceId at epoch 0 (a FIRST registration on AUTH)",
+    M1.serviceServe!.grant.instanceId === iid1 && epoch1 === 0, { iid1, epoch1 });
+
+  // A goal ACCEPTED under epoch 0 and terminated by incarnation 1 before it dies — the legitimate
+  // pre-restart winner, whose survival across a REAL auth restart is what this leg proves.
+  const gw1 = M1.goalWriter!.ctx;
+  const ref1 = goalRefOf(reqFor("g-pre-restart"), "g-pre-restart");
+  await bindGoal(gw1, ref1, "fp-pre-restart");
+  await createGoal(gw1, ref1, {
+    fingerprint: "fp-pre-restart", command: "spawn", caller: { id: `${caller.owner}.${caller.actor}`, lifecycleUid: caller.uid },
+    requestId: "g-pre-restart", sourceSeq: 0, acceptedAt: 1_000_000, readinessDeadlineMs: 30_000,
+    acceptedEpoch: epoch1,
+  });
+  await commitGoalResult(gw1, {
+    ref: ref1, now: 1_000_001, cause: "complete", state: "failed",
+    data: { by: "pre-restart" }, committer: { instanceId: iid1, epoch: epoch1 },
+  });
+  check("incarnation 1 sees the terminal it committed under its own accepted epoch", (await readGoalResult(gw1, ref1))?.state === "failed");
+
+  // ── the AUTH restart: PHASE-2 verify-evicts the superseded serve family via the delivery daemon ──
+  await mgr.stop();
+  mgr = new Manager({ space: SPACE, servers: SERVERS, runtime: "pty", workspaceRoot });
+  await mgr.start(); // this SUCCEEDS only because the delivery-admin eviction responder answered
+  const M2 = mgr as unknown as MgrPriv;
+  const iid2 = M2.managerInstanceId;
+  const epoch2 = M2.serviceServe!.grant.epoch;
+
+  check("the AUTH restart SUCCEEDED — it drove the delivery-admin eviction responder", evictCalls >= 1, { evictCalls });
+  check("the restart PRESERVED the logical instanceId (persisted, not a fresh mint)", iid2 === iid1, { iid1, iid2 });
+  check("the restart ADVANCED the process epoch through the §13.1 gate (superseding the predecessor)",
+    epoch2 > epoch1 && M2.serviceServe!.grant.instanceId === iid1, { epoch1, epoch2 });
+
+  // TERMINAL SURVIVAL on a real AUTH+daemon restart. A verified eviction kills the PREDECESSOR; it
+  // does not retract what the predecessor already durably committed. So the pre-restart fact stands
+  // and the successor cannot overwrite it — one goal, one terminal subject, first fact wins.
+  const gw2 = M2.goalWriter!.ctx;
+  const survived = await readGoalResult(gw2, ref1);
+  check("the pre-restart terminal SURVIVES the evicting restart and is what the restarted incarnation reads",
+    survived?.state === "failed" && (survived?.data as { by?: string })?.by === "pre-restart", survived);
+  const second = await commitGoalResult(gw2, {
+    ref: ref1, now: 1_000_002, cause: "complete", state: "succeeded",
+    data: { by: "successor" }, committer: { instanceId: iid1, epoch: epoch2 },
+  });
+  check("the successor's CONTRADICTORY second terminal loses the create-only CAS and reads back the winner",
+    second.won === false && second.fact.state === "failed" && (second.fact.data as { by?: string })?.by === "pre-restart",
+    { won: second.won, fact: second.fact });
+} finally {
+  await mgr?.stop().catch(() => {});
+  await delivery?.stop().catch(() => {});
+  for (const k of kids) { try { k.kill("SIGKILL"); } catch { /* best effort */ } }
+  // The scratch tree goes too. Its absence here is the defect: this suite passed, said so, and
+  // left one directory behind on every green run — reproduced by count, not inferred. The pause
+  // is the one `_boot-broker` uses: removing the tree while the broker is still flushing
+  // JetStream state leaves files behind it recreates, so the directory survives its own removal.
+  await wait(200);
+  rmSync(dir, { recursive: true, force: true });
+  releaseBroker?.(); // last: ownership is held until this teardown has actually finished
+}
+
+console.log(`\n${fail === 0 ? "AUTH RESTART-SUCCEEDS (full-stack) SMOKE OK ✅" : "AUTH RESTART-SUCCEEDS SMOKE FAILED"}  (${pass} passed, ${fail} failed)`);
+process.exit(fail === 0 ? 0 : 1);

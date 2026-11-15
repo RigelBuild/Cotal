@@ -1,0 +1,101 @@
+{
+  "suite": [
+    "extensions/connector-jcode/smoke/jcode-host.smoke.ts"
+  ],
+  "guard": "Jcode retries a first readiness turn that used its pre-MCP tool snapshot exactly once, still refuses a never-callable bridge without presence, opens the foreground TUI before readiness completes, records that bootstrap orientation predates an actual completed mesh join, bounds the readiness proof so a long turn cannot stay invisible, names that pre-join gate in the connector log, names the timeout outcome separately from a hang, a missing prompt, or a provider refusal, and joins on an observed orientation tool_done even when that turn never emits turn_done",
+  "command": "pnpm --filter @cotal-ai/connector-core... build && pnpm smoke:jcode-host",
+  "minTicks": 8,
+  "proveWith": "node scripts/mutation-proof.mjs --config extensions/connector-jcode/smoke/mutations/jcode-readiness.json",
+  "why": [
+    "Jcode locks its first turn's tool list before asynchronous MCP registration can complete. The connector cannot treat that first absent call as a permanent bridge failure, but must not advertise without a real later tool call either (#777).",
+    "The remaining cells pin the same boot ordering: the foreground observer must start while readiness is in flight (#779), and the transcript must explicitly supersede the truthful but stale pre-join orientation result only after a completed mesh join (#778, #845).",
+    "A heavy persona can keep the readiness turn alive with no mesh presence. The host now bounds that turn, names the pre-join gate while it is in flight, and names the outcome (proved, provider refusal, or timeout) so those are not the same line (#1216).",
+    "The bound is a call-observation deadline. An orientation tool_done that arrives while turn_done is withheld must join rather than take the destructive timeout path (#1440)."
+  ],
+  "mutations": [
+    {
+      "name": "M1 remove the bounded retry after the pre-MCP snapshot",
+      "file": "extensions/connector-jcode/src/host.ts",
+      "find": "      const firstTurn = runReadinessTurn();\n      await Promise.race([orientationObserved, firstTurn]);\n      if (!observedOrientation && !(readiness && hasOrientation(readiness))) {\n        writeJcodeDiagnostic(\n          `[cotal-jcode] pre-join readiness: first cotal_orientation turn missed the tool; retrying once inside the same bound\\n`,\n        );\n        const secondTurn = runReadinessTurn();\n        await Promise.race([orientationObserved, secondTurn]);\n      }",
+      "replace": "      const firstTurn = runReadinessTurn();\n      await Promise.race([orientationObserved, firstTurn]);\n      if (!observedOrientation && !(readiness && hasOrientation(readiness))) {\n        writeJcodeDiagnostic(\n          `[cotal-jcode] pre-join readiness: first cotal_orientation turn missed the tool; retrying once inside the same bound\\n`,\n        );\n      }",
+      "expectRed": "a first-turn MCP snapshot race recovers on one bounded retry"
+    },
+    {
+      "name": "M2 join without proving orientation after the retry",
+      "file": "extensions/connector-jcode/src/host.ts",
+      "find": "    if (!readiness || !hasOrientation(readiness)) {\n      writeJcodeDiagnostic(\n        `[cotal-jcode] pre-join readiness outcome: cotal_orientation never became callable; never joined\\n`,\n      );\n      throw new Error(",
+      "replace": "    if (false) {\n      writeJcodeDiagnostic(\n        `[cotal-jcode] pre-join readiness outcome: cotal_orientation never became callable; never joined\\n`,\n      );\n      throw new Error(",
+      "expectRed": "a permanently absent cotal tool ends the launch"
+    },
+    {
+      "name": "M3 move the foreground TUI behind readiness again",
+      "file": "extensions/connector-jcode/src/host.ts",
+      "find": "    if (useTui) launchTui();",
+      "replace": "    if (false) launchTui();",
+      "expectRed": "foreground TUI starts before its readiness turn finishes"
+    },
+    {
+      "name": "M4 omit the post-join correction for stale bootstrap context",
+      "file": "extensions/connector-jcode/src/host.ts",
+      "find": "    const joinNotice = `You are now connected to the Cotal mesh as \"${config.name}\". The earlier cotal_orientation result was captured before this join; use cotal_orientation again for live context.`;",
+      "replace": "    const joinNotice = `You are connected.`;",
+      "expectRed": "a no-prompt seat's post-join notice is delivered as a driven turn, not a noReply append"
+    },
+    {
+      "name": "M5 do not await the completed mesh join before notifying Jcode",
+      "file": "extensions/connector-jcode/src/host.ts",
+      "find": "    await agent.start();",
+      "replace": "    agent.start();",
+      "expectRed": "post-join notice stays absent while the mesh is unreachable"
+    },
+    {
+      "name": "M6 drop the host-side readiness turn bound",
+      "file": "extensions/connector-jcode/src/host.ts",
+      "find": "            timeout = setTimeout(() => resolve(\"timeout\"), readinessBudgetMs);",
+      "replace": "            timeout = setTimeout(() => resolve(\"timeout\"), 1_000_000_000);",
+      "expectRed": "a readiness turn that overruns its bound ends the launch"
+    },
+    {
+      "name": "M7 omit the in-flight pre-join readiness diagnostic",
+      "file": "extensions/connector-jcode/src/host.ts",
+      "find": "    writeJcodeDiagnostic(\n      `[cotal-jcode] pre-join readiness: waiting for one cotal_orientation call (bound ${readinessBudgetMs}ms; not on the roster yet)\\n`,\n    );\n",
+      "replace": "",
+      "expectRed": "the connector log names the pre-join readiness gate while that turn is still running"
+    },
+    {
+      "name": "M8 omit the timeout outcome diagnostic",
+      "file": "extensions/connector-jcode/src/host.ts",
+      "find": "            writeJcodeDiagnostic(\n              `[cotal-jcode] pre-join readiness outcome: timeout after ${readinessBudgetMs}ms; no cotal_orientation call observed; killing the private Jcode tree and discarding that in-flight turn; never joined\\n`,\n            );\n",
+      "replace": "",
+      "expectRed": "a timed-out readiness turn names its outcome as timeout, not a hang or a missing prompt"
+    },
+    {
+      "name": "M9 omit the provider-refusal outcome diagnostic",
+      "file": "extensions/connector-jcode/src/host.ts",
+      "find": "        writeJcodeDiagnostic(\n          `[cotal-jcode] pre-join readiness outcome: provider refusal of ${classified.parameter} ${JSON.stringify(classified.value)} (${classified.providerCode}); never joined\\n`,\n        );\n",
+      "replace": "",
+      "expectRed": "provider readiness refusal names that outcome, not a timeout or a missing prompt"
+    },
+    {
+      "name": "M10 omit the proved no-prompt outcome diagnostic",
+      "file": "extensions/connector-jcode/src/host.ts",
+      "find": "    writeJcodeDiagnostic(\n      bootPrompt\n        ? `[cotal-jcode] pre-join readiness outcome: orientation proved; joining, then submitting the spawn --prompt\\n`\n        : `[cotal-jcode] pre-join readiness outcome: orientation proved; joining with no spawn --prompt\\n`,\n    );\n",
+      "replace": "",
+      "expectRed": "a successful join with no spawn --prompt names that outcome"
+    },
+    {
+      "name": "M11 ignore orientation tool_done until the turn completes",
+      "file": "extensions/connector-jcode/src/host.ts",
+      "find": "      const firstTurn = runReadinessTurn();\n      await Promise.race([orientationObserved, firstTurn]);",
+      "replace": "      const firstTurn = runReadinessTurn();\n      await firstTurn;",
+      "expectRed": "an early orientation tool_done does not take the destructive timeout path"
+    },
+    {
+      "name": "M12 keep a completed proof turn marked busy",
+      "file": "extensions/connector-jcode/src/host.ts",
+      "find": "    watchClient(client);\n    turnActive = readinessTurnOpen;",
+      "replace": "    watchClient(client);\n    turnActive = true;\n    client.removeAllListeners(\"session_status\");\n    client.removeAllListeners(\"turn_done\");",
+      "expectRed": "mesh DM becomes a Harness API turn"
+    }
+  ]
+}

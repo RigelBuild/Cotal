@@ -1,0 +1,230 @@
+/** @module index */
+export { createPlacementEnrollmentAuthority, type PlacementEnrollmentAuthorityOptions } from "./placement-enrollment.js";
+export type { EnrollmentAcl, RolePolicyPort, ReconcilerPort, ServiceAuthenticator, ManagerClaimView, AcceptedPlacementView, PlacementAuthorityView, AcceptedIntentView, EnrollEffectView, EnrollmentIdentity, PlacementEnrollmentVerificationRequest } from "./placement-enrollment.js";
+export { parsePlacementEnrollmentRequest } from "@cotal-ai/core";
+export { parsePlacementEnrollmentVerificationRequest, parseEnrollmentIdentity } from "./placement-enrollment-types.js";
+export { mintServiceCallerPayloadObserverCreds, type ServiceCallerPayloadBootstrap } from "./service-caller-payload-bootstrap.js";
+export { deriveOwnerToken, deriveOwnerForIdpSubject, platformControlOwner } from "./derive.js";
+export { parsePlatformControlAuthorityRequest, type ManagerAuthorityHolder } from "./platform-control.js";
+export { parsePlatformSupervisorAuthorityRequest, type PlatformSupervisorAssignment, type PlatformSupervisorAuthorityRequest, type PlatformSupervisorInput } from "./platform-supervisor.js";
+export type { PlatformControlAssignment } from "@cotal-ai/core";
+export {
+  AUTH_CALLOUT_SUBJECT,
+  CALLOUT_TIMEOUT_REASON,
+  createCalloutAuth,
+  startAuthCallout,
+  type AuthCalloutLimits,
+  type CalloutAuth,
+  type CalloutProvisionInput,
+  type CalloutConnection,
+  type CalloutMsg,
+  type StartAuthCalloutOpts,
+} from "./callout.js";
+export { ConnectLimiter, ConnectRateLimited, DEFAULT_CONNECT_LIMITS, type ConnectLimitKind, type ConnectLimits, type ConnectSource } from "./connect-limit.js";
+export { admitsServiceEndpoints, openCalloutLane, type CalloutLane, type CalloutLaneOptions } from "./callout-lane.js";
+export { runCalloutHost, parseSpaceManifest, type SpaceManifest } from "./callout-host.js";
+export {
+  validateUserToken,
+  assertCredentialIdClaim,
+  USER_TOKEN_VER,
+  MAX_TOKEN_TTL_SEC,
+  USER_TOKEN_VIEWS,
+  PUBLIC_EXCHANGE_VIEWS,
+  VIEW_REQUIRED_SCOPE,
+  type UserTokenActor,
+  type UserTokenService,
+  type UserTokenView,
+  type ValidatedUserToken,
+  type ValidateUserTokenOpts,
+} from "./token.js";
+export {
+  USER_TOKEN_ALG,
+  createUserTokenIssuer,
+  generateSigningKey,
+  exportSigningKey,
+  importSigningKey,
+  pinnedJwksResolver,
+  type SigningKey,
+  type SerializedSigningKey,
+  type IssueClaims,
+  type ServiceAccessClaims,
+  type UserTokenIssuer,
+  type CreateIssuerOpts,
+} from "./issuer.js";
+export {
+  createIdpBridge,
+  verifyIdpToken,
+  verifyToolResultHumanProof,
+  verifyDmReaderProof,
+  DM_READER_PURPOSE,
+  type VerifiedIdpToken,
+  type ToolResultHumanProof,
+  type IdpConfig,
+  type ActorGrant,
+  type CreateIdpBridgeOpts,
+  type ExchangeResult,
+  type IdpBridge,
+} from "./idp.js";
+export {
+  CATALOG_FRESH_MS,
+  deviceLogin,
+  establishIdpSession,
+  fetchIdpJwt,
+  revokeIdpSession,
+  loadIdpSession,
+  hasIdpSessions,
+  saveIdpSession,
+  deleteIdpSession,
+  deleteIdpSpaceCatalog,
+  hasIdpSpaceCatalog,
+  prepareIdpSpaceCatalogs,
+  requireIdpSession,
+  normalizeIdpUrl,
+  probeIdpJwks,
+  IdpLoginCancelled,
+  IdpUnreachableError,
+  type IdpSession,
+  type DeviceLoginOpts,
+  type DeviceLoginPrompt,
+} from "./login.js";
+export { calloutPermissions, type AclResolver, type UserCallerIssuer } from "./permissions.js";
+export {
+  USER_AUTH_TRUST_SCHEME,
+  userAuthTrustFingerprint,
+  validateRetainedManagedAgent,
+} from "./continuity.js";
+export {
+  AUTH_PROVIDER_NAME,
+  authCalloutKey,
+  authInstanceKey,
+  authIssuerKey,
+  authOwnerSecretKey,
+  authServiceKeysKey,
+  clearAuthServiceInfo,
+  ensureCalloutAuth,
+  ensureIssuer,
+  ensureOwnerSecret,
+  ensurePinnedIdp,
+  loadAuthServiceInfo,
+  loadCalloutAuth,
+  loadIssuer,
+  loadOwnerSecret,
+  loadPinnedIdp,
+  loadServiceKeys,
+  saveAuthServiceInfo,
+  saveServiceKeys,
+  spaceIssuer,
+  type AuthServiceInfo,
+  type PinnedIdp,
+  type ServiceKeys,
+} from "./store.js";
+export {
+  actorLedgerDir,
+  managedActorLedgerDir,
+  findInteractiveActor,
+  findManagedActor,
+  findActorUnified,
+  grantActor,
+  grantManagedActor,
+  ledgerAclResolver,
+  ledgerActorSourceIsLive,
+  ledgerAuthorizeConnect,
+  ledgerAuthorizeGrant,
+  ledgerAuthorizeAgentExchange,
+  ledgerRowFilename,
+  loadActorLedger,
+  revokeActor,
+  revokeManagedActor,
+  newActorToken,
+  hashActorToken,
+  AGENT_BEARER_TTL_SEC,
+  type ActorKind,
+  type ActorRow,
+} from "./ledger.js";
+export { runAuthService, startAuthService, parseAuthHostManifest, type AuthHostEntry, type AuthServiceRuntimeOptions, type OpenAuthAuthorityPlaneOptions, type AuthServiceHandle, type PublicFaceInput, type PlatformControlInput, openAuthAuthorityPlane, dispatchManagerAuthorityRequest, handleManagerServiceAuthority, type ManagerServiceAuthorityCtx, handleToolResultHumanProof, type ToolResultHumanProofCtx, TOOL_RESULT_HUMAN_PROOF_PATH, handleToolResultConsent, TOOL_RESULT_CONSENT_PATH, JWKS_MAX_AGE_SEC, INTERACTIVE_RETIRE_PATH, CHAT_SESSION_PATHS, MANAGED_ACTIVATE_PATH, MANAGED_RETIRE_PATH, VERIFY_ENROLLMENT_PATH, composeUserBundle, finalizeUserBundleEndpoint, checkAdvertisedServer, checkAgentProvisioningUrl, type ManagedLifecycleActivationRequest, type ManagedLifecycleActivationResult, type AuthAuthorityPlane } from "./service.js";
+export { remoteManagerIssuerGrants } from "./authority-client.js";
+export { PLANE_CLAIM_REFUSED, PLANE_CLAIM_KEY, readPlaneClaim, planeClaimRefusal, type PlaneClaimRefusal, type PlaneClaimRow } from "./plane-claim.js";
+// The R1 connect-arm deny-new READ seam (SPEC 13.1): the reader grant builder, the sealed
+// shape-proved reader, and the pure connect-credential check the production composition runs.
+// The WRITE side (authority-client, root-credential, activateLifecycleAtUid) stays
+// package-internal — the sealed plane is its only production door; smokes import the modules.
+export {
+  authConnectReaderGrants, openConnectReader, authorizeConnectCredential,
+  type ConnectReader,
+} from "./connect-reader.js";
+export { revokeRemoteRun, parseRemoteRunRevokeRequest, admitRemoteRun, authorizeRemoteRunAttempt, parseRemoteRunAttemptRequest, type RemoteRunAttemptGrant, parseRemoteRunAdmissionRequest, authorizeRemoteManagerRenewal, issueRemoteManagerAuthority, parseRemoteManagerAuthorityRequest, type IssueRemoteManagerAuthorityArgs, type ObserveManagerRun } from "./manager-authority.js";
+export { parseRemoteManagerMaintenanceRequest, authorizeRemoteManagerMaintenance, completeRemoteManagerMaintenance } from "./manager-maintenance.js";
+export {
+  parseRemoteRetainedAgentValidationRequest,
+  authorizeRemoteRetainedAgentValidation,
+  completeRemoteRetainedAgentValidation,
+  remoteManagerCurrentRegistrationProof,
+  type AuthorizeRemoteRetainedAgentValidationArgs,
+} from "./retained-manager-validation.js";
+export { parseRemoteManagerAdminAuthorizationRequest, authorizeRemoteManagerAdmin } from "./manager-admin-authorization.js";
+export { parseRemoteManagerParticipationAuthorizationRequest, authorizeRemoteManagerParticipation } from "./manager-participation-authorization.js";
+export {
+  authorizeRemoteManagedAgentEnrollment,
+  authorizeRemoteManagedAgentPrepareRetirement,
+  authorizeRemoteManagedAgentRuntimeCreate,
+  authorizeRemoteManagedAgentRuntimeStatus,
+  type AuthorizeRemoteManagedAgentEnrollmentArgs,
+  type AuthorizeRemoteManagedAgentPrepareRetirementArgs,
+  type AuthorizeRemoteManagedAgentRuntimeArgs,
+  type RemoteManagedAgentRuntimeDecision,
+  type ObserveManagerGate,
+} from "./managed-agent-enrollment.js";
+export {
+  authorizeDelegatedUserIntentAdmission,
+  authorizeDelegatedUserIntentExecution,
+  delegatedUserIntentHoldsAlias,
+  joinOrStartDelegatedUserIntent,
+  type AuthorizeDelegatedUserIntentAdmissionArgs,
+  type AuthorizeDelegatedUserIntentExecutionArgs,
+  type DelegatedUserIntentDecision,
+  type DelegatedUserIntentExecutionPin,
+  type DelegatedUserIntentFlights,
+  type DelegatedUserIntentIncarnation,
+  type DelegatedUserIntentRecord,
+  type ObservePlatformControlAssignment,
+} from "./delegated-user-intent.js";
+export { cotalAuthProvider } from "./provider.js"; // self-registers the "auth-provider" extension
+import "./service-adapter.js"; // self-registers the native auth service preset and child
+import "./commands.js"; // self-registers `login` / `logout` / `actor` / `auth-service` into the core Registry
+// NB: writeEndpointGate (the D14 endpoint-registration stand-in) is deliberately NOT
+// re-exported here (import it directly from the module in smokes/provisioning). The public
+// surface is the store + hooks + close/sweep seams.
+export { openSessionAuthStore, kvSessionLedger, sessionRedemptionHooks, closeSession, sweepSessions, kvServeIssuanceGate, type SessionAuthStore, type EndpointGateRow, type SessionSigner, type SessionHookDeps, type SessionCloser } from "./session-ledger.js";
+// NB: the package surface is the sealed contexts + the READ seams only. The activation saga,
+// the UID reservation, the gate primitives (create/observe/freeze/reopen/retire), the
+// normative credential ledger (credential-ledger.ts: rows, source gates, the mint protocol),
+// and the takeover barrier are ALL package-internal: their executor seam is the sealed
+// registry itself, and exposing a public epoch advance / head retirement / bare gate reopen
+// around an incomplete barrier would recreate the half-fence D13 removes. Smokes and
+// provisioning tooling import them directly from the modules.
+export {
+  openLifecycleRegistry, openLifecycleMappingReader,
+  readLifecycleMappingLeader, lifecycleProcessEpochReader,
+  type LifecycleRegistry, type LifecycleMappingReader, type LifecycleMapping, type EpGateRow,
+} from "./lifecycle-registry.js";
+// The D13 (4) admission mediator + admission-policy coordinate (SPEC 13.6/13.8/13.9) is
+// PACKAGE-INTERNAL, deliberately: `openAdmissionMediator` requires the BRANDED records
+// scanner (site 3, nats-server#8274), whose constructors are not on the package surface, so
+// a root export would be an unsatisfiable public seam (a mediator you can name but never
+// construct). And a bare `openRecordsScannerCandidate` export is refused too: ONE shared records
+// scanner per space is the composition rule (fact-5; scans serialize module-wide per space,
+// so a stray second instance is safe but never the intended shape), and this package does
+// not own that composition (the #29 slice does). Until it lands, the whole coordinate is
+// reached by importing the module directly (smokes do); nothing of it is on the package
+// surface.
+
+export type { AuthConnectionState, AuthServiceClosed } from "./owned-connections.js";
+
+export { createToolResultConsentSigner, makeToolResultConsentRecorder, parseToolResultConsentInput, toolResultConsentKey, type ToolResultConsentInput, type ToolResultConsentSignerOptions, type ToolResultConsentRecorder } from "./tool-result-consent.js";
+
+// Host-only prerequisites. No serving activation and no supported runtime clock witness.
+export { createToolResultRevocationCustody, recordToolResultRevocation, snapshotToolResultRevocations, consumeToolResultSnapshot, requireToolResultClockPrerequisite, type ToolResultRevocationCustody, type ToolResultSnapshotWitness, type ToolResultSnapshotRequest } from "./tool-result-prerequisites.js";
+
+export * from "./service-host-contract.js";
+
+export { SERVICE_RENEWAL_TYP, validateServiceRenewalProof, type ServiceRenewalClaims, type ValidatedServiceRenewal } from "./service-renewal.js";

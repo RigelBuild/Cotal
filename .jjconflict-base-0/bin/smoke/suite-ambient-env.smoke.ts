@@ -1,0 +1,970 @@
+/**
+ * Ambient-environment census over the SUITES themselves - the cell for a class this repo's runtime
+ * cells structurally cannot see.
+ *
+ * WHAT KEEPS HAPPENING. A suite builds a child process env as `{ ...process.env, ...somethingOurs }`.
+ * Whatever runs that suite may itself be a managed agent session, whose environment carries a live
+ * credential path, a live broker URL and a control token. The spread hands all of it to the child.
+ * Two suites were doing exactly this and both were GREEN: the connector env layered on top used to
+ * overwrite precisely the variables that would have made the inheritance visible, so the child got a
+ * working identity and nothing anywhere recorded where it came from.
+ *
+ * WHY A RUNTIME CELL CANNOT CATCH IT. `seat-env-scope` watches what a connector's launch spec hands
+ * a real descendant. It has no view of what ANOTHER suite's harness inherits from ITS runner. The
+ * only shape that can fail a future suite which reintroduces the spread is a static census over the
+ * suite sources, which is what this is. The idea is a reviewer's, not mine.
+ *
+ * THE RULE. Every `...process.env` spread into a child environment must either strip the `COTAL_`
+ * variables from that copy first, or the file must appear in {@link REVIEWED} with a measured
+ * reason. A strip on a different child in the same file does not clear an unstripped spread.
+ * Exempt is not "we looked away": each entry names why that file's child cannot capture an
+ * identity, and adding one is a conscious edit in a file a reviewer reads.
+ *
+ * Run: `pnpm smoke:suite-ambient-env`
+ */
+import assert from "node:assert/strict";
+import { readdirSync, readFileSync, statSync } from "node:fs";
+import { dirname, join, relative } from "node:path";
+import { fileURLToPath } from "node:url";
+import ts from "typescript";
+
+const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
+const SKIP = new Set(["node_modules", "dist", ".git", ".pnpm-store", "coverage", "reserved"]);
+
+/** Every tracked source file under a smoke path. Keyed on CONTENT and location, not on one
+ *  directory: the suites live under `bin/smoke`, under a package's own `smoke` directory, and as
+ *  bare `*.smoke.ts` files beside their package. A census that knew only the first would miss the
+ *  other two silently. */
+function* suiteSources(dir: string): Generator<string> {
+  for (const e of readdirSync(dir, { withFileTypes: true })) {
+    if (e.name.startsWith(".") || SKIP.has(e.name)) continue;
+    const p = join(dir, e.name);
+    if (e.isDirectory()) yield* suiteSources(p);
+    else if (/\.(ts|mts|cts|mjs|js)$/.test(e.name) && statSync(p).size < 2_000_000) {
+      const rel = relative(repoRoot, p).split("\\").join("/");
+      if (/(^|\/)smoke(\/|\.)/.test(rel) || /\.smoke\.[a-z]+$/.test(rel)) yield p;
+    }
+  }
+}
+
+/** The spread, written the way people write it. */
+const SPREAD = /\.\.\.process\.env\b/g;
+/** A file that mutates `process.env` itself at module scope, then later spreads it, has already
+ *  dropped the ambient keys from what the child will inherit. Function-local and branch-local scrubs
+ *  are not ownership: they may never execute before the spread. */
+const PROCESS_ENV_STRIP =
+  /for\s*\(\s*const\s+\w+\s+of\s+Object\.keys\(\s*process\.env\s*\)\)[^\n]{0,160}?startsWith\(\s*["']COTAL_["']\s*\)[^\n]{0,80}?delete\s+process\.env/g;
+/** A second real child-env construction path filters the ambient entries while copying them. It is
+ *  not a SPREAD match, but files combining it with a spread are the real mixed-path population. */
+const FILTERED_COPY = /Object\.entries\(\s*process\.env\s*\)\.filter\([\s\S]{0,160}?startsWith\(\s*["']COTAL_["']\s*\)/;
+const RECORD_MESH = /\brecordMesh\s*\(/;
+const COTAL_HOME_ASSIGNMENT = /process\.env\.COTAL_HOME\s*=/;
+
+function hasPrivateRegistryHome(source: string): boolean {
+  return !RECORD_MESH.test(source) || COTAL_HOME_ASSIGNMENT.test(source);
+}
+
+/** Comments are not child env. The census used to treat a `delete` in prose plus a `startsWith("COTAL_")`
+ *  on a different child as a strip of every spread in the file. */
+function codeWithoutComments(src: string): string {
+  let out = "";
+  let i = 0;
+  let state: "code" | "sq" | "dq" | "bt" | "line" | "block" = "code";
+  while (i < src.length) {
+    const c = src[i];
+    const n = src[i + 1];
+    if (state === "line") {
+      if (c === "\n") {
+        state = "code";
+        out += c;
+      } else out += " ";
+      i++;
+      continue;
+    }
+    if (state === "block") {
+      if (c === "*" && n === "/") {
+        state = "code";
+        out += "  ";
+        i += 2;
+        continue;
+      }
+      out += c === "\n" ? "\n" : " ";
+      i++;
+      continue;
+    }
+    if (state === "sq" || state === "dq") {
+      if (c === "\\") {
+        out += c + (n ?? "");
+        i += 2;
+        continue;
+      }
+      out += c;
+      if ((state === "sq" && c === "'") || (state === "dq" && c === '"')) state = "code";
+      i++;
+      continue;
+    }
+    if (state === "bt") {
+      if (c === "\\") {
+        out += c + (n ?? "");
+        i += 2;
+        continue;
+      }
+      if (c === "`") state = "code";
+      out += c;
+      i++;
+      continue;
+    }
+    if (c === "/" && n === "/") {
+      state = "line";
+      out += "  ";
+      i += 2;
+      continue;
+    }
+    if (c === "/" && n === "*") {
+      state = "block";
+      out += "  ";
+      i += 2;
+      continue;
+    }
+    if (c === "'") state = "sq";
+    else if (c === '"') state = "dq";
+    else if (c === "`") state = "bt";
+    out += c;
+    i++;
+  }
+  return out;
+}
+
+function lineOf(src: string, index: number): number {
+  return src.slice(0, index).split("\n").length;
+}
+
+function windowAfter(src: string, index: number, lines: number): string {
+  let end = index;
+  for (let n = 0; n < lines; n++) {
+    const nl = src.indexOf("\n", end + 1);
+    if (nl < 0) return src.slice(index);
+    end = nl;
+  }
+  return src.slice(index, end);
+}
+
+function spreadIndexes(code: string): number[] {
+  return [...code.matchAll(SPREAD)].map((m) => m.index ?? -1).filter((i) => i >= 0);
+}
+
+interface ProcessEnvStrip {
+  start: number;
+  deleteStart: number;
+  end: number;
+  region: number;
+}
+
+interface LexicalRegions {
+  regions: Int32Array;
+  processEnvStrips: ProcessEnvStrip[];
+}
+
+function sourceOffsetsForCookedText(
+  rawText: string,
+  cookedText: string,
+  rawSourceOffsets: Int32Array,
+): Int32Array {
+  assert.equal(rawSourceOffsets.length, rawText.length + 1);
+  if (rawText === cookedText) return rawSourceOffsets;
+
+  const cookedSourceOffsets = new Int32Array(cookedText.length + 1);
+  cookedSourceOffsets[0] = rawSourceOffsets[0];
+  let rawIndex = 0;
+  let cookedIndex = 0;
+  while (rawIndex < rawText.length) {
+    if (rawText[rawIndex] !== "\\") {
+      const rawWidth = rawText[rawIndex] === "\r" && rawText[rawIndex + 1] === "\n" ? 2 : 1;
+      const cookedCharacter = rawText[rawIndex] === "\r" ? "\n" : rawText[rawIndex];
+      assert.equal(
+        cookedText[cookedIndex],
+        cookedCharacter,
+        "cooked literal text diverged from its source",
+      );
+      rawIndex += rawWidth;
+      cookedIndex++;
+      cookedSourceOffsets[cookedIndex] = rawSourceOffsets[rawIndex];
+      continue;
+    }
+
+    const escapeStart = rawIndex;
+    const escape = rawText[rawIndex + 1];
+    let rawEnd = rawIndex + 2;
+    let cookedWidth = 1;
+    if (escape === "\r" || escape === "\n" || escape === "\u2028" || escape === "\u2029") {
+      if (escape === "\r" && rawText[rawIndex + 2] === "\n") rawEnd++;
+      cookedWidth = 0;
+    } else if (escape === "x") {
+      rawEnd = rawIndex + 4;
+    } else if (escape === "u" && rawText[rawIndex + 2] === "{") {
+      rawEnd = rawText.indexOf("}", rawIndex + 3) + 1;
+      assert.ok(rawEnd > 0, "unterminated Unicode code-point escape in parsed literal");
+      cookedWidth = Number.parseInt(rawText.slice(rawIndex + 3, rawEnd - 1), 16) > 0xffff ? 2 : 1;
+    } else if (escape === "u") {
+      rawEnd = rawIndex + 6;
+    } else if (escape >= "0" && escape <= "7") {
+      const maxDigits = escape <= "3" ? 3 : 2;
+      while (
+        rawEnd < rawText.length &&
+        rawEnd - escapeStart - 1 < maxDigits &&
+        /[0-7]/.test(rawText[rawEnd])
+      )
+        rawEnd++;
+    }
+    assert.ok(rawEnd <= rawText.length, "escape extends beyond parsed literal text");
+    rawIndex = rawEnd;
+    for (let i = 0; i < cookedWidth; i++) {
+      cookedIndex++;
+      assert.ok(
+        cookedIndex <= cookedText.length,
+        "source escape produced more cooked text than TypeScript parsed",
+      );
+      cookedSourceOffsets[cookedIndex] = rawSourceOffsets[i + 1 === cookedWidth ? rawEnd : escapeStart];
+    }
+    if (cookedWidth === 0) cookedSourceOffsets[cookedIndex] = rawSourceOffsets[rawEnd];
+  }
+  assert.equal(
+    cookedIndex,
+    cookedText.length,
+    `source escape produced less cooked text than TypeScript parsed: raw=${JSON.stringify(rawText)} cooked=${JSON.stringify(cookedText)}`,
+  );
+  return cookedSourceOffsets;
+}
+
+/** Region 0 is module code. Each literal is its own child-script region. Parsing each region's
+ *  cooked contents recursively gives nested templates their own identity, returns `${...}`
+ *  interpolation to the containing code region, and maps child-script matches back to source. */
+function lexicalRegions(src: string): LexicalRegions {
+  const regions = new Int32Array(src.length);
+  const processEnvStrips: ProcessEnvStrip[] = [];
+  let nextRegion = 1;
+  const mark = (start: number, end: number, region: number): void => {
+    regions.fill(region, start, end);
+  };
+
+  const parseRegion = (text: string, sourceOffsets: Int32Array, baseRegion: number): void => {
+    mark(sourceOffsets[0], sourceOffsets[text.length], baseRegion);
+    for (const match of text.matchAll(PROCESS_ENV_STRIP)) {
+      const start = match.index ?? -1;
+      if (start < 0) continue;
+      processEnvStrips.push({
+        start: sourceOffsets[start],
+        deleteStart: sourceOffsets[start + match[0].lastIndexOf("delete")],
+        end: sourceOffsets[start + match[0].length],
+        region: baseRegion,
+      });
+    }
+    const file = ts.createSourceFile("region.ts", text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+    const visit = (node: ts.Node): void => {
+      if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) {
+        const start = node.getStart(file);
+        const end = node.end;
+        const childRegion = nextRegion++;
+        mark(sourceOffsets[start], sourceOffsets[end], childRegion);
+        const endTrim = node.isUnterminated ? 0 : 1;
+        if (end - start > 1 + endTrim) {
+          const rawText = text.slice(start + 1, end - endTrim);
+          const rawSourceOffsets = sourceOffsets.slice(start + 1, end - endTrim + 1);
+          const cookedSourceOffsets = sourceOffsetsForCookedText(rawText, node.text, rawSourceOffsets);
+          parseRegion(node.text, cookedSourceOffsets, childRegion);
+        }
+        return;
+      }
+      if (ts.isTemplateExpression(node)) {
+        const childRegion = nextRegion++;
+        const headStart = node.head.getStart(file);
+        mark(sourceOffsets[headStart], sourceOffsets[node.head.end], childRegion);
+        if (node.head.text) {
+          const rawText = text.slice(headStart + 1, node.head.end - 2);
+          const rawSourceOffsets = sourceOffsets.slice(headStart + 1, node.head.end - 1);
+          parseRegion(
+            node.head.text,
+            sourceOffsetsForCookedText(rawText, node.head.text, rawSourceOffsets),
+            childRegion,
+          );
+        }
+        for (const span of node.templateSpans) {
+          const expressionStart = span.expression.getStart(file);
+          // Interpolation executes in the containing code region.
+          parseRegion(
+            text.slice(expressionStart, span.expression.end),
+            sourceOffsets.slice(expressionStart, span.expression.end + 1),
+            baseRegion,
+          );
+          const literalStart = span.literal.getStart(file);
+          mark(sourceOffsets[literalStart], sourceOffsets[span.literal.end], childRegion);
+          if (span.literal.text) {
+            const literalEndTrim = ts.isTemplateTail(span.literal)
+              ? span.literal.isUnterminated
+                ? 0
+                : 1
+              : 2;
+            const rawText = text.slice(literalStart + 1, span.literal.end - literalEndTrim);
+            const rawSourceOffsets = sourceOffsets.slice(
+              literalStart + 1,
+              span.literal.end - literalEndTrim + 1,
+            );
+            parseRegion(
+              span.literal.text,
+              sourceOffsetsForCookedText(rawText, span.literal.text, rawSourceOffsets),
+              childRegion,
+            );
+          }
+        }
+        return;
+      }
+      // REGEX-LITERAL REGION: braces here are data, not structural nesting.
+      if (node.kind === ts.SyntaxKind.RegularExpressionLiteral) {
+        mark(sourceOffsets[node.getStart(file)], sourceOffsets[node.end], nextRegion++);
+        return;
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(file);
+  };
+
+  parseRegion(src, Int32Array.from({ length: src.length + 1 }, (_, index) => index), 0);
+  return { regions, processEnvStrips };
+}
+
+/** Structural brace depth inside one lexical region. Module braces ignore embedded child scripts;
+ *  child-script braces are counted within that literal. */
+function braceDepthAt(src: string, regions: Int32Array, index: number, region: number): number {
+  let depth = 0;
+  for (let i = 0; i < index; i++) {
+    if (regions[i] !== region) continue;
+    if (src[i] === "{") depth++;
+    else if (src[i] === "}") depth = Math.max(0, depth - 1);
+  }
+  return depth;
+}
+
+function processEnvStrippedBefore(code: string, lexical: LexicalRegions, index: number): boolean {
+  const region = lexical.regions[index];
+  return lexical.processEnvStrips.some(
+    (strip) =>
+      strip.end <= index &&
+      strip.region === region &&
+      lexical.regions[strip.start] === region &&
+      lexical.regions[strip.deleteStart] === region &&
+      braceDepthAt(code, lexical.regions, strip.start, region) === 0,
+  );
+}
+
+function regexEscape(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** True when THIS spread is assigned to a copy which is then scrubbed, or `process.env` was already
+ *  stripped in this file. Matching the copied variable prevents a later child's strip from clearing
+ *  an earlier unstripped spread. */
+function spreadStripped(code: string, lexical: LexicalRegions, index: number): boolean {
+  const { regions } = lexical;
+  const region = regions[index];
+  if (processEnvStrippedBefore(code, lexical, index)) return true;
+  const before = code.slice(Math.max(0, index - 320), index);
+  const assignment = /(?:const|let|var)\s+([A-Za-z_$][\w$]*)(?:\s*:[^=;\n]+)?\s*=\s*\{[^{}]*$/.exec(before);
+  if (!assignment) return false;
+  const assignmentIndex = Math.max(0, index - 320) + (assignment.index ?? 0);
+  if (regions[assignmentIndex] !== region) return false;
+  const name = regexEscape(assignment[1]);
+  const after = windowAfter(code, index, 12);
+  const copyStrip = new RegExp(
+    `^\\.\\.\\.process\\.env\\b[^}]*}\\s*;[\\s\\S]{0,240}?Object\\.keys\\(\\s*${name}\\s*\\)[\\s\\S]{0,160}?startsWith\\(\\s*["']COTAL_["']\\s*\\)[\\s\\S]{0,80}?delete\\s+${name}\\s*\\[`,
+  );
+  const match = copyStrip.exec(after);
+  if (!match) return false;
+  const keysOffset = match[0].indexOf("Object.keys");
+  const deleteOffset = match[0].lastIndexOf("delete");
+  return regions[index + keysOffset] === region && regions[index + deleteOffset] === region;
+}
+
+function unstrippedSpreadLines(src: string): number[] {
+  const code = codeWithoutComments(src);
+  const lexical = lexicalRegions(code);
+  return spreadIndexes(code).filter((index) => !spreadStripped(code, lexical, index)).map((index) => lineOf(code, index));
+}
+
+assert.deepEqual(
+  unstrippedSpreadLines(`
+function neverCalled() {
+/}/;
+for (const key of Object.keys(process.env)) if (key.startsWith("COTAL_")) delete process.env[key];
+}
+const unsafe = { ...process.env };
+spawn("unsafe", { env: unsafe });
+`),
+  [6],
+  "a regex close brace must not hide nested scrub depth",
+);
+for (const keywordRegex of ["return /}/;", "throw /}/;", "void /}/;", "delete /}/;"]) {
+  assert.deepEqual(
+    unstrippedSpreadLines([
+      "function neverCalled() {",
+      keywordRegex,
+      "for (const key of Object.keys(process.env)) if (key.startsWith(\"COTAL_\")) delete process.env[key];",
+      "}",
+      "const unsafe = { ...process.env };",
+      "spawn(\"unsafe\", { env: unsafe });",
+    ].join("\n")),
+    [5],
+    `a keyword-prefixed regex must not hide nested scrub depth: ${keywordRegex}`,
+  );
+}
+assert.deepEqual(
+  unstrippedSpreadLines(`
+/{/;
+for (const key of Object.keys(process.env)) if (key.startsWith("COTAL_")) delete process.env[key];
+const safe = { ...process.env };
+spawn("safe", { env: safe });
+`),
+  [],
+  "a regex open brace must not invent module scrub depth",
+);
+assert.deepEqual(
+  unstrippedSpreadLines(`
+/[{}]/;
+for (const key of Object.keys(process.env)) if (key.startsWith("COTAL_")) delete process.env[key];
+const safe = { ...process.env };
+spawn("safe", { env: safe });
+`),
+  [],
+  "regex character-class braces must not alter module scrub depth",
+);
+assert.deepEqual(
+  unstrippedSpreadLines(`
+const quotient = numerator / denominator;
+for (const key of Object.keys(process.env)) if (key.startsWith("COTAL_")) delete process.env[key];
+const safe = { ...process.env };
+spawn("safe", { env: safe });
+`),
+  [],
+  "division must not be classified as a regex literal",
+);
+assert.deepEqual(
+  unstrippedSpreadLines([
+    "const OUTER = `head ${`for (const key of Object.keys(process.env)) if (key.startsWith(\"COTAL_\")) delete process.env[key];`} tail`;",
+    "const unsafe = { ...process.env };",
+    "spawn(\"unsafe\", { env: unsafe });",
+  ].join("\n")),
+  [2],
+  "an unused nested template scrub must not clear a module-code spread",
+);
+assert.deepEqual(
+  unstrippedSpreadLines([
+    "const child = `head ${`for (const key of Object.keys(process.env)) if (key.startsWith(\"COTAL_\")) delete process.env[key];`} middle ${{ ...process.env }} tail`;",
+  ].join("\n")),
+  [1],
+  "a nested template scrub must not clear a sibling interpolation spread",
+);
+assert.deepEqual(
+  unstrippedSpreadLines([
+    "const child = `raw { ${value / 2} tail }`;",
+    "for (const key of Object.keys(process.env)) if (key.startsWith(\"COTAL_\")) delete process.env[key];",
+    "const safe = { ...process.env };",
+    "spawn(\"safe\", { env: safe });",
+  ].join("\n")),
+  [],
+  "template interpolation must restore the module region before later tokens",
+);
+assert.deepEqual(
+  unstrippedSpreadLines([
+    "for (const key of Object.keys(process.env)) if (key.startsWith(\"COTAL_\")) delete process.env[key];",
+    "const child = `raw ${(() => { const safe = { ...process.env }; spawn(\"safe\", { env: safe }); })()} tail`;",
+  ].join("\n")),
+  [],
+  "a module scrub must clear a spread inside template interpolation code",
+);
+assert.deepEqual(
+  unstrippedSpreadLines([
+    "const child = `for (const key of Object.keys(process.env)) if (key.startsWith(\"COTAL_\")) delete process.env[key]; ${(() => { const unsafe = { ...process.env }; spawn(\"unsafe\", { env: unsafe }); })()}`;",
+  ].join("\n")),
+  [1],
+  "a raw-template scrub must not clear a spread inside interpolation code",
+);
+assert.deepEqual(
+  unstrippedSpreadLines([
+    "// stray ` / } { in comment",
+    "const noise = \"stray ` / } { in string\";",
+    "for (const key of Object.keys(process.env)) if (key.startsWith(\"COTAL_\")) delete process.env[key];",
+    "const safe = { ...process.env };",
+    "spawn(\"safe\", { env: safe });",
+  ].join("\n")),
+  [],
+  "comment and string slash or backtick noise must not corrupt later module tokens",
+);
+assert.deepEqual(
+  unstrippedSpreadLines(`
+const UNUSED = \`for (const key of Object.keys(process.env)) if (key.startsWith("COTAL_")) delete process.env[key];\`;
+const unsafe = { ...process.env };
+spawn("unsafe", { env: unsafe });
+`),
+  [3],
+  "an unused child-script template scrub must not clear a module-code spread",
+);
+assert.deepEqual(
+  unstrippedSpreadLines(`
+for (const key of Object.keys(process.env)) if (key.startsWith("COTAL_")) delete process.env[key];
+const CHILD = \`const unsafe = { ...process.env }; spawn("unsafe", { env: unsafe });\`;
+`),
+  [3],
+  "a module-code scrub must not clear a child-script template spread",
+);
+assert.deepEqual(
+  unstrippedSpreadLines(`
+const CHILD = \`for (const key of Object.keys(process.env)) if (key.startsWith("COTAL_")) delete process.env[key]; const safe = { ...process.env }; spawn("safe", { env: safe });\`;
+`),
+  [],
+  "a child-script template scrub must clear a later spread in the same template",
+);
+assert.deepEqual(
+  unstrippedSpreadLines(`
+for (const key of Object.keys(process.env)) if (key.startsWith("COTAL_")) delete process.env[key];
+const safe = { ...process.env };
+spawn("safe", { env: safe });
+`),
+  [],
+  "an unconditional module-scope process.env scrub must clear later direct spreads",
+);
+assert.deepEqual(
+  unstrippedSpreadLines(`
+function neverCalled() {
+for (const key of Object.keys(process.env)) if (key.startsWith("COTAL_")) delete process.env[key];
+}
+const unsafe = { ...process.env };
+spawn("unsafe", { env: unsafe });
+`),
+  [5],
+  "an uncalled function scrub must not clear a later unsafe spread",
+);
+assert.deepEqual(
+  unstrippedSpreadLines(`
+function neverCalled() {
+  for (const key of Object.keys(process.env)) if (key.startsWith("COTAL_")) delete process.env[key];
+}
+const unsafe = { ...process.env };
+spawn("unsafe", { env: unsafe });
+`),
+  [5],
+  "an indented uncalled function scrub must not clear a later unsafe spread",
+);
+assert.deepEqual(
+  unstrippedSpreadLines(`
+if (shouldScrub) {
+for (const key of Object.keys(process.env)) if (key.startsWith("COTAL_")) delete process.env[key];
+}
+const unsafe = { ...process.env };
+spawn("unsafe", { env: unsafe });
+`),
+  [5],
+  "a conditional process.env scrub must not clear a later unsafe spread",
+);
+assert.deepEqual(
+  unstrippedSpreadLines(`
+if (shouldScrub) {
+  for (const key of Object.keys(process.env)) if (key.startsWith("COTAL_")) delete process.env[key];
+}
+const unsafe = { ...process.env };
+spawn("unsafe", { env: unsafe });
+`),
+  [5],
+  "an indented conditional process.env scrub must not clear a later unsafe spread",
+);
+
+// Regression cell: one stripped child cannot clear another unstripped child, and a comment that says
+// `delete` is not a mechanism. Put the unsafe child first so the following child's real strip is also
+// inside the matching window. The same file shape passes when every spread is followed by its strip.
+assert.deepEqual(
+  unstrippedSpreadLines(`
+const first = { ...process.env };
+// delete is prose, not a stripping mechanism.
+spawn("first", { env: first });
+const second = { ...process.env };
+for (const key of Object.keys(second)) if (key.startsWith("COTAL_")) delete second[key];
+spawn("second", { env: second });
+`),
+  [2],
+  "a mixed file must fail when one child spread is unstripped",
+);
+assert.deepEqual(
+  unstrippedSpreadLines(`
+const first = { ...process.env };
+for (const key of Object.keys(first)) if (key.startsWith("COTAL_")) delete first[key];
+spawn("first", { env: first });
+const second = { ...process.env };
+for (const key of Object.keys(second)) if (key.startsWith("COTAL_")) delete second[key];
+spawn("second", { env: second });
+`),
+  [],
+  "a file must pass when every child spread is stripped",
+);
+
+function assertFixtureParses(name: string, source: string): void {
+  const parsed = ts.createSourceFile("fixture.ts", source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const diagnostics = (parsed as unknown as { parseDiagnostics?: readonly ts.Diagnostic[] }).parseDiagnostics ?? [];
+  assert.equal(diagnostics.length, 0, `${name} must parse before its classification is trusted`);
+}
+
+const privateRegistryHomeFixture = [
+  'process.env.COTAL_HOME = "/tmp/private";',
+  'recordMesh({ space: "fixture" });',
+].join("\n");
+assertFixtureParses("the private registry-home fixture", privateRegistryHomeFixture);
+assert.equal(
+  hasPrivateRegistryHome(privateRegistryHomeFixture),
+  true,
+  "a suite that assigns COTAL_HOME before recording a mesh must pass the registry-home rule",
+);
+
+const ambientRegistryHomeFixture = 'recordMesh({ space: "fixture" });';
+assertFixtureParses("the ambient registry-home fixture", ambientRegistryHomeFixture);
+assert.equal(
+  hasPrivateRegistryHome(ambientRegistryHomeFixture),
+  false,
+  "a suite that records a mesh without assigning COTAL_HOME must fail the registry-home rule",
+);
+
+const childScriptScrubTail =
+  ' (const key of Object.keys(process.env)) if (key.startsWith("COTAL_")) delete process.env[key];';
+const childScriptSpreadTail = ' const safe = { ...process.env }; spawn("safe", { env: safe });';
+const childScriptScrubSpellings = [
+  ["plain child-script scrub", "for"],
+  ["hex-escaped child-script scrub", "\\x66or"],
+  ["Unicode-escaped child-script scrub", "\\u0066or"],
+  ["split Unicode-escaped child-script scrub", "f\\u006fr"],
+] as const;
+
+const noScrubChildScript =
+  'const CHILD = `const unsafe = { ...process.env }; spawn("unsafe", { env: unsafe });`;';
+assertFixtureParses("the no-scrub child-script fixture", noScrubChildScript);
+assert.deepEqual(
+  unstrippedSpreadLines(noScrubChildScript),
+  [1],
+  "a child-script spread without a scrub must remain unsafe",
+);
+
+for (const [name, keyword] of childScriptScrubSpellings) {
+  const source = `const CHILD = \`${keyword}${childScriptScrubTail}${childScriptSpreadTail}\`;`;
+  assertFixtureParses(`the ${name} fixture`, source);
+  assert.deepEqual(
+    unstrippedSpreadLines(source),
+    [],
+    `a ${name} must clear a later spread in the same template`,
+  );
+}
+
+const sourceMappedEscapedScrub =
+  `const CHILD = \`{\\u0030} ${childScriptScrubSpellings[2][1]}${childScriptScrubTail}${childScriptSpreadTail}\`;`;
+assertFixtureParses("the source-mapped escaped-scrub fixture", sourceMappedEscapedScrub);
+assert.deepEqual(
+  unstrippedSpreadLines(sourceMappedEscapedScrub),
+  [],
+  "an escaped child-script scrub must retain its source brace depth",
+);
+
+const unusedEscapedScrub = [
+  `const UNUSED = \`${childScriptScrubSpellings[2][1]}${childScriptScrubTail}\`;`,
+  'const unsafe = { ...process.env };',
+  'spawn("unsafe", { env: unsafe });',
+].join("\n");
+assertFixtureParses("the unused escaped-scrub fixture", unusedEscapedScrub);
+assert.deepEqual(
+  unstrippedSpreadLines(unusedEscapedScrub),
+  [2],
+  "an escaped scrub in an unused template must not clear a module-code spread",
+);
+
+const sourceMappedTemplateHeadScrub =
+  "const CHILD = `" +
+  `{\\u0030} ${childScriptScrubSpellings[2][1]}${childScriptScrubTail}${childScriptSpreadTail}` +
+  "${0}`;";
+assertFixtureParses(
+  "the source-mapped template-head escaped-scrub fixture",
+  sourceMappedTemplateHeadScrub,
+);
+assert.deepEqual(
+  unstrippedSpreadLines(sourceMappedTemplateHeadScrub),
+  [],
+  "an escaped template-head scrub must retain its source brace depth",
+);
+
+const noScrubTemplateHead =
+  'const CHILD = `const unsafe = { ...process.env }; spawn("unsafe", { env: unsafe });${0}`;';
+assertFixtureParses("the no-scrub template-head fixture", noScrubTemplateHead);
+assert.deepEqual(
+  unstrippedSpreadLines(noScrubTemplateHead),
+  [1],
+  "a template-head spread without a scrub must remain unsafe",
+);
+
+const sourceMappedTemplateSpanScrub =
+  "const CHILD = `${0}" +
+  `{\\u0030} ${childScriptScrubSpellings[2][1]}${childScriptScrubTail}${childScriptSpreadTail}` +
+  "`;";
+assertFixtureParses(
+  "the source-mapped template-span escaped-scrub fixture",
+  sourceMappedTemplateSpanScrub,
+);
+assert.deepEqual(
+  unstrippedSpreadLines(sourceMappedTemplateSpanScrub),
+  [],
+  "an escaped template-span scrub must retain its source brace depth",
+);
+
+const noScrubTemplateSpan =
+  'const CHILD = `${0}const unsafe = { ...process.env }; spawn("unsafe", { env: unsafe });`;';
+assertFixtureParses("the no-scrub template-span fixture", noScrubTemplateSpan);
+assert.deepEqual(
+  unstrippedSpreadLines(noScrubTemplateSpan),
+  [1],
+  "a template-span spread without a scrub must remain unsafe",
+);
+
+/**
+ * Files that spread the ambient environment and are graded SAFE, each with the measurement.
+ *
+ * Every reason here is about the CHILD: a child that never reads Cotal connection material cannot
+ * capture an identity from what it inherited, however much it inherited. A file whose child changes
+ * shape has to be re-measured, which is why the reason and not just the path is recorded.
+ */
+const REVIEWED: Record<string, string> = {
+  "bin/smoke/suite-ambient-env.smoke.ts": "this census itself: its ambient spreads occur only in fixture strings and it spawns nothing",
+  "bin/smoke/suite-ambient-env-self.smoke.ts":
+    "the in-process sibling of this census: its ambient spreads occur only in fixture strings it feeds to a parser, and it spawns nothing",
+  "bin/smoke/suite-own-process-material.smoke.ts":
+    "the connection-material census: same shape, its ambient spreads are fixture strings handed to a parser and it spawns nothing",
+  "implementations/cli/smoke/command-kernel.smoke.ts":
+    "spawns the cotal CLI for an ext-update path; the child consumes COTAL_UPDATE_* and COTAL_SKIP_CONNECTOR_SEED and never calls configFromEnv/controlFromEnv",
+  "implementations/cli/smoke/update-concurrency.smoke.ts":
+    "same ext-update shape: self-reentered node helpers reading COTAL_UPDATE_* / XDG_CONFIG_HOME, no connection material read",
+  "bin/smoke/herdr-e2e-live.smoke.ts":
+    "spawns herdr-e2e-manager-child.mjs, which builds its OWN stub identity from HE2E_* and sets the COTAL_ vars itself rather than reading the inherited ones",
+  "packages/workspace/smoke/win32-creation-native.smoke.ts":
+    "the spread only saves process.env for restoration in finally; coldOsEnvironment(before) replaces process.env before any child is spawned, and the snapshot is never passed to a child",
+  "implementations/auth/smoke/personal-native-auth.smoke.ts":
+    "strips COTAL_ from process.env first in its parent branch, then sets only the COTAL_ keys its children need; the strip cannot move to module scope because the same file's agent-bearer, auth-service and app-identity child modes read the COTAL_ keys their parent passes",
+  "implementations/auth/smoke/personal-native-recovery.smoke.ts":
+    "strips COTAL_ from process.env first in its parent branch, then sets only the COTAL_ keys its children need; the strip cannot move to module scope because the same file's agent-bearer, auth-service, app-identity and gateway child modes read the COTAL_ keys their parent passes",
+  "implementations/manager/smoke/native-conversation-capabilities.smoke.ts":
+    "strips COTAL_ from process.env first in its parent branch, then sets only the COTAL_ keys its children need; the strip cannot move to module scope because the same file's agent-bearer, auth-service, app-identity and seat child modes read the COTAL_ keys their parent passes",
+  "implementations/manager/smoke/native-conversation-run.smoke.ts":
+    "strips COTAL_ from process.env first in its parent branch, then sets only the COTAL_ keys its children need; the strip cannot move to module scope because the same file's agent-bearer, auth-service and app-identity child modes read the COTAL_ keys their parent passes",
+};
+
+const REGISTRY_HOME_REVIEWED: Record<string, string> = {
+  "bin/smoke/suite-ambient-env.smoke.ts":
+    "this census itself: recordMesh and COTAL_HOME occur only in fixture strings it feeds to a parser",
+  "implementations/auth/smoke/_approval-authority.ts":
+    "a fixture module, not a suite: startApprovalAuthority throws unless process.env.COTAL_HOME already equals the home its importer passes",
+};
+
+/**
+ * THE RATCHET, and read the next sentence before you read the list.
+ *
+ * IT IS A TRACKED DEFERRAL, NOT A WAIVER: the 44 are owned by issue #619, which carries the names,
+ * which of them spawn the CLI, and what "done" looks like for each. A frozen baseline pointing at an
+ * open issue is a deferral; one pointing at nothing is a waiver that outlives everyone who agreed to
+ * it. If #619 is closed and this list is not empty, this comment is the lie and the list is the
+ * truth.
+ *
+ * THESE FILES ARE NOT CLEARED. Nobody has measured whether their children read connection material,
+ * and this suite does not claim they are safe. They are the ambient spreads that already existed
+ * when this census was written, frozen so that the SET CANNOT GROW. A new suite that spreads without
+ * stripping fails here; an old one keeps doing what it was already doing until somebody audits it.
+ *
+ * Saying that plainly matters more than the list. A frozen baseline presented as a clean bill of
+ * health is worse than no baseline, because the next reader stops looking. Several of these spawn the
+ * `cotal` CLI, which DOES read connection material, so some of them are very likely real instances of
+ * the same defect that was found twice on this branch. Auditing them is its own piece of work and
+ * does not belong in a credential change.
+ *
+ * The ratchet also TIGHTENS: an entry that no longer spreads must be deleted from this list, so the
+ * baseline shrinks as files are fixed and can never quietly become a permanent waiver.
+ */
+const FROZEN: readonly string[] = [
+  "bin/smoke/dogfood-live.smoke.ts",
+  "bin/smoke/ext-live.smoke.ts",
+  "bin/smoke/orca-extension-live.smoke.ts",
+  "bin/smoke/seed-tarball-live.smoke.ts",
+  "bin/smoke/setup-pure-live.smoke.ts",
+  "bin/smoke/spawn-detach-live.smoke.ts",
+  "bin/smoke/up-stack-live.smoke.ts",
+  "bin/smoke/up-tls-routes-live.smoke.ts",
+  "extensions/connector-core/smoke/feedback.smoke.ts",
+  "implementations/auth/smoke/down-manifest-usermode.smoke.ts",
+  "implementations/auth/smoke/freeslot-respawn-barrier.smoke.ts",
+  "implementations/auth/smoke/int2-revoke-hold.smoke.ts",
+  "implementations/auth/smoke/_ps-arm2.smoke.ts",
+  "implementations/auth/smoke/ps-operator-path.smoke.ts",
+  "implementations/auth/smoke/ps-user-mode.smoke.ts",
+  "implementations/cli/smoke/bind-fence-live.smoke.ts",
+  "implementations/cli/smoke/ext-seed-help.smoke.ts",
+  "implementations/cli/smoke/join-creds-pairing.smoke.ts",
+  "implementations/cli/smoke/manager-singleton-live.smoke.ts",
+  "implementations/cli/smoke/sys-rotation-e2e.smoke.ts",
+  "implementations/cli/smoke/up-manifest-live.smoke.ts",
+  "implementations/delivery/smoke/adoption-doctor-e2e.smoke.ts",
+  "implementations/delivery/smoke/adoption-false-green.smoke.ts",
+  "implementations/delivery/smoke/adoption-passive-preflight.smoke.ts",
+  "implementations/delivery/smoke/delivery-cred-renewal.smoke.ts",
+  "implementations/manager/smoke/attach-reconnect.smoke.ts",
+  "implementations/manager/smoke/cli-on-instance-live.smoke.ts",
+  "implementations/manager/smoke/cli-seat-locality.smoke.ts",
+  "implementations/manager/smoke/gate-reconcile-cli-e2e.smoke.ts",
+  "implementations/manager/smoke/_probe-attach-reconnect.ts",
+  "implementations/manager/smoke/_probe-cellj-timing.ts",
+  "implementations/manager/smoke/_probe-session-leak.ts",
+  "implementations/manager/smoke/seat-input-live.smoke.ts",
+  "implementations/manager/smoke/windows-launch.smoke.ts",
+  "packages/core/smoke/presence-ttl-refresh-cli.smoke.ts",
+];
+
+const REAL_PROCESS_ENV_SCRUB_FILES = new Set([
+  "bin/smoke/manager-stop-reaps-agents.smoke.ts",
+  "bin/smoke/persona-agent.smoke.ts",
+  "extensions/connector-opencode/smoke/events-release.smoke.ts",
+  "implementations/cli/smoke/up-per-space-membership-live.smoke.ts",
+  "implementations/manager/smoke/_probe-late-delivery.ts",
+  "implementations/manager/smoke/_probe-live-socket-gap.ts",
+  "implementations/manager/smoke/_probe-missed-handoff.ts",
+  "implementations/manager/smoke/_probe-pipe-oneshot-exit.ts",
+  "implementations/manager/smoke/_probe-stdin-window.ts",
+  "implementations/manager/smoke/attach-stdin.smoke.ts",
+]);
+
+const offenders: string[] = [];
+const frozen: string[] = [];
+const stripped: string[] = [];
+const exempted: string[] = [];
+let totalSpreads = 0;
+const multiSpreadFiles: string[] = [];
+const mixedPathFiles: string[] = [];
+let realProcessEnvScrubSpreads = 0;
+const privateRegistryHomes: string[] = [];
+const reviewedRegistryHomes: string[] = [];
+const ambientRegistryHomes: string[] = [];
+
+for (const file of suiteSources(repoRoot)) {
+  const rel = relative(repoRoot, file).split("\\").join("/");
+  const body = readFileSync(file, "utf8");
+  const code = codeWithoutComments(body);
+  if (RECORD_MESH.test(code)) {
+    if (rel in REGISTRY_HOME_REVIEWED) reviewedRegistryHomes.push(rel);
+    else if (hasPrivateRegistryHome(code)) privateRegistryHomes.push(rel);
+    else ambientRegistryHomes.push(rel);
+  }
+  const lexical = lexicalRegions(code);
+  const spreads = spreadIndexes(code);
+  if (spreads.length === 0) continue;
+  totalSpreads += spreads.length;
+  if (rel in REVIEWED) {
+    exempted.push(rel);
+    continue;
+  }
+  const stripStates = spreads.map((index) => spreadStripped(code, lexical, index));
+  if (spreads.length > 1) multiSpreadFiles.push(rel);
+  if (FILTERED_COPY.test(code)) mixedPathFiles.push(rel);
+  if (REAL_PROCESS_ENV_SCRUB_FILES.has(rel)) {
+    assert.ok(stripStates.every(Boolean), `${rel} stopped being protected by its module-scope process.env scrub`);
+    realProcessEnvScrubSpreads += spreads.length;
+  }
+  const unstripped = spreads.filter((_, index) => !stripStates[index]);
+  if (unstripped.length === 0) {
+    stripped.push(rel);
+    continue;
+  }
+  if (FROZEN.includes(rel)) {
+    frozen.push(rel);
+    continue;
+  }
+  offenders.push(
+    `${rel} (unstripped spread at line ${unstripped.map((i) => lineOf(code, i)).join(", ")})`,
+  );
+}
+
+console.log(
+  `• census: ${stripped.length + exempted.length + frozen.length + offenders.length} suite file(s) spread the ambient environment ` +
+    `(${stripped.length} strip, ${exempted.length} reviewed-safe, ${frozen.length} frozen and UNAUDITED)`,
+);
+for (const f of stripped) console.log(`  ✓ ${f} - strips COTAL_ before the spread`);
+for (const f of exempted) console.log(`  · ${f} - reviewed safe: ${REVIEWED[f]}`);
+console.log(
+  `• registry-home census: ${privateRegistryHomes.length + reviewedRegistryHomes.length + ambientRegistryHomes.length} suite file(s) call recordMesh ` +
+    `(${privateRegistryHomes.length} private COTAL_HOME, ${reviewedRegistryHomes.length} reviewed fixture source)`,
+);
+for (const f of privateRegistryHomes) console.log(`  ✓ ${f} - assigns process.env.COTAL_HOME`);
+for (const f of reviewedRegistryHomes) console.log(`  · ${f} - reviewed safe: ${REGISTRY_HOME_REVIEWED[f]}`);
+assert.equal(
+  ambientRegistryHomes.length,
+  0,
+  `suite(s) call recordMesh without assigning process.env.COTAL_HOME: ${ambientRegistryHomes.join(", ")}`,
+);
+assert.ok(
+  privateRegistryHomes.length > 0,
+  "the registry-home census matched no isolated recordMesh suites, which means the rule is broken rather than the tree being clean",
+);
+for (const path of Object.keys(REGISTRY_HOME_REVIEWED))
+  assert.ok(
+    reviewedRegistryHomes.includes(path),
+    `REGISTRY_HOME_REVIEWED lists ${path}, but the census did not find a recordMesh fixture there`,
+  );
+
+// A census that found nothing is not a pass. The spread is a normal thing for a suite to do, so a
+// zero here means the scan stopped seeing files, not that the tree got clean.
+assert.ok(
+  stripped.length + exempted.length + frozen.length + offenders.length > 0,
+  "the census matched no suite files at all, which means the scan is broken rather than the tree being clean",
+);
+const classifiedFiles = stripped.length + exempted.length + frozen.length + offenders.length;
+assert.ok(
+  totalSpreads > classifiedFiles,
+  `the real census found ${totalSpreads} spread(s) across ${classifiedFiles} file(s); spread enumeration was truncated or the multi-spread population disappeared`,
+);
+assert.ok(
+  multiSpreadFiles.length > 0,
+  "the real census found no multi-spread suite files; spread enumeration or the population sentinel is broken",
+);
+assert.ok(
+  mixedPathFiles.length > 0,
+  "the real census found no files combining filtered ambient copies with spread copies; the mixed-path population sentinel is broken",
+);
+assert.equal(
+  realProcessEnvScrubSpreads,
+  14,
+  "the measured module-scope process.env scrub population changed from 10 files / 14 spreads",
+);
+assert.equal(
+  [...REAL_PROCESS_ENV_SCRUB_FILES].filter((file) => stripped.includes(file)).length,
+  10,
+  "the measured module-scope process.env scrub population no longer has 10 safe files",
+);
+// Every exemption must correspond to a file that still exists and still spreads; a stale entry is a
+// waiver nobody is checking.
+for (const path of Object.keys(REVIEWED))
+  assert.ok(
+    exempted.includes(path),
+    `REVIEWED lists ${path}, but the census did not find an ambient spread there - remove the stale entry rather than leaving a waiver in place`,
+  );
+// The ratchet tightens: a frozen entry that stopped spreading (or was stripped) must leave the list,
+// or the baseline becomes a permanent waiver that outlives the thing it waived.
+const staleFrozen = FROZEN.filter((f) => !frozen.includes(f));
+assert.deepEqual(
+  staleFrozen,
+  [],
+  `FROZEN still lists file(s) that no longer spread the ambient environment:\n  ${staleFrozen.join("\n  ")}\nDelete them from the list; the baseline is only allowed to shrink.`,
+);
+
+assert.deepEqual(
+  offenders,
+  [],
+  `these suite files spread the ambient environment into a child without stripping COTAL_ first:\n  ${offenders.join(
+    "\n  ",
+  )}\nWhatever runs a suite may be a managed agent session, so that spread hands the child a live credential and a live broker URL. Strip the COTAL_ keys from the copy first, or add the file to REVIEWED with the measured reason its child cannot read connection material. Do NOT add it to FROZEN: that list is a frozen baseline, not a place to put new ones.`,
+);
+
+console.log("\nsuite-ambient-env: PASS");

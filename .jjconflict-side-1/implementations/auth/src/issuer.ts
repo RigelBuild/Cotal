@@ -1,0 +1,275 @@
+/**
+ * Plane-1 user-bearer ISSUER — the server-side piece that turns an already-authenticated human
+ * (an owner) into the short-lived Cotal user bearer an agent presents to the callout (the plan's
+ * §"Plane 1"; the exact claim shape {@link validateUserToken} enforces on the other side).
+ *
+ * This is the production form of what the callout E2E smoke hand-rolls: an EdDSA (Ed25519) signer
+ * whose public keys are published as a JWKS the callout verifies against OFFLINE. It is deliberately
+ * NOT the Better-Auth binding (that's Plane-1's IdP adapter, a later slice) — an issuer takes an
+ * ALREADY-derived owner + a ledger-authorized actor and mints; deriving the owner and authorizing
+ * the actor happen upstream.
+ *
+ * Load-bearing properties:
+ *  - `alg` is EdDSA only; every token carries a `kid` so verifiers pick the right key across rotation;
+ *  - the minted claims are exactly {@link validateUserToken}'s reject matrix inverse — a token this
+ *    issuer produces MUST validate, and the round-trip smoke pins that (issuer ↔ validator agree);
+ *  - the lifetime is capped at the view's {@link viewTtlCapSec} at MINT (fail loud on an overlong ask) — the
+ *    validator caps on the read side too, but a mint that quietly exceeded the cap would be dead JWTs;
+ *  - rotation is real: multiple keys live in the JWKS at once (sign with the newest, verify any
+ *    still-published kid), and a retired kid stops verifying — that's the revocation seam for the
+ *    signing key, distinct from the per-token exp lever.
+ *
+ * NOTHING here leaks private material: `jwks()` exports public JWKs only; the private key stays a
+ * `CryptoKey` in memory (or a persisted private JWK the operator controls).
+ */
+import { SignJWT, calculateJwkThumbprint, createRemoteJWKSet, exportJWK, generateKeyPair, importJWK } from "jose";
+import type { CryptoKey, JWK, JWTVerifyGetKey } from "jose";
+import { assertDerivedOwnerToken, assertLifecycleToken, assertValidOwnerToken, isCredentialTransportUrl, SERVICE_ACCESS_TTL_SECONDS, parseServiceRegistrationWitness, type ServiceRegistrationWitness } from "@cotal-ai/core";
+import { issueServiceRenewalProof, type ServiceRenewalClaims } from "./service-renewal.js";
+import { USER_TOKEN_VER, USER_TOKEN_VIEWS, assertCredentialIdClaim, assertSessionClaim, assertTransferWriterClaim, viewTtlCapSec, type UserTokenSession, type UserTokenTransferWriter, type UserTokenView } from "./token.js";
+
+/** The one signing algorithm — Ed25519. Pinned on both mint and verify. */
+export const USER_TOKEN_ALG = "EdDSA";
+
+/** An active signing key: the private `CryptoKey` for minting + its published public JWK. The `kid`
+ *  is the RFC 7638 thumbprint of the public key (stable, collision-free, verifier-recomputable). */
+export interface SigningKey {
+  kid: string;
+  privateKey: CryptoKey;
+  /** Public JWK as published in the set (carries `kid`/`alg`/`use`; never `d`). */
+  publicJwk: JWK;
+}
+
+/** A signing key serialized for persistence — the PRIVATE JWK (with `d`) plus its kid. Guard this at
+ *  rest like any signing secret; `importSigningKey` restores it (kid integrity re-checked). */
+export interface SerializedSigningKey {
+  kid: string;
+  privateJwk: JWK;
+}
+
+function publicMembers(jwk: JWK): JWK {
+  // OKP public projection — the members a verifier (and the thumbprint) needs; drop the private `d`.
+  if (jwk.kty !== "OKP" || jwk.crv !== "Ed25519" || typeof jwk.x !== "string")
+    throw new Error(`signing key must be an Ed25519 OKP JWK (got kty=${String(jwk.kty)} crv=${String(jwk.crv)})`);
+  return { kty: jwk.kty, crv: jwk.crv, x: jwk.x };
+}
+
+async function toSigningKey(privateKey: CryptoKey, privateJwk: JWK): Promise<SigningKey> {
+  const pub = publicMembers(privateJwk);
+  const kid = await calculateJwkThumbprint(pub);
+  return { kid, privateKey, publicJwk: { ...pub, kid, alg: USER_TOKEN_ALG, use: "sig" } };
+}
+
+/** Mint a fresh Ed25519 signing key (extractable, so it can be persisted with {@link exportSigningKey}). */
+export async function generateSigningKey(): Promise<SigningKey> {
+  const { privateKey } = await generateKeyPair(USER_TOKEN_ALG, { extractable: true });
+  return toSigningKey(privateKey as CryptoKey, await exportJWK(privateKey as CryptoKey));
+}
+
+/** Serialize a signing key (private JWK + kid) for persistence. */
+export async function exportSigningKey(key: SigningKey): Promise<SerializedSigningKey> {
+  return { kid: key.kid, privateJwk: await exportJWK(key.privateKey) };
+}
+
+/** Restore a persisted signing key; re-derives the kid from the public projection and refuses a
+ *  serialized blob whose stored kid doesn't match (tamper / corruption fail-loud). */
+export async function importSigningKey(s: SerializedSigningKey): Promise<SigningKey> {
+  const privateKey = (await importJWK(s.privateJwk, USER_TOKEN_ALG)) as CryptoKey;
+  const key = await toSigningKey(privateKey, s.privateJwk);
+  if (key.kid !== s.kid) throw new Error(`signing key kid mismatch: serialized ${s.kid} != recomputed ${key.kid}`);
+  return key;
+}
+
+/** The claims a caller supplies to mint a bearer — the owner is already derived and the actor is
+ *  already ledger-authorized upstream; the issuer only stamps and signs. */
+export interface IssueClaims {
+  /** The opaque derived owner (`u_…`; format-asserted). */
+  owner: string;
+  /** The space the bearer is scoped to (becomes `aud`). */
+  space: string;
+  /** The ledger-authorized agent-instance id (becomes `act.actor`; grammar-asserted). */
+  actor: string;
+  /** Capability scope. */
+  scope?: string[];
+  /** At most one spawner audit link, `<owner>.<actor>` dot-form. */
+  parent?: string;
+  /** The ledger row's lifecycle UID (SPEC 13.1) — lifecycle-BINDS the bearer: the callout requires
+   *  exact equality with the CURRENT row at connect, so a predecessor incarnation's still-unexpired
+   *  bearer can never mint the successor's broker authority. Stamped whenever the row carries one. */
+  lifecycleUid?: string;
+  /** The credential-ledger row id (SPEC 13.1: `cred.<uid>.<credid>`) this bearer is issued under.
+   *  Stamped whenever the issuance ledgered a row; the connect boundary leader-reads it and denies
+   *  a revoked/absent-row bearer (deny-new), so the issuer ↔ validator inverse must carry it. */
+  credentialId?: string;
+  /** Exchange-authorized elevated view (already ledger-checked upstream; the issuer only stamps —
+   *  and re-asserts the closed enum, mint ↔ validate inverse). */
+  view?: UserTokenView;
+  /** Exact manager instance bound to the manager-caller view. */
+  managerInstanceId?: string;
+  /** The one session bound to the session-caller view (#2312), already ledger-verified upstream. */
+  session?: UserTokenSession;
+  /** The one object bound to the transfer-writer view (#1499). */
+  transferWriter?: UserTokenTransferWriter;
+  /** Requested lifetime; capped at the view's {@link viewTtlCapSec} (an overlong ask THROWS). */
+  ttlSec?: number;
+  /** Absolute expiry ceiling in unix seconds, such as the expiry of the proof the bearer rests on.
+   *  `exp` is the earlier of `now + ttlSec` and this, read at signing time, so time spent before
+   *  signing shortens the bearer instead of extending it; a ceiling at or before now THROWS. */
+  notAfter?: number;
+}
+
+/** Fixed deadline already bounded by current native root, approval and authorization. */
+export interface ServiceAccessClaims {
+  witness: ServiceRegistrationWitness;
+  expiresAt: number;
+}
+
+/** A running issuer: mints bearers with the active key, publishes the public JWKS, and rotates. */
+export interface UserTokenIssuer {
+  /** The `iss` every bearer carries (verifiers pin this). */
+  readonly issuer: string;
+  /** The active signing kid. */
+  activeKid(): string;
+  /** Mint a bearer for a validated (owner, actor). Returns the compact JWS. */
+  issue(claims: IssueClaims): Promise<string>;
+  /** Service registration-bound renewal proof, never a connect bearer. */
+  issueServiceRenewal(claims: ServiceRenewalClaims): Promise<string>;
+  /** Signature primitive only; the dedicated host must establish current service authority. */
+  issueServiceAccess(claims: ServiceAccessClaims): Promise<string>;
+  /** The public JWK Set to publish for offline verification (all live kids, public members only). */
+  jwks(): { keys: JWK[] };
+  /** Add a key and make it the active signer; prior keys stay published until {@link retire}. */
+  rotate(key: SigningKey): void;
+  /** Drop a retired kid from the set — after that, tokens it signed no longer verify. */
+  retire(kid: string): void;
+  /** A verifier over the CURRENT key set (reflects rotate/retire live) — for a co-located callout
+   *  or tests. Same `JWTVerifyGetKey` shape {@link validateUserToken} accepts. */
+  localKeySet(): JWTVerifyGetKey;
+}
+
+export interface CreateIssuerOpts {
+  /** Exact issuer string minted into `iss` (verifiers pin it). */
+  issuer: string;
+  /** The initial (active) signing key. */
+  key: SigningKey;
+}
+
+/** Build a {@link UserTokenIssuer}. */
+export function createUserTokenIssuer(opts: CreateIssuerOpts): UserTokenIssuer {
+  if (!opts.issuer) throw new Error("issuer: an `iss` string is required");
+  const keys = new Map<string, SigningKey>([[opts.key.kid, opts.key]]);
+  let active = opts.key.kid;
+
+  const issue = async (claims: IssueClaims): Promise<string> => {
+    if (claims.view === "service-endpoint") throw new Error("issue: service-endpoint requires the dedicated service authority issuer");
+    // Every claim is RUNTIME-shape-checked, not just TS-typed: C2 feeds this from IdP/session JSON,
+    // and a mis-shaped claim must fail HERE — signing it would mint a dead bearer the validator
+    // rejects, silently breaking the issuer ↔ validator inverse.
+    assertDerivedOwnerToken(claims.owner);
+    assertValidOwnerToken(claims.actor);
+    if (typeof claims.space !== "string" || !claims.space)
+      throw new Error("issue: space (aud) must be a non-empty string");
+    if (claims.scope !== undefined && !(Array.isArray(claims.scope) && claims.scope.every((s) => typeof s === "string")))
+      throw new Error("issue: scope must be a string list when present");
+    if (claims.parent !== undefined) {
+      if (typeof claims.parent !== "string")
+        throw new Error("issue: parent must be a string principal (<owner>.<actor>)");
+      const parts = claims.parent.split(".");
+      if (parts.length !== 2) throw new Error(`issue: parent "${claims.parent}" is not a principal (<owner>.<actor>)`);
+      assertDerivedOwnerToken(parts[0]);
+      assertValidOwnerToken(parts[1]);
+    }
+    if (claims.credentialId !== undefined) assertCredentialIdClaim(claims.credentialId); // never sign a credid the validator would reject
+    if (claims.view !== undefined && !USER_TOKEN_VIEWS.includes(claims.view))
+      throw new Error(
+        `issue: view "${String(claims.view)}" is not a known view (${USER_TOKEN_VIEWS.join(", ")}) - the enum is closed on the mint side too`,
+      );
+    if (claims.managerInstanceId !== undefined) assertLifecycleToken(claims.managerInstanceId, "managerInstanceId");
+    if (claims.view === "manager-caller" && claims.managerInstanceId === undefined)
+      throw new Error('issue: view "manager-caller" requires managerInstanceId');
+    if (claims.managerInstanceId !== undefined && claims.view !== "manager-caller")
+      throw new Error('issue: managerInstanceId is valid only with view "manager-caller"');
+    if ((claims.view === "session-caller") !== (claims.session !== undefined))
+      throw new Error('issue: view "session-caller" and a session claim come together or not at all');
+    if (claims.session !== undefined) assertSessionClaim(claims.session);
+    if ((claims.view === "transfer-writer") !== (claims.transferWriter !== undefined))
+      throw new Error('issue: view "transfer-writer" and a transferWriter claim come together or not at all');
+    if (claims.transferWriter !== undefined) assertTransferWriterClaim(claims.transferWriter);
+    if (claims.notAfter !== undefined && !Number.isSafeInteger(claims.notAfter))
+      throw new Error("issue: notAfter must be an integer unix time when present");
+    const cap = viewTtlCapSec(claims.view);
+    const ttl = claims.ttlSec ?? cap;
+    if (typeof ttl !== "number" || !Number.isFinite(ttl) || !(ttl > 0) || ttl > cap)
+      throw new Error(`issue: ttlSec ${ttl} out of range (0, ${cap}] - the cap is the revocation lever`);
+    const signer = keys.get(active);
+    if (!signer) throw new Error("issue: no active signing key");
+    const now = Math.floor(Date.now() / 1000);
+    if (claims.notAfter !== undefined && claims.notAfter <= now)
+      throw new Error(`issue: the expiry ceiling ${claims.notAfter} has passed - refusing to sign a bearer that would outlive its proof`);
+    const exp = claims.notAfter === undefined ? now + ttl : Math.min(now + ttl, claims.notAfter);
+    return new SignJWT({
+      scope: claims.scope ?? [],
+      ver: USER_TOKEN_VER,
+      act: { owner: claims.owner, actor: claims.actor, ...(claims.scope ? { scope: claims.scope } : {}), ...(claims.parent ? { parent: claims.parent } : {}), ...(claims.lifecycleUid ? { lifecycleUid: claims.lifecycleUid } : {}), ...(claims.credentialId ? { credentialId: claims.credentialId } : {}), ...(claims.view ? { view: claims.view } : {}), ...(claims.managerInstanceId ? { managerInstanceId: claims.managerInstanceId } : {}), ...(claims.session ? { session: claims.session } : {}), ...(claims.transferWriter ? { transferWriter: claims.transferWriter } : {}) },
+    })
+      .setProtectedHeader({ alg: USER_TOKEN_ALG, kid: signer.kid })
+      .setSubject(claims.owner)
+      .setIssuer(opts.issuer)
+      .setAudience(claims.space)
+      .setIssuedAt(now)
+      .setNotBefore(now)
+      .setExpirationTime(exp)
+      .sign(signer.privateKey);
+  };
+
+  return {
+    issuer: opts.issuer,
+    activeKid: () => active,
+    issue,
+    issueServiceRenewal: (claims) => {
+      const signer = keys.get(active);
+      if (!signer) throw new Error("issue: no active signing key");
+      return issueServiceRenewalProof(signer, opts.issuer, claims);
+    },
+    issueServiceAccess: async (claims) => {
+      const witness = parseServiceRegistrationWitness(claims.witness);
+      const now = Math.floor(Date.now() / 1000), exp = claims.expiresAt;
+      if (!Number.isSafeInteger(exp) || exp <= now || exp > now + SERVICE_ACCESS_TTL_SECONDS)
+        throw new Error("service access requires a future fixed expiry within its lifetime cap");
+      const signer = keys.get(active);
+      if (!signer) throw new Error("issue: no active signing key");
+      const bearer = await new SignJWT({ ver: USER_TOKEN_VER, scope: [], act: {
+        owner: witness.principal.owner, actor: witness.principal.actor, scope: [],
+        lifecycleUid: witness.principal.lifecycleUid, credentialId: witness.rootCredentialId,
+        view: "service-endpoint", service: { duty: "serve", witness },
+      } }).setProtectedHeader({ alg: USER_TOKEN_ALG, kid: signer.kid })
+        .setIssuer(opts.issuer).setAudience(witness.space).setSubject(witness.principal.owner)
+        .setIssuedAt(now).setNotBefore(now).setExpirationTime(exp).sign(signer.privateKey);
+      if (exp <= Math.floor(Date.now() / 1000)) throw new Error("service access expired before release; its fixed expiry is not extended");
+      return bearer;
+    },
+    jwks: () => ({ keys: [...keys.values()].map((k) => k.publicJwk) }),
+    rotate: (key: SigningKey) => { keys.set(key.kid, key); active = key.kid; },
+    retire: (kid: string) => {
+      if (kid === active) throw new Error(`issuer: refusing to retire the active kid ${kid} - rotate to a new key first`);
+      keys.delete(kid);
+    },
+    localKeySet: (): JWTVerifyGetKey => async (header) => {
+      const jwk = header.kid ? keys.get(header.kid)?.publicJwk : undefined;
+      if (!jwk) throw new Error(`no published signing key for kid ${String(header.kid)}`);
+      return (await importJWK(jwk, USER_TOKEN_ALG)) as CryptoKey;
+    },
+  };
+}
+
+/** Build the callout's pinned key resolver: a `createRemoteJWKSet` locked to ONE origin. The token
+ *  never influences where the key comes from — jose fetches only this URL and ignores any embedded
+ *  `jku`/`jwk` (and {@link validateUserToken} rejects those headers outright). HTTPS is required
+ *  except plain http on a loopback IP literal (dev). A name such as `localhost` gets no exception,
+ *  because resolution would then choose the trust anchor. */
+export function pinnedJwksResolver(jwksUri: string): JWTVerifyGetKey {
+  const url = new URL(jwksUri);
+  if (!isCredentialTransportUrl(url))
+    throw new Error(`JWKS origin must be https (or http on a loopback IP literal for dev), got ${url.protocol}//${url.hostname}`);
+  return createRemoteJWKSet(url);
+}

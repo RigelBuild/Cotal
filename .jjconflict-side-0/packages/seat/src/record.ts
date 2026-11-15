@@ -1,0 +1,233 @@
+import { chmodSync, closeSync, constants, fchmodSync, fstatSync, ftruncateSync, mkdirSync, openSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { randomBytes } from "node:crypto";
+
+export const RECORD_VERSION = 1;
+
+export interface SeatRecord {
+  version: number;
+  id: string;
+  name: string;
+  socket: string;
+  token: string;
+  custodianPid: number;
+  childPid: number;
+  /** The custodian's process start identity (`/proc/<pid>/stat` starttime), so a later reader can
+   *  tell this custodian from an unrelated process that inherited its pid. Absent on a record a
+   *  custodian wrote before identity pinning; such a record is never signalled. */
+  custodianStart?: string;
+  /** The child's process start identity, same rule. Absent on a pinned record when the child had
+   *  already exited before the custodian could read it (a failed exec); a reader takes that as gone. */
+  childStart?: string;
+  /** The boot this record's pids belong to (`/proc/sys/kernel/random/boot_id`). A start token counts
+   *  clock ticks SINCE BOOT, so it is only unique within one boot, and custody records outlive a
+   *  reboot on disk. Without this, a surviving record could match an unrelated process that reached
+   *  the same pid at the same tick after a reboot, and be signalled for it. Absent on a record
+   *  written before boot binding; such a record is never signalled. */
+  bootId?: string;
+  /** Private temporary directories the launch wrote for this seat's child to read (a persona
+   *  carrier, an MCP config file). The custodian removes them when its child exits and drops from the
+   *  record the ones it removed; any still listed belong to a custodian killed first or could not be
+   *  removed, and the reap that proves the seat gone removes them, keeping the record until it has. */
+  artifacts?: string[];
+  /** The temp dir of the launcher that wrote `artifacts`, which every entry must sit directly under.
+   *  Recorded because a reap may run in a successor whose own temp dir differs. */
+  artifactRoot?: string;
+}
+
+export function seatId(): string {
+  return randomBytes(16).toString("hex");
+}
+
+const SEAT_ID = /^[0-9a-f]{32}$/;
+
+/** Every seat id names a directory under the custody root, so it is checked against the shape
+ *  {@link seatId} mints before it is ever joined to a path. A reference reaches `reapSeat` and
+ *  `loadSeat` from a durable slot row, and an id carrying `..` or a separator would address a
+ *  record outside the root. Refuse rather than resolve: an unaddressable reference must not be
+ *  reported as a seat that is already forgotten. */
+export function assertSeatId(id: string): string {
+  if (!isSeatId(id)) throw new Error(`seat id ${JSON.stringify(id)} is not 32 lowercase hex characters; it names a directory under the custody root`);
+  return id;
+}
+
+/** Whether `id` has the shape {@link seatId} mints, so a directory entry can be told from a seat. */
+export function isSeatId(id: string): boolean {
+  return SEAT_ID.test(id);
+}
+
+export function capabilityToken(): string {
+  return randomBytes(32).toString("hex");
+}
+
+export function recordPath(root: string, id: string): string {
+  return join(root, assertSeatId(id), "record.json");
+}
+
+/** Where a custodian records how its child ended, beside the custody record it names. */
+export function exitPath(recordFile: string): string {
+  return join(dirname(recordFile), "exit.json");
+}
+
+export function socketPath(root: string, id: string): string {
+  return join(root, assertSeatId(id), "seat.sock");
+}
+
+/** The launch fence: beside the seat directory, so it outlives the release rename of that directory. */
+export function fencePath(root: string, id: string): string {
+  return join(root, `.launch-${assertSeatId(id)}`);
+}
+
+/** This boot's identity. Read at the moment a record is written and again when it is read back: a
+ *  start token is ticks since THIS boot, so two records from different boots share a namespace they
+ *  cannot distinguish on their own. Undefined where the kernel does not publish it: a record written
+ *  then is unbound, and a record read then cannot be tied to this boot, so both are refused rather
+ *  than wrongly signalled. */
+export function bootToken(): string | undefined {
+  try {
+    const id = readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+    return id.length > 0 ? id : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Read one Linux `/proc/<pid>/stat` snapshot. The returned fields start at field 3 (`state`)
+ *  after the final `) `, because `comm` may contain spaces and parentheses. Undefined when the
+ *  entry is absent, unreadable, or malformed. */
+export function processStatFields(pid: number): string[] | undefined {
+  if (typeof pid !== "number" || !Number.isSafeInteger(pid) || pid <= 0) return undefined;
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    if (stat.includes("\0")) return undefined;
+    const prefix = `${pid} (`;
+    if (!stat.startsWith(prefix)) return undefined;
+    const after = stat.lastIndexOf(") ");
+    if (after < prefix.length) return undefined;
+    const rest = stat.slice(after + 2).trim();
+    if (rest.length === 0 || /[\r\n]/.test(rest)) return undefined;
+    const fields = rest.split(/[ \t]+/);
+    if (
+      fields.length < 20 ||
+      !/^[A-Za-z]$/.test(fields[0]!) ||
+      !/^\d+$/.test(fields[1]!) ||
+      !/^\d+$/.test(fields[2]!) ||
+      !/^\d+$/.test(fields[19]!) ||
+      !fields.slice(3, 19).every((f) => /^-?\d+$/.test(f))
+    ) {
+      return undefined;
+    }
+    return fields;
+  } catch {
+    return undefined;
+  }
+}
+
+/** The Linux process start token: `/proc/<pid>/stat` field 22 (starttime, in clock ticks since
+ *  boot), parsed after the final `)` because comm may hold spaces and parentheses. A zombie still
+ *  reports it, so a child that exited before its custodian reaped it is still readable. Undefined
+ *  when the pid has no `/proc` entry. */
+export function processStartToken(pid: number): string | undefined {
+  return processStatFields(pid)?.[19];
+}
+
+function notPrivate(path: string, why: string): NodeJS.ErrnoException {
+  const refused: NodeJS.ErrnoException = new Error(`refusing to write "${path}": it ${why}; it was left unchanged`);
+  refused.code = "EPERM";
+  return refused;
+}
+
+/** Open a private regular file without following links or blocking on special files. */
+function openPrivate(path: string, flags: number): number {
+  let fd: number;
+  try {
+    fd = openSync(path, flags | constants.O_NOFOLLOW | constants.O_NONBLOCK, 0o600);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ELOOP") throw notPrivate(path, "is a symlink");
+    throw e;
+  }
+  try {
+    const info = fstatSync(fd);
+    if (!info.isFile()) throw notPrivate(path, "is not a regular file");
+    if (info.uid !== process.getuid!()) throw notPrivate(path, `is owned by uid ${info.uid}, not this user`);
+    fchmodSync(fd, 0o600);
+    return fd;
+  } catch (e) {
+    closeSync(fd);
+    throw e;
+  }
+}
+
+/** Replace a private file's bytes under {@link openPrivate}'s rule. */
+export function writePrivate(path: string, data: string): void {
+  const fd = openPrivate(path, constants.O_WRONLY | constants.O_CREAT);
+  try {
+    ftruncateSync(fd);
+    writeFileSync(fd, data);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/** Append to a private log under {@link openPrivate}'s rule. */
+export function appendPrivate(path: string, data: string): void {
+  const fd = openPrivate(path, constants.O_WRONLY | constants.O_CREAT | constants.O_APPEND);
+  try {
+    writeFileSync(fd, data);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+export function writeRecord(path: string, record: SeatRecord): void {
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  writePrivate(path, `${JSON.stringify(record)}\n`);
+  chmodSync(dirname(path), 0o700);
+}
+
+/** Read a file in a seat directory without following a final symlink. */
+export function readSeatFileNoFollow(path: string): string {
+  const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    return readFileSync(fd, "utf8");
+  } finally {
+    closeSync(fd);
+  }
+}
+
+export function readRecord(path: string): SeatRecord {
+  const raw = JSON.parse(readSeatFileNoFollow(path)) as Partial<SeatRecord>;
+  if (raw.version !== RECORD_VERSION) throw new Error(`unsupported seat record version ${String(raw.version)}`);
+  if (typeof raw.id !== "string" || raw.id.length === 0) throw new Error("seat record missing id");
+  if (typeof raw.name !== "string" || raw.name.length === 0) throw new Error("seat record missing name");
+  if (typeof raw.socket !== "string" || raw.socket.length === 0) throw new Error("seat record missing socket");
+  if (typeof raw.token !== "string" || raw.token.length === 0) throw new Error("seat record missing token");
+  if (typeof raw.custodianPid !== "number" || !Number.isInteger(raw.custodianPid)) throw new Error("seat record missing custodianPid");
+  if (typeof raw.childPid !== "number" || !Number.isInteger(raw.childPid)) throw new Error("seat record missing childPid");
+  if (raw.custodianStart !== undefined && (typeof raw.custodianStart !== "string" || raw.custodianStart.length === 0))
+    throw new Error("seat record custodianStart is not a start token");
+  if (raw.childStart !== undefined && (typeof raw.childStart !== "string" || raw.childStart.length === 0))
+    throw new Error("seat record childStart is not a start token");
+  if (raw.bootId !== undefined && (typeof raw.bootId !== "string" || raw.bootId.length === 0))
+    throw new Error("seat record bootId is not a boot identity");
+  if (raw.artifacts !== undefined && (!Array.isArray(raw.artifacts) || raw.artifacts.some((a) => typeof a !== "string" || a.length === 0)))
+    throw new Error("seat record artifacts is not a list of paths");
+  if (raw.artifactRoot !== undefined && (typeof raw.artifactRoot !== "string" || raw.artifactRoot.length === 0))
+    throw new Error("seat record artifactRoot is not a path");
+  return {
+    version: RECORD_VERSION,
+    id: raw.id,
+    name: raw.name,
+    socket: raw.socket,
+    token: raw.token,
+    custodianPid: raw.custodianPid,
+    childPid: raw.childPid,
+    ...(raw.custodianStart !== undefined ? { custodianStart: raw.custodianStart } : {}),
+    ...(raw.childStart !== undefined ? { childStart: raw.childStart } : {}),
+    // Carried, not re-read from this process: a record read on another boot must still say which
+    // boot its pids came from, which is the whole point of the stamp.
+    ...(raw.bootId !== undefined ? { bootId: raw.bootId } : {}),
+    ...(raw.artifacts !== undefined ? { artifacts: raw.artifacts } : {}),
+    ...(raw.artifactRoot !== undefined ? { artifactRoot: raw.artifactRoot } : {}),
+  };
+}

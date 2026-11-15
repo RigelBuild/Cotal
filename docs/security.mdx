@@ -68,6 +68,8 @@ An authenticated peer can flood destinations it may write to. Cotal relies on co
 The deployment also has these limits.
 
 - A copied static credential retains inline data-plane grants until expiry or signing-key rotation. Despawn retires its lifecycle and control authority but cannot add a static auth callout.
+- A manager-issued DM-only seat credential carries inline broker grants until its expiry. Identity retirement prevents renewal and retires its issuance record, but a copied JWT may keep its DM grant until its bounded expiry (at most 24 hours); retire does not turn that JWT into an online-revocable credential.
+
 - A host compromise can expose signing authority. Narrow operator profiles reduce individual connection grants but do not protect a copied signer.
 - Static `spawn` can choose a child's channel ACL. Spawn also grants access to connector launch options on the manager host.
 - Spawn environment filtering does not confine files reachable through `HOME` or other supplied roots.

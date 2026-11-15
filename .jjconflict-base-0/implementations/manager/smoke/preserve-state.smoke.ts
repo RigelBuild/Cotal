@@ -1,0 +1,1838 @@
+import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync, existsSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import {
+  DEV_OWNER,
+  createSpaceAuth,
+  mintCreds,
+  mintLifecycleUid,
+  newIdentity,
+  principalKey,
+  registry,
+  type AgentHandle,
+  type AttachSession,
+  type AuthProvider,
+  type Connector,
+  type LaunchOpts,
+  type LaunchSpec,
+} from "@cotal-ai/core";
+import { advanceSeatWriterGeneration, agentCredsDir, agentLifecycleSecretFilePaths, loadSeatWriterGeneration, readSeatCheckpoint, seatCheckpointDir } from "@cotal-ai/workspace";
+// The two shipped entry points the cut and the resume call, so these checks run the operator's
+// path rather than the gates underneath it. Implementations do not depend on each other, so this
+// is a dev-only smoke import from source, the same way attach.smoke.ts reads the CLI's ws client.
+import { captureSeatCheckpoint } from "../../cli/src/lib/seat-capture.js";
+import { admitSeatCheckpoints } from "../../cli/src/lib/seat-admission.js";
+import { restoreSeatCheckpoints } from "../../cli/src/lib/seat-restore.js";
+import { admitAndRestoreSeatCheckpoints } from "../../cli/src/lib/seat-resume.js";
+import { Manager, type ManagerResumeIdentity, type ManagerResumeAgent, type ManagerResumeInventory } from "../src/manager.js";
+import { MAX_RESUME_CONTROL_BYTES, parseResumeControlArgs } from "../src/resume.js";
+
+let failures = 0;
+function check(label: string, condition: boolean, extra?: unknown): void {
+  console.log(`${condition ? "ok" : "not ok"} - ${label}${condition ? "" : `: ${String(extra ?? "")}`}`);
+  if (!condition) failures++;
+}
+
+interface FakeHandle extends AgentHandle {
+  stops: number;
+  releases: number;
+}
+
+function fakeHandle(name: string, opts: { throwOnStop?: boolean } = {}): FakeHandle {
+  let state: "running" | "exited" = "running";
+  const exits = new Set<() => void>();
+  const session: AttachSession = {
+    cols: 80,
+    rows: 24,
+    backlog: () => Buffer.alloc(0),
+    onData: () => () => {},
+    onExit: (fn) => { exits.add(fn); return () => exits.delete(fn); },
+    write: () => {},
+    resize: () => {},
+  };
+  const handle: FakeHandle = {
+    name,
+    kind: "fake",
+    stops: 0,
+    releases: 0,
+    status: () => state,
+    stop: () => {
+      handle.stops++;
+      if (opts.throwOnStop) throw new Error("simulated stop failure");
+      state = "exited";
+      for (const fn of exits) fn();
+    },
+    waitForExit: () => state === "exited"
+      ? Promise.resolve()
+      : new Promise<void>((resolve) => {
+          const done = (): void => { exits.delete(done); resolve(); };
+          exits.add(done);
+        }),
+    release: () => { handle.releases++; },
+    interrupt: () => {},
+    attach: () => session,
+  };
+  return handle;
+}
+
+/** A handle whose stop leaves the child DYING: `waitForExit` stays pending until `finishExit`. A
+ *  real pty exits on its own clock, so this is the only shape that separates an accepted stop from
+ *  its exit proof — `fakeHandle` exits inside `stop()`, which hides that gap entirely. */
+function lingeringHandle(name: string): AgentHandle & { finishExit(): void } {
+  let state: "running" | "exited" = "running";
+  let release = (): void => {};
+  const exited = new Promise<void>((resolve) => { release = resolve; });
+  return {
+    name,
+    kind: "fake",
+    status: () => state,
+    stop: () => {},
+    waitForExit: () => exited,
+    interrupt: () => {},
+    attach: () => { throw new Error("lingering handle has no attach stream"); },
+    finishExit: () => { state = "exited"; release(); },
+  };
+}
+
+function silentExitHandle(name: string): AgentHandle & { exitSilently(): void } {
+  let state: "running" | "exited" = "running";
+  return {
+    name,
+    kind: "fake",
+    status: () => state,
+    stop: () => { state = "exited"; },
+    waitForExit: async () => {},
+    interrupt: () => {},
+    attach: () => { throw new Error("external runtime has no attach stream"); },
+    exitSilently: () => { state = "exited"; },
+  };
+}
+
+const root = mkdtempSync(join(tmpdir(), "cotal-preserve-"));
+const agentsDir = join(root, ".cotal", "agents");
+const runDir = join(root, ".cotal", "run");
+const runAgentsDir = join(runDir, "r1", "agents");
+mkdirSync(agentsDir, { recursive: true });
+mkdirSync(runAgentsDir, { recursive: true });
+const personaPath = join(agentsDir, "worker.md");
+const runPersonaPath = join(runAgentsDir, "worker.md");
+writeFileSync(personaPath, "---\nname: worker\n---\nworker persona\n");
+writeFileSync(runPersonaPath, "---\nname: worker\n---\nworker persona\n");
+writeFileSync(join(runDir, "r1.json"), JSON.stringify({
+  apiVersion: "cotal-launch/v1",
+  space: "preserve-smoke",
+  runId: "r1",
+  agents: [{
+    name: "worker",
+    agent: "preserve-connector",
+    subscribe: ["general"],
+    allowSubscribe: ["general"],
+    allowPublish: [],
+    hash: "abc123",
+  }],
+}));
+const digest = (path: string): string => createHash("sha256").update(readFileSync(path)).digest("hex");
+const inventoryOf = (...agents: ManagerResumeAgent[]): ManagerResumeInventory => ({
+  version: "cotal-manager-resume/v2",
+  space: "preserve-smoke",
+  createdAt: new Date().toISOString(),
+  agents,
+});
+
+function managerWith(
+  runtimeSpawn: (name: string, spec: LaunchSpec, cwd: string) => AgentHandle,
+  opts: { resumeAttemptId?: string; resumeDurableCommitToken?: string } = {},
+): Manager {
+  const manager = new Manager({
+    space: "preserve-smoke",
+    runtime: "pty",
+    workspaceRoot: root,
+    preserveStopTimeoutMs: 50,
+    resumeAttemptId: opts.resumeAttemptId,
+    resumeDurableCommitToken: opts.resumeDurableCommitToken,
+  });
+  const agents = (manager as unknown as { agents: Map<string, { id: string; name: string; userOwner?: string; lifecycleUid?: string }> }).agents;
+  (manager as unknown as { runtime: unknown }).runtime = { kind: "fake", spawn: runtimeSpawn };
+  (manager as unknown as { probeStaticCredential: () => Promise<{ ok: true }> }).probeStaticCredential = async () => ({ ok: true });
+  (manager as unknown as { ep: unknown }).ep = {
+    ref: () => ({ id: "local.manager", name: "manager", role: "manager" }),
+    // The real endpoint publishes the incarnation's lifecycleUid in presence whenever it has one
+    // (endpoint.ts publishPresence); the readiness lifecycle fence matches on it, so the fake roster
+    // must carry it too or a resumed agent (which now recovers its uid) never reports STARTED.
+    getRoster: () => [...agents.values()].map((a) => ({
+      card: { id: a.userOwner ? a.id : principalKey(DEV_OWNER, a.id).key, name: a.name },
+      lifecycleUid: a.lifecycleUid,
+      status: "idle",
+    })),
+    waitForPresenceSnapshot: async () => {},
+    // The CHAT stream frontier this fake mesh has reached, for the preservation cut to record as
+    // each retained seat's backfillFloor (issue #545).
+    chatFrontier: async () => 4242,
+    on: () => {},
+    off: () => {},
+    releaseManagerLease: async () => {},
+    releaseDaemonRenewalLease: async () => {},
+    stop: async () => {},
+  };
+  (manager as unknown as { attach: unknown }).attach = { stop: async () => {} };
+  return manager;
+}
+
+type Reply = { ok: boolean; data?: unknown; error?: string };
+// 1d: the manager `ctl` `handle` router is deleted; each op is a door-shared method the ep serve
+// path calls. This test helper drives the SAME methods with the SAME framing the ep door uses:
+//  - the resume/preservation FAMILY bypasses the admission fence (the ep door wraps them in
+//    `adminGated`, not `serveGated`, so they run WHILE `resumeRequired` fences ordinary work);
+//  - ordinary ops (`models`, `stop`) ride the shared `admitControl` fence (serveGated's core — the
+//    drain gate preserveState waits on). The admin authority is now the ep credential boundary +
+//    `adminGated` (proven in manager-split/manager-service-ops), not a tier arg here.
+const control = async (manager: Manager, _tier: string, op: string, args: Record<string, unknown>): Promise<Reply> => {
+  const m = manager as unknown as {
+    opResumePreserved: (a: unknown) => Promise<Reply>;
+    opCommitResume: (a: unknown) => Promise<Reply>;
+    opFinalizeResume: (a: unknown) => Promise<Reply>;
+    opPreservationCtl: (op: string, a: unknown) => Promise<Reply>;
+    opModels: (a: Record<string, unknown>) => Promise<Reply>;
+    opStop: (a: Record<string, unknown>, caller: string, admin: boolean) => Promise<Reply>;
+    list: (filter?: string) => unknown[];
+    psOwnerFilter: (caller: { owner: string; actor: string; uid: string }, admin: boolean) => Promise<string | undefined>;
+    admitControl: (caller: string) => { refusal?: string; release?: () => void };
+  };
+  if (op === "resumePreserved") return m.opResumePreserved(args);
+  if (op === "commitResume") return m.opCommitResume(args);
+  if (op === "finalizeResume") return m.opFinalizeResume(args);
+  if (op === "preparePreservation" || op === "commitPreservation" || op === "abortPreservation") return m.opPreservationCtl(op, args);
+  // Ordinary op: run through the admission fence (the ep door's serveGated core).
+  const admission = m.admitControl("local.operator");
+  if (admission.refusal !== undefined) return { ok: false, error: admission.refusal };
+  try {
+    if (op === "models") return await m.opModels(args);
+    if (op === "stop") return await m.opStop(args, "local.operator", true);
+    if (op === "ps") return { ok: true, data: m.list(await m.psOwnerFilter({ owner: "local", actor: "operator", uid: mintLifecycleUid() }, true)) };
+    return { ok: false, error: `unknown op: ${op}` };
+  } finally {
+    admission.release?.();
+  }
+};
+
+// A deterministic valid incarnation uid ([a-z0-9]{26,32}) per agent, so preserved inventory carries
+// the exact value a real ManagedAgent would (spawn mints it, resume recovers it) and the smoke can
+// assert it threads inventory -> LaunchOpts unchanged.
+const uidFor = (name: string): string => (name.replace(/[^a-z0-9]/g, "") + "0".repeat(26)).slice(0, 26);
+
+function managed(name: string, id: string, handle: AgentHandle, source: "manifest" | "persona" = "manifest") {
+  return {
+    name,
+    role: "worker",
+    agent: "preserve-connector",
+    id,
+    lifecycleUid: uidFor(name),
+    seed: "TOP-SECRET-SEED",
+    spawner: "local.manager",
+    startedAt: 1_700_000_000_000,
+    handle,
+    control: { path: "/tmp/control.sock", token: "TOP-SECRET-CONTROL" },
+    launch: {
+      source: source === "manifest"
+        ? { kind: "manifest", runId: "r1", requested: "worker", hash: "abc123", configPath: runPersonaPath, configSha256: digest(runPersonaPath), manifestSha256: digest(join(runDir, "r1.json")) }
+        : { kind: "persona", ref: "worker", configPath: personaPath, configSha256: digest(personaPath) },
+      cwd: root,
+      model: "test-model",
+      subscribe: ["general"],
+      allowSubscribe: ["general"],
+      allowPublish: [],
+      capabilities: ["spawn"],
+    },
+  };
+}
+
+// The connector callback below is what assigns this, and the checker cannot follow a call into
+// a registered extension. A bare `x = undefined` reset therefore narrows the binding to
+// `undefined` for the rest of the block and every later read reports on `never`, so the reset
+// goes through a call, which leaves the declared type in place. Runtime behaviour is identical.
+let capturedLaunch: LaunchOpts | undefined;
+const resetCapturedLaunch = () => { capturedLaunch = undefined; };
+const connector: Connector = {
+  kind: "connector",
+  name: "preserve-connector",
+  buildLaunch: (opts) => {
+    capturedLaunch = opts;
+    return { command: "true", args: [], env: {} };
+  },
+};
+registry.register(connector);
+
+let retainedValidationCalls = 0;
+let retainedGrantCalls = 0;
+let afterRetainedValidation: (() => void) | undefined;
+let lastRetainedInput: { actorToken?: string; sentinelCreds?: string } | undefined;
+let retainedAuthority = {
+  owner: "u_aaaaaaaaaaaaaaaaaaaaaaaaaa",
+  actor: "worker",
+  // Must equal the user entry's inventory uid: the manager binds the two before any spawn.
+  lifecycleUid: uidFor("userworker"),
+  scope: [] as string[],
+  allowSubscribe: ["general"],
+  allowPublish: [] as string[],
+  role: "worker",
+  parent: undefined as string | undefined,
+};
+// The registry takes a whole AuthProvider; this stub implements only what the resume path calls.
+// A cast AFTER the literal gives its members no contextual type, which is why the validator's
+// parameter was implicitly `any`; annotating the subset types the callback from the contract, and
+// the widening happens once, at the register call.
+const preserveAuth: Pick<AuthProvider, "kind" | "name" | "agentBearerCommand" | "validateRetainedAgent" | "grantAgent"> = {
+  kind: "auth-provider",
+  name: "preserve-auth",
+  agentBearerCommand: "agent-bearer",
+  validateRetainedAgent: async (input) => {
+    retainedValidationCalls++;
+    lastRetainedInput = input;
+    const result = { ...retainedAuthority };
+    afterRetainedValidation?.();
+    return result;
+  },
+  grantAgent: async () => {
+    retainedGrantCalls++;
+    throw new Error("grantAgent must not run during resume");
+  },
+};
+registry.register(preserveAuth as unknown as AuthProvider);
+
+// Fence and drain: an accepted async control request completes before children stop, while later
+// lifecycle work is rejected immediately. The exit watcher fires from stop() but must not clean up.
+{
+  let releaseModels!: () => void;
+  const modelsGate = new Promise<void>((resolve) => { releaseModels = resolve; });
+  const slowModelsCon: Connector = {
+    kind: "connector",
+    name: "preserve-slow-models",
+    listModels: async () => { await modelsGate; return { models: [] }; },
+    buildLaunch: () => ({ command: "true", args: [] }),
+  };
+  registry.register(slowModelsCon);
+  const manager = managerWith((name) => fakeHandle(name));
+  const handle = fakeHandle("worker");
+  const map = (manager as unknown as { agents: Map<string, unknown> }).agents;
+  map.set("worker", managed("worker", "open_principal_1", handle));
+  let deprovisions = 0;
+  (manager as unknown as { deprovision: () => Promise<void> }).deprovision = async () => { deprovisions++; };
+  (manager as unknown as { watchExit: (a: unknown) => void }).watchExit(map.get("worker"));
+
+  const accepted = control(manager, "admin", "models", { agent: "preserve-slow-models" });
+  let persistenceStarted!: () => void;
+  let releasePersistence!: () => void;
+  const persisting = new Promise<void>((resolve) => { persistenceStarted = resolve; });
+  const persisted = new Promise<void>((resolve) => { releasePersistence = resolve; });
+  const preserving = manager.preserveState({
+    attemptId: "fence",
+    persistInventory: async () => { persistenceStarted(); await persisted; },
+  });
+  const rejected = await manager.startAgent({ name: "worker", agent: "preserve-connector" });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  check("fence rejects lifecycle work after preservation begins", !rejected.ok && /fenced/.test(rejected.error ?? ""), rejected.error);
+  check("preservation waits for accepted in-flight work before stopping", handle.stops === 0, handle.stops);
+  releaseModels();
+  await accepted;
+  await persisting;
+  check("no child stops before the coordinator durably persists inventory", handle.stops === 0, handle.stops);
+  releasePersistence();
+  const result = await preserving;
+  check("preservation completes after in-flight drain", result.ok && result.state === "preserved", result);
+  check("preservation hard-stops the child", handle.stops === 1, handle.stops);
+  check("preservation and its exit watcher never deprovision", deprovisions === 0, deprovisions);
+  const json = JSON.stringify(result.inventory);
+  check("inventory is JSON-persistable", JSON.parse(json).version === "cotal-manager-resume/v2");
+  check("inventory records the exact same principal", result.inventory.agents[0]?.identity.mode === "open" && result.inventory.agents[0].identity.id === "open_principal_1", result.inventory.agents[0]);
+  check("inventory records effective connector/runtime/cwd references", result.inventory.agents[0]?.launch.connector === "preserve-connector" && result.inventory.agents[0]?.launch.runtime === "fake" && result.inventory.agents[0]?.launch.cwd === root, result.inventory.agents[0]?.launch);
+  check("inventory preserves .cotal/run dependencies", result.inventory.agents[0]?.dependencies.includes(join(runDir, "r1.json")) === true && result.inventory.agents[0]?.dependencies.includes(runPersonaPath) === true, result.inventory.agents[0]?.dependencies);
+  check("inventory excludes seed and control token values", !json.includes("TOP-SECRET-SEED") && !json.includes("TOP-SECRET-CONTROL"), json);
+  check("inventory records the chat frontier as the seat's backfill floor", result.inventory.agents[0]?.backfillFloor === 4242, result.inventory.agents[0]?.backfillFloor);
+  // A --config spawn now records the identity name as its persona ref (the path rides configPath),
+  // the shape `parseResumeControlArgs` must accept at resume time.
+  const configSeatInventory = inventoryOf({
+    ...result.inventory.agents[0]!,
+    launch: {
+      ...result.inventory.agents[0]!.launch,
+      source: { kind: "persona", ref: "worker", configPath: join(root, "outside-catalog.md"), configSha256: "a".repeat(64) },
+    },
+  });
+  let configSeatAccepted = false;
+  try {
+    parseResumeControlArgs({ attemptId: "fence", inventory: configSeatInventory });
+    configSeatAccepted = true;
+  } catch { /* recorded below */ }
+  check("accepts a --config seat's inventory: the persona ref is the identity name, the path rides configPath", configSeatAccepted);
+  const pathRefInventory = inventoryOf({
+    ...result.inventory.agents[0]!,
+    launch: {
+      ...result.inventory.agents[0]!.launch,
+      source: { kind: "persona", ref: join(root, "outside-catalog.md"), configPath: join(root, "outside-catalog.md"), configSha256: "a".repeat(64) },
+    },
+  });
+  let pathRefError: string | undefined;
+  try { parseResumeControlArgs({ attemptId: "fence", inventory: pathRefInventory }); } catch (e) { pathRefError = (e as Error).message; }
+  check("a path-shaped persona ref is refused by the resume schema", /must be a safe token/.test(pathRefError ?? ""), pathRefError);
+  check("same preservation attempt is idempotent", (await manager.preparePreservation("fence")).state === "preserved");
+  let refusedDifferent = false;
+  try { await manager.preparePreservation("different"); } catch { refusedDifferent = true; }
+  check("different preservation attempt is refused after fencing", refusedDifferent);
+}
+
+// An abandoned prepare can return to active only before commit starts.
+{
+  const manager = managerWith((name) => fakeHandle(name));
+  (manager as unknown as { lifecycleInFlight: number }).lifecycleInFlight = 1;
+  const preparing = manager.preparePreservation("abandon");
+  let refusedPreparingAbort = false;
+  try { manager.abortPreservation("abandon"); } catch (e) {
+    refusedPreparingAbort = /still preparing or draining/.test((e as Error).message);
+  }
+  check("abort refuses while preparation is draining in-flight lifecycle work", refusedPreparingAbort);
+  (manager as unknown as { releaseLifecycle: () => void }).releaseLifecycle();
+  const prepared = await preparing;
+  check("empty abandoned attempt prepares without stopping", prepared.ok && prepared.state === "prepared");
+  const abandonedGeneration = (manager as unknown as { preservationGeneration: number }).preservationGeneration;
+  manager.abortPreservation("abandon");
+  const next = await manager.preparePreservation("replacement");
+  check("pre-commit abort permits a new preservation attempt", next.ok && next.attemptId === "replacement");
+  let staleRejected = false;
+  try {
+    await (manager as unknown as { runPreparation: (attemptId: string, generation: number) => Promise<unknown> })
+      .runPreparation("abandon", abandonedGeneration);
+  } catch (e) {
+    staleRejected = /abandoned/.test((e as Error).message);
+  }
+  check("an abandoned generation cannot publish inventory into its replacement", staleRejected);
+  manager.abortPreservation("replacement");
+}
+
+// #3241: the plan a caller receives shares nothing with the live seat. An in-process caller that
+// edits the plan and then abandons the attempt leaves the seat's retained launch as it was, so the
+// next cut records the seat as it runs.
+{
+  const manager = managerWith((name) => fakeHandle(name));
+  const map = (manager as unknown as { agents: Map<string, unknown> }).agents;
+  map.set("worker", managed("worker", "open_principal_alias", fakeHandle("worker"), "persona"));
+  const first = await manager.preparePreservation("alias-1");
+  const handed = first.inventory.agents[0]?.launch;
+  check("the abandoned plan carries the seat", first.ok && handed !== undefined, first);
+  if (handed) {
+    for (const list of [handed.subscribe, handed.allowSubscribe, handed.allowPublish ?? [], handed.capabilities ?? []]) (list as string[]).push("ops");
+    (handed.source as { configSha256: string }).configSha256 = "0".repeat(64);
+  }
+  manager.abortPreservation("alias-1");
+  const next = await manager.preparePreservation("alias-2");
+  const recorded = next.inventory.agents[0]?.launch;
+  check("a caller's edit to an abandoned plan does not widen the seat's lists in the next cut",
+    JSON.stringify([recorded?.subscribe, recorded?.allowSubscribe, recorded?.allowPublish, recorded?.capabilities]) === JSON.stringify([["general"], ["general"], [], ["spawn"]]),
+    JSON.stringify(recorded));
+  check("...nor change its launch source, so the next cut still records the seat",
+    next.ok && next.failures.length === 0 && recorded?.source.configSha256 === digest(personaPath), JSON.stringify({ failures: next.failures, source: recorded?.source }));
+  manager.abortPreservation("alias-2");
+}
+
+// An accepted pre-fence destructive stop includes its detached deprovision in the drain. The
+// preserved inventory is taken only after that operation has fully completed.
+{
+  const manager = managerWith((name) => fakeHandle(name));
+  const handle = fakeHandle("precut");
+  const map = (manager as unknown as { agents: Map<string, unknown> }).agents;
+  map.set("precut", managed("precut", "precut_id", handle, "persona"));
+  let releaseDeprovision!: () => void;
+  let deprovisionStarted!: () => void;
+  const started = new Promise<void>((resolve) => { deprovisionStarted = resolve; });
+  const blocked = new Promise<void>((resolve) => { releaseDeprovision = resolve; });
+  (manager as unknown as { deprovision: () => Promise<void> }).deprovision = async () => {
+    deprovisionStarted();
+    await blocked;
+  };
+  const stop = control(manager, "admin", "stop", { name: "precut", graceful: false });
+  const preserving = manager.preserveState({ attemptId: "precut", persistInventory: async () => {} });
+  await started;
+  let settled = false;
+  void preserving.then(() => { settled = true; });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  check("preservation drains detached cleanup from accepted pre-fence work", !settled);
+  releaseDeprovision();
+  await stop;
+  const result = await preserving;
+  check("completed pre-fence stop is absent from resume inventory", result.ok && result.inventory.agents.length === 0, result.inventory.agents);
+}
+
+// Partial failure: every child is attempted, successful children are retained without cleanup, and
+// the manager stays fenced in preserving state so a caller cannot publish a ready cut.
+{
+  const manager = managerWith((name) => fakeHandle(name));
+  const good = fakeHandle("good");
+  const bad = fakeHandle("bad", { throwOnStop: true });
+  const map = (manager as unknown as { agents: Map<string, unknown> }).agents;
+  map.set("good", managed("good", "open_good", good, "persona"));
+  map.set("bad", managed("bad", "open_bad", bad, "persona"));
+  let deprovisions = 0;
+  (manager as unknown as { deprovision: () => Promise<void> }).deprovision = async () => { deprovisions++; };
+  const result = await manager.preserveState({ attemptId: "partial", persistInventory: async () => {} });
+  check("partial stop reports failure and no preserved state", !result.ok && result.state === "preserving", result);
+  check("partial stop attempts every child", good.stops === 1 && bad.stops === 1, `${good.stops}/${bad.stops}`);
+  check("partial stop names the failed child", result.failures.length === 1 && result.failures[0]?.name === "bad", result.failures);
+  check("partial stop retains the full pre-stop inventory", result.inventory.agents.length === 2, result.inventory.agents);
+  check("partial stop performs no deprovision", deprovisions === 0, deprovisions);
+  // Shutdown after the failed cut reports the refused hard stop once and does not wait for that
+  // seat's exit: the stop never reached the child, so the wait could only time out and restate it.
+  let shutdown: string | undefined;
+  try { await manager.stop(); } catch (e) { shutdown = (e as Error).message; }
+  check("shutdown after a partial cut reports a refused stop once, with no exit wait",
+    shutdown === "manager preservation shutdown incomplete: bad: stop failed: simulated stop failure", shutdown);
+}
+
+// A runtime without an authoritative wait contract is never accepted as a completed cut, even if
+// its synchronous status happens to change after stop.
+{
+  const manager = managerWith((name) => fakeHandle(name));
+  const handle = fakeHandle("unverified");
+  delete (handle as { waitForExit?: () => Promise<void> }).waitForExit;
+  (manager as unknown as { agents: Map<string, unknown> }).agents.set(
+    "unverified",
+    managed("unverified", "unverified_id", handle, "persona"),
+  );
+  const result = await manager.preserveState({ attemptId: "unverified", persistInventory: async () => {} });
+  check("runtime without waitForExit fails the cut closed", !result.ok && /cannot prove child exit/.test(result.failures[0]?.error ?? ""), result.failures);
+}
+
+// Recursive reap never frees a descendant until stop+wait proves it exited. If descendants remain
+// running, preservation drains the reap, reports the failed proof, and inventories every live slot.
+{
+  const manager = managerWith((name) => fakeHandle(name));
+  const stuck = (name: string): FakeHandle => {
+    const handle = fakeHandle(name);
+    handle.stop = () => { handle.stops++; };
+    handle.waitForExit = () => new Promise<void>(() => {});
+    return handle;
+  };
+  const child = stuck("reap-child");
+  const grandchild = stuck("reap-grandchild");
+  const map = (manager as unknown as { agents: Map<string, unknown> }).agents;
+  const deadParent = principalKey(DEV_OWNER, "dead_parent").key;
+  const childPrincipal = principalKey(DEV_OWNER, "reap_child").key;
+  map.set("reap-child", { ...managed("reap-child", "reap_child", child, "persona"), spawner: deadParent });
+  map.set("reap-grandchild", { ...managed("reap-grandchild", "reap_grandchild", grandchild, "persona"), spawner: childPrincipal });
+  (manager as unknown as { reapChildrenOf: (id: string) => void }).reapChildrenOf(deadParent);
+  check("recursive reap starts every descendant stop", child.stops === 1 && grandchild.stops === 1, `${child.stops}/${grandchild.stops}`);
+  check("recursive reap retains slots while descendants may still live", map.has("reap-child") && map.has("reap-grandchild"), [...map.keys()]);
+  const plan = await manager.preparePreservation("reap-live");
+  check("preservation fails closed when recursive descendants cannot prove exit", !plan.ok && plan.failures.filter((f) => /accepted stop could not prove exit/.test(f.error)).length === 2, plan.failures);
+  check("still-running recursive descendants remain in preservation inventory", plan.inventory.agents.map((a) => a.name).sort().join(",") === "reap-child,reap-grandchild", plan.inventory.agents);
+}
+
+// Same-principal open resume: a fresh active manager adopts the retained id exactly, without
+// provisioning or name auto-numbering, and resolves manifest launch options from the retained run.
+let openInventory: ManagerResumeAgent;
+{
+  openInventory = {
+    space: "preserve-smoke",
+    name: "worker",
+    role: "worker",
+    identity: { mode: "open", id: "open_principal_resume", lifecycleUid: uidFor("resume") },
+    launch: {
+      connector: "preserve-connector",
+      runtime: "fake",
+      cwd: root,
+      source: { kind: "manifest", runId: "r1", requested: "worker", hash: "abc123", configPath: runPersonaPath, configSha256: digest(runPersonaPath), manifestSha256: digest(join(runDir, "r1.json")) },
+      // Required by ManagerResumeAgent and omitted here, so the resume read `undefined` and treated
+      // this run as event-less. `false` is that same behaviour, stated.
+      events: false,
+      subscribe: ["general"],
+      allowSubscribe: ["general"],
+      allowPublish: [],
+    },
+    dependencies: [join(runDir, "r1.json"), runPersonaPath],
+    spawner: "local.manager",
+    startedAt: new Date().toISOString(),
+    backfillFloor: 4242,
+  };
+  const manager = managerWith((name) => fakeHandle(name));
+  resetCapturedLaunch();
+  const result = await manager.resumePreserved(inventoryOf(openInventory));
+  const reply = result.agents[0]?.reply;
+  check("open resume succeeds under the exact retained name", result.ok && reply?.ok && (reply.data as { name?: string })?.name === "worker", JSON.stringify(result));
+  check("open resume reuses the exact retained principal", capturedLaunch?.id === "open_principal_resume", capturedLaunch?.id);
+  // The recovered incarnation uid MUST reach the child launch (never a fresh mint): its lifecycle-keyed
+  // durables are named by it, and the readiness fence matches presence on it.
+  check("open resume threads the recovered incarnation uid into launch", capturedLaunch?.lifecycleUid === uidFor("resume"), capturedLaunch?.lifecycleUid);
+  check("open resume threads the backfill floor into launch", capturedLaunch?.backfillFloor === 4242, capturedLaunch?.backfillFloor);
+}
+
+// The wire schema refuses a malformed backfillFloor and accepts an absent one (a pre-fx109
+// inventory, or a remote-authority manager that recorded no floor).
+{
+  const negativeArgs = { attemptId: "backfill-floor-negative", inventory: inventoryOf({ ...openInventory, backfillFloor: -1 }) };
+  let negativeRefused = false;
+  try { parseResumeControlArgs(negativeArgs); } catch (e) {
+    negativeRefused = /backfillFloor/.test((e as Error).message);
+  }
+  check("schema refuses a negative backfillFloor", negativeRefused);
+
+  const fractionalArgs = { attemptId: "backfill-floor-fractional", inventory: inventoryOf({ ...openInventory, backfillFloor: 1.5 }) };
+  let fractionalRefused = false;
+  try { parseResumeControlArgs(fractionalArgs); } catch (e) {
+    fractionalRefused = /backfillFloor/.test((e as Error).message);
+  }
+  check("schema refuses a fractional backfillFloor", fractionalRefused);
+
+  const { backfillFloor: _omit, ...noFloor } = openInventory;
+  const absentArgs = { attemptId: "backfill-floor-absent", inventory: inventoryOf(noFloor as ManagerResumeAgent) };
+  let absentAccepted = true;
+  try { parseResumeControlArgs(absentArgs); } catch { absentAccepted = false; }
+  check("schema accepts an inventory with no backfillFloor", absentAccepted);
+}
+
+// A manager replacement after the coordinator fsyncs commit evidence re-adopts the inventory,
+// returns the exact same token, and can finalize without releasing cleanup early.
+{
+  const attemptId = "restart_after_commit";
+  const first = managerWith((name) => fakeHandle(name), { resumeAttemptId: attemptId });
+  await control(first, "admin", "resumePreserved", { attemptId, inventory: inventoryOf(openInventory) });
+  const committed = await control(first, "admin", "commitResume", { attemptId });
+  const durableCommitToken = (committed.data as { durableCommitToken?: string }).durableCommitToken!;
+  await first.stop();
+
+  const replacement = managerWith((name) => fakeHandle(name), { resumeAttemptId: attemptId, resumeDurableCommitToken: durableCommitToken });
+  const resumed = await control(replacement, "admin", "resumePreserved", { attemptId, inventory: inventoryOf(openInventory) });
+  const recommitted = await control(replacement, "admin", "commitResume", { attemptId });
+  const finalized = await control(replacement, "admin", "finalizeResume", { attemptId, durableCommitToken });
+  check("replacement manager re-adopts retained agents", resumed.ok, resumed.error);
+  check("replacement manager returns the fsynced commit token", recommitted.ok && (recommitted.data as { durableCommitToken?: string }).durableCommitToken === durableCommitToken, recommitted);
+  check("replacement manager finalizes the original commit", finalized.ok && (finalized.data as { state?: string }).state === "active", finalized);
+}
+
+// Abrupt manager death can leave an external-runtime child alive. A replacement must not spawn a
+// duplicate process under that exact principal and then mistake the survivor for its own readiness.
+{
+  const attemptId = "restart_with_survivor";
+  let spawns = 0;
+  let spawned = false;
+  let survivorOffline = false;
+  const replacement = managerWith((name) => { spawns++; spawned = true; return fakeHandle(name); }, {
+    resumeAttemptId: attemptId,
+    resumeDurableCommitToken: "1".repeat(64),
+  });
+  const survivorInventory = inventoryOf(openInventory);
+  const ep = (replacement as unknown as { ep: { getRoster: () => unknown[]; waitForPresenceSnapshot: () => Promise<void> } }).ep;
+  let releaseSnapshot!: () => void;
+  ep.waitForPresenceSnapshot = () => new Promise<void>((resolveSnapshot) => { releaseSnapshot = resolveSnapshot; });
+  ep.getRoster = () => [{
+    card: { id: principalKey(DEV_OWNER, openInventory.identity.mode === "open" ? openInventory.identity.id : "").key, name: openInventory.name },
+    lifecycleUid: openInventory.identity.mode === "open" ? openInventory.identity.lifecycleUid : undefined,
+    status: spawned || !survivorOffline ? "idle" : "offline",
+  }];
+  const resumePending = control(replacement, "admin", "resumePreserved", { attemptId, inventory: survivorInventory });
+  await new Promise((resolveTick) => setTimeout(resolveTick, 0));
+  check("replacement waits for the initial presence snapshot before spawn", spawns === 0, spawns);
+  releaseSnapshot();
+  const resumed = await resumePending;
+  check("replacement refuses an already-live retained principal before spawn", !resumed.ok && /already live/.test(resumed.error ?? "") && spawns === 0, resumed.error);
+  ep.waitForPresenceSnapshot = async () => {};
+  survivorOffline = true;
+  const retried = await replacement.resumePreserved(survivorInventory);
+  check("replacement retry ignores an offline survivor ghost", retried.ok && spawns === 1, retried.error);
+}
+
+// A same-principal survivor stays authoritative even when its lifecycle uid differs from the
+// requested inventory. A successor or foreign incarnation cannot be bypassed as a predecessor ghost.
+{
+  let spawns = 0;
+  const manager = managerWith((name) => { spawns++; return fakeHandle(name); });
+  (manager as unknown as { ep: { getRoster: () => unknown[] } }).ep.getRoster = () => [{
+    card: { id: principalKey(DEV_OWNER, openInventory.identity.mode === "open" ? openInventory.identity.id : "").key, name: openInventory.name },
+    lifecycleUid: uidFor("survivor-successor"),
+    status: "idle",
+  }];
+  const wrongUidLive = await manager.resumePreserved(inventoryOf(openInventory));
+  check("resume refuses a live same-principal row even when its lifecycle uid differs", !wrongUidLive.ok && /already live/.test(wrongUidLive.error ?? "") && spawns === 0, wrongUidLive.error);
+}
+
+// Terminal confirmation makes only that exact predecessor lifecycle's lingering roster row stale.
+// A fresh lifecycle may pass it, while an attempt to resume the retired uid itself remains refused.
+{
+  let spawns = 0;
+  const manager = managerWith((name) => { spawns++; return fakeHandle(name); });
+  const principal = principalKey(DEV_OWNER, openInventory.identity.mode === "open" ? openInventory.identity.id : "").key;
+  const predecessorUid = openInventory.identity.lifecycleUid;
+  const retire = (target: Manager): void => {
+    (target as unknown as { retiring: Map<string, unknown> }).retiring.set(openInventory.name, {
+      opId: "retire_worker",
+      owner: DEV_OWNER,
+      actor: openInventory.identity.mode === "open" ? openInventory.identity.id : "",
+      target: { id: openInventory.identity.mode === "open" ? openInventory.identity.id : "", name: openInventory.name, lifecycleUid: predecessorUid },
+      startedAt: Date.now(),
+    });
+    (target as unknown as { confirmRetirement: (a: { id: string; name: string; lifecycleUid: string }) => void })
+      .confirmRetirement({ id: principal, name: openInventory.name, lifecycleUid: predecessorUid });
+  };
+  retire(manager);
+  const freshUid = uidFor("freshsuccessor");
+  const freshInventory: ManagerResumeAgent = {
+    ...openInventory,
+    identity: { ...openInventory.identity, lifecycleUid: freshUid } as ManagerResumeIdentity,
+  };
+  (manager as unknown as { ep: { getRoster: () => unknown[] } }).ep.getRoster = () => [{
+    card: { id: principal, name: openInventory.name },
+    lifecycleUid: spawns === 0 ? predecessorUid : freshUid,
+    status: "idle",
+  }];
+  const fresh = await manager.resumePreserved(inventoryOf(freshInventory));
+  check("resume ignores only a terminal-confirmed exact predecessor row for a fresh lifecycle", fresh.ok && spawns === 1, fresh.error);
+
+  const retired = managerWith((name) => { spawns++; return fakeHandle(name); });
+  retire(retired);
+  (retired as unknown as { ep: { getRoster: () => unknown[] } }).ep.getRoster = () => [{
+    card: { id: principal, name: openInventory.name },
+    lifecycleUid: predecessorUid,
+    status: "idle",
+  }];
+  const sameUid = await retired.resumePreserved(inventoryOf(openInventory));
+  check("resume still refuses a live row for the requested terminal-confirmed lifecycle", !sameUid.ok && /already live/.test(sameUid.error ?? "") && spawns === 1, sameUid.error);
+
+  const unconfirmed = managerWith((name) => { spawns++; return fakeHandle(name); });
+  (unconfirmed as unknown as { ep: { getRoster: () => unknown[] } }).ep.getRoster = () => [{
+    card: { id: principal, name: openInventory.name },
+    lifecycleUid: predecessorUid,
+    status: "idle",
+  }];
+  const unknownOutcome = await unconfirmed.resumePreserved(inventoryOf(freshInventory));
+  check("resume refuses an unconfirmed predecessor row even for a fresh lifecycle", !unknownOutcome.ok && /already live/.test(unknownOutcome.error ?? "") && spawns === 1, unknownOutcome.error);
+
+  const missingUid = managerWith((name) => { spawns++; return fakeHandle(name); });
+  retire(missingUid);
+  (missingUid as unknown as { ep: { getRoster: () => unknown[] } }).ep.getRoster = () => [{
+    card: { id: principal, name: openInventory.name },
+    status: "idle",
+  }];
+  const unknownLifecycle = await missingUid.resumePreserved(inventoryOf(freshInventory));
+  check("resume refuses a live same-principal row with no lifecycle uid", !unknownLifecycle.ok && /already live/.test(unknownLifecycle.error ?? "") && spawns === 1, unknownLifecycle.error);
+
+  const wrongRow = managerWith((name) => { spawns++; return fakeHandle(name); });
+  retire(wrongRow);
+  (wrongRow as unknown as { ep: { getRoster: () => unknown[] } }).ep.getRoster = () => [{
+    card: { id: principal, name: openInventory.name },
+    lifecycleUid: uidFor("foreignliveuid"),
+    status: "idle",
+  }];
+  const foreignLive = await wrongRow.resumePreserved(inventoryOf(freshInventory));
+  check("resume refuses a live lifecycle not named by the terminal predecessor confirmation", !foreignLive.ok && /already live/.test(foreignLive.error ?? "") && spawns === 1, foreignLive.error);
+}
+
+// A failed or unknown retirement owns the alias before retained-principal liveness. Resume must
+// refuse and re-drive that exact lifecycle's teardown rather than launching through the hold.
+{
+  let spawns = 0;
+  const redriven: Array<{ id: string; name: string; lifecycleUid: string }> = [];
+  const manager = managerWith((name) => { spawns++; return fakeHandle(name); });
+  (manager as unknown as { deprovision: (a: { id: string; name: string; lifecycleUid: string }) => Promise<void> }).deprovision = async (a) => { redriven.push(a); };
+  (manager as unknown as { retiring: Map<string, unknown> }).retiring.set("worker", {
+    opId: "retire_worker",
+    owner: DEV_OWNER,
+    actor: openInventory.identity.mode === "open" ? openInventory.identity.id : "",
+    target: { id: openInventory.identity.mode === "open" ? openInventory.identity.id : "", name: openInventory.name, lifecycleUid: openInventory.identity.lifecycleUid },
+    startedAt: Date.now(),
+    lastError: "terminal outcome unknown",
+  });
+  const held = await manager.resumePreserved(inventoryOf(openInventory));
+  check("resume refuses an unresolved retirement hold before launch", !held.ok && /pending retirement/.test(held.error ?? "") && /terminal outcome unknown/.test(held.error ?? "") && spawns === 0, held.error);
+  await new Promise((resolveTick) => setTimeout(resolveTick, 0));
+  const heldId = openInventory.identity.mode === "open" ? openInventory.identity.id : "";
+  check("resume re-drives the exact held lifecycle teardown", redriven.length === 1 && redriven[0]?.id === heldId && redriven[0]?.name === openInventory.name && redriven[0]?.lifecycleUid === openInventory.identity.lifecycleUid, redriven);
+}
+
+// Wire resume is admin-only, attempt-bound, and relaunches the exact retained principal.
+{
+  let spawns = 0;
+  const manager = managerWith((name) => { spawns++; return fakeHandle(name); });
+  const result = await control(manager, "admin", "resumePreserved", {
+    attemptId: "unbound",
+    inventory: inventoryOf(openInventory),
+  });
+  check("wire resume requires a construction-bound startup attempt", !result.ok && /--resume-attempt/.test(result.error ?? "") && spawns === 0, result.error);
+}
+
+{
+  let spawns = 0;
+  const manager = managerWith((name) => { spawns++; return fakeHandle(name); }, { resumeAttemptId: "restore_1" });
+  const args = { attemptId: "restore_1", inventory: inventoryOf(openInventory) };
+  const gated = await manager.startAgent({ name: "worker", agent: "preserve-connector" });
+  check("startup resume gate fences ordinary lifecycle work", !gated.ok && /waiting for resume attempt/.test(gated.error ?? ""), gated.error);
+  // 1d: `resumePreserved` is admin-only via the ep credential boundary (the `manager.admin` ep row
+  // is minted only into operator instruments — manager-split) + serve-time `adminGated`
+  // (manager-service-ops); a merely spawn-capable caller is broker-denied before the handler. There
+  // is no in-handler tier reject to assert here anymore, so this section drives the admin path only.
+  check("no resume launched before the admin call", spawns === 0, spawns);
+  resetCapturedLaunch();
+  const resumed = await control(manager, "admin", "resumePreserved", args);
+  check("admin wire resume succeeds", resumed.ok, resumed.error);
+  check("wire resume uses the exact retained principal", capturedLaunch?.id === "open_principal_resume", capturedLaunch?.id);
+  const data = resumed.data as { attemptId?: string; state?: string; agents?: Array<{ name: string; reply: { ok: boolean } }> };
+  check("wire response is attempt-bound with per-agent results", data.attemptId === "restore_1" && data.state === "awaitingCommit" && data.agents?.length === 1 && data.agents[0]?.reply.ok === true, resumed.data);
+  const repeated = await control(manager, "admin", "resumePreserved", args);
+  check("same attempt and inventory is idempotent", repeated.ok && spawns === 1, `spawns=${spawns}`);
+  const changedInventory = { ...args.inventory, createdAt: new Date(Date.now() + 1_000).toISOString() };
+  const changed = await control(manager, "admin", "resumePreserved", { attemptId: "restore_1", inventory: changedInventory });
+  check("same attempt rejects a different inventory", !changed.ok && /different inventory/.test(changed.error ?? ""), changed.error);
+  const wrongAttempt = await control(manager, "admin", "resumePreserved", { ...args, attemptId: "restore_2" });
+  check("wire resume rejects a different attempt", !wrongAttempt.ok && /expects resume attempt/.test(wrongAttempt.error ?? ""), wrongAttempt.error);
+  const stillGated = await manager.startAgent({ name: "worker", agent: "preserve-connector" });
+  check("ordinary lifecycle remains fenced until durable activation commit", !stillGated.ok && /waiting for resume attempt/.test(stillGated.error ?? ""), stillGated.error);
+  // `commitResume` is admin-only by the same ep credential boundary (see the resumePreserved note).
+  const [committed, committedAgain] = await Promise.all([
+    control(manager, "admin", "commitResume", { attemptId: "restore_1" }),
+    control(manager, "admin", "commitResume", { attemptId: "restore_1" }),
+  ]);
+  const commitData = committed.data as { state?: string; durableCommitToken?: string };
+  check("admin commit returns durable evidence without releasing the gate", committed.ok && commitData.state === "awaitingFinalize" && /^[a-f0-9]{64}$/.test(commitData.durableCommitToken ?? ""), committed);
+  check("concurrent resume commit retries are idempotent with one durable token", committedAgain.ok && (committedAgain.data as { durableCommitToken?: string }).durableCommitToken === commitData.durableCommitToken, committedAgain);
+  const stillCommitted = await control(manager, "admin", "models", { agent: "preserve-connector" });
+  check("ordinary lifecycle remains fenced after commit", !stillCommitted.ok && /waiting for resume attempt/.test(stillCommitted.error ?? ""), stillCommitted.error);
+  // `finalizeResume` is admin-only by the same ep credential boundary (see the resumePreserved note).
+  const wrongToken = await control(manager, "admin", "finalizeResume", { attemptId: "restore_1", durableCommitToken: "0".repeat(64) });
+  check("resume finalize is bound to commit evidence", !wrongToken.ok && /does not match/.test(wrongToken.error ?? ""), wrongToken.error);
+  const finalized = await control(manager, "admin", "finalizeResume", { attemptId: "restore_1", durableCommitToken: commitData.durableCommitToken });
+  check("token-bound finalize releases the startup resume gate", finalized.ok && (finalized.data as { state?: string }).state === "active", finalized);
+  const finalizedAgain = await control(manager, "admin", "finalizeResume", { attemptId: "restore_1", durableCommitToken: commitData.durableCommitToken });
+  check("resume finalize is idempotent", finalizedAgain.ok, finalizedAgain.error);
+  const released = await control(manager, "admin", "models", { agent: "preserve-connector" });
+  check("ordinary lifecycle is active only after finalize", !/waiting for resume attempt/.test(released.error ?? ""), released.error);
+}
+
+// The shipped `--config <path>` start path (spawn.ts's `config: managerConfigRef`) must record the
+// persona's identity name as `launch.source.ref`, not the path, so the preservation cut it produces
+// round-trips through the resume schema (`label`, a safe token).
+{
+  const outsideCatalogPath = join(root, "outside-catalog.md");
+  writeFileSync(outsideCatalogPath, "---\nname: outside-worker\n---\nan outside-catalog persona\n");
+  const manager = managerWith((name) => fakeHandle(name));
+  const started = await manager.startAgent({ name: outsideCatalogPath, agent: "preserve-connector", config: outsideCatalogPath, events: false });
+  check("a --config start succeeds", started.ok, started.error);
+  const recorded = (manager as unknown as { agents: Map<string, { launch: { source: { kind: string; ref: string; configPath: string } } }> }).agents.get("outside-worker");
+  check("a --config start records the identity name as its persona ref", recorded?.launch.source.kind === "persona" && recorded.launch.source.ref === "outside-worker" && recorded.launch.source.configPath === outsideCatalogPath, recorded?.launch.source);
+}
+
+// A signal or singleton-lease loss after commit but before finalize remains non-destructive.
+{
+  const handle = fakeHandle("worker");
+  const manager = managerWith(() => handle, { resumeAttemptId: "signal_gap" });
+  let deprovisions = 0;
+  (manager as unknown as { deprovision: () => Promise<void> }).deprovision = async () => { deprovisions++; };
+  await control(manager, "admin", "resumePreserved", { attemptId: "signal_gap", inventory: inventoryOf(openInventory) });
+  const committed = await control(manager, "admin", "commitResume", { attemptId: "signal_gap" });
+  await manager.stop();
+  check("SIGTERM-equivalent stop after commit-before-finalize stops the child", committed.ok && handle.stops === 1, handle.stops);
+  check("SIGTERM-equivalent stop after commit-before-finalize preserves retained footprint", deprovisions === 0, deprovisions);
+}
+
+{
+  const handle = fakeHandle("worker");
+  const manager = managerWith(() => handle, { resumeAttemptId: "lease_gap" });
+  let deprovisions = 0;
+  (manager as unknown as { deprovision: () => Promise<void> }).deprovision = async () => { deprovisions++; };
+  await control(manager, "admin", "resumePreserved", { attemptId: "lease_gap", inventory: inventoryOf(openInventory) });
+  const committed = await control(manager, "admin", "commitResume", { attemptId: "lease_gap" });
+  const ep = (manager as unknown as { ep: Record<string, unknown> }).ep;
+  ep.renewManagerLease = async () => { throw new Error("simulated lease loss"); };
+  ep.readOwnManagerLease = async () => { throw new Error("simulated broker silence"); };
+  (manager as unknown as { leaseInfo: unknown; leaseRevision: number }).leaseInfo = {
+    holder: "local.manager", runtime: "fake", root, pid: process.pid,
+  };
+  (manager as unknown as { leaseRevision: number }).leaseRevision = 1;
+  const originalExit = process.exit;
+  let exitCode: number | undefined;
+  (process as unknown as { exit: (code?: number) => never }).exit = ((code?: number) => {
+    exitCode = code;
+    return undefined as never;
+  });
+  try {
+    await (manager as unknown as { renewLease: () => Promise<void> }).renewLease();
+  } finally {
+    (process as unknown as { exit: typeof process.exit }).exit = originalExit;
+  }
+  check("lease loss after commit-before-finalize ends nothing: no exit, and the child keeps running", committed.ok && exitCode === undefined && handle.stops === 0, `${exitCode}/${handle.stops}`);
+  check("lease loss after commit-before-finalize preserves retained footprint", deprovisions === 0, deprovisions);
+}
+
+{
+  const handle = silentExitHandle("worker");
+  const manager = managerWith(() => handle, { resumeAttemptId: "exit_before_finalize" });
+  await control(manager, "admin", "resumePreserved", { attemptId: "exit_before_finalize", inventory: inventoryOf(openInventory) });
+  const committed = await control(manager, "admin", "commitResume", { attemptId: "exit_before_finalize" });
+  handle.exitSilently();
+  const finalized = await control(manager, "admin", "finalizeResume", {
+    attemptId: "exit_before_finalize",
+    durableCommitToken: (committed.data as { durableCommitToken?: string }).durableCommitToken,
+  });
+  check("finalize refuses to release suppression if a committed handle stopped", !finalized.ok && /not live at finalize/.test(finalized.error ?? ""), finalized.error);
+  const stillFenced = await control(manager, "admin", "models", { agent: "preserve-connector" });
+  check("failed finalize keeps ordinary lifecycle fenced", !stillFenced.ok && /waiting for resume attempt/.test(stillFenced.error ?? ""), stillFenced.error);
+}
+
+// The strict wire parser rejects secret-bearing unknown fields and oversized payloads before launch.
+{
+  let spawns = 0;
+  const secretManager = managerWith((name) => { spawns++; return fakeHandle(name); });
+  const secretInventory = JSON.parse(JSON.stringify(inventoryOf(openInventory))) as Record<string, unknown> & { agents: Array<Record<string, unknown>> };
+  secretInventory.agents[0].seed = "must-not-cross-wire";
+  const secret = await control(secretManager, "admin", "resumePreserved", { attemptId: "secret", inventory: secretInventory });
+  check("wire inventory rejects secret/unknown fields", !secret.ok && /Unrecognized key/.test(secret.error ?? ""), secret.error);
+  check("secret-bearing inventory launches nothing", spawns === 0, spawns);
+
+  const largeManager = managerWith((name) => { spawns++; return fakeHandle(name); });
+  const largeInventory = JSON.parse(JSON.stringify(inventoryOf(openInventory))) as { agents: Array<{ launch: { model?: string } }> };
+  largeInventory.agents[0].launch.model = "x".repeat(MAX_RESUME_CONTROL_BYTES);
+  const large = await control(largeManager, "admin", "resumePreserved", { attemptId: "large", inventory: largeInventory });
+  check("wire inventory enforces the payload byte bound", !large.ok && /exceed/.test(large.error ?? ""), large.error);
+  check("oversized inventory launches nothing", spawns === 0, spawns);
+}
+
+// The whole inventory is preflighted before the first child launch.
+{
+  let spawns = 0;
+  const manager = managerWith((name) => { spawns++; return fakeHandle(name); }, { resumeAttemptId: "all_preflight" });
+  const missing = join(root, ".cotal", "run", "missing.md");
+  const invalid: ManagerResumeAgent = {
+    ...openInventory,
+    name: "invalid-second",
+    identity: { mode: "open", id: "invalid_second", lifecycleUid: uidFor("invalidsecond") },
+    launch: {
+      ...openInventory.launch,
+      source: { kind: "persona", ref: "missing", configPath: missing, configSha256: "0".repeat(64) },
+    },
+    dependencies: [missing],
+  };
+  const result = await control(manager, "admin", "resumePreserved", {
+    attemptId: "all_preflight",
+    inventory: inventoryOf(openInventory, invalid),
+  });
+  const data = result.data as { agents?: Array<{ name: string; reply: { ok: boolean; error?: string } }> } | undefined;
+  check("invalid later inventory entry prevents every launch", !result.ok && spawns === 0, `${result.error} / spawns=${spawns}`);
+  check("preflight failure returns one result per agent", data?.agents?.length === 2 && data.agents[0]?.reply.ok === true && data.agents[1]?.reply.ok === false, result.data);
+}
+
+// A launch-phase partial failure reports every agent and keeps already activated identities retained.
+{
+  let spawns = 0;
+  const manager = managerWith((name) => {
+    spawns++;
+    if (spawns === 2) throw new Error("simulated resume launch failure");
+    return fakeHandle(name);
+  }, { resumeAttemptId: "partial_resume" });
+  let deprovisions = 0;
+  (manager as unknown as { deprovision: () => Promise<void> }).deprovision = async () => { deprovisions++; };
+  const second: ManagerResumeAgent = {
+    ...openInventory,
+    name: "worker-two",
+    identity: { mode: "open", id: "open_principal_two", lifecycleUid: uidFor("workertwo") },
+  };
+  const result = await control(manager, "admin", "resumePreserved", {
+    attemptId: "partial_resume",
+    inventory: inventoryOf(openInventory, second),
+  });
+  const data = result.data as { state?: string; agents?: Array<{ name: string; reply: { ok: boolean; error?: string } }> } | undefined;
+  check("launch failure returns one result per inventory agent", !result.ok && data?.state === "degraded" && data.agents?.length === 2 && data.agents[0]?.reply.ok === true && data.agents[1]?.reply.ok === false, result.data);
+  const commit = await control(manager, "admin", "commitResume", { attemptId: "partial_resume" });
+  check("failed activation cannot be committed", !commit.ok && /no successful activation/.test(commit.error ?? ""), commit.error);
+  await manager.stop();
+  check("partial resume shutdown does not deprovision retained principals", deprovisions === 0, deprovisions);
+}
+
+// A degraded uncertain attempt remains retained even if exact presence arrives later.
+{
+  const handle = fakeHandle("worker");
+  const manager = managerWith(() => handle, { resumeAttemptId: "late_presence" });
+  (manager as unknown as { readinessTimeoutMs: number }).readinessTimeoutMs = 5;
+  let roster: Array<{ card: { id: string; name: string }; status: string }> = [];
+  const presenceListeners = new Set<() => void>();
+  (manager as unknown as { ep: unknown }).ep = {
+    ref: () => ({ id: "local.manager", name: "manager", role: "manager" }),
+    getRoster: () => roster,
+    waitForPresenceSnapshot: async () => {},
+    on: (event: string, fn: () => void) => { if (event === "presence") presenceListeners.add(fn); },
+    off: (_event: string, fn: () => void) => { presenceListeners.delete(fn); },
+    releaseManagerLease: async () => {},
+    releaseDaemonRenewalLease: async () => {},
+    stop: async () => {},
+  };
+  let deprovisions = 0;
+  (manager as unknown as { deprovision: () => Promise<void> }).deprovision = async () => { deprovisions++; };
+  const result = await control(manager, "admin", "resumePreserved", {
+    attemptId: "late_presence",
+    inventory: inventoryOf(openInventory),
+  });
+  check("uncertain attempt is degraded and non-committable", !result.ok && /uncertain/.test(JSON.stringify(result.data)), result.data);
+  roster = [{ card: { id: principalKey(DEV_OWNER, "open_principal_resume").key, name: "worker" }, status: "idle" }];
+  for (const listener of [...presenceListeners]) listener();
+  handle.stop({ graceful: false });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  check("late adoption cannot release cleanup before commit", deprovisions === 0, deprovisions);
+}
+
+// Late adoption is incarnation-exact: a wrong/absent-uid presence under the reused alias must NOT
+// adopt an uncertain resume (that would undo the incarnation-exact readiness fence after a timeout);
+// only the exact recovered uid does. No resumeAttemptId => resumeRequired false => adoption may release.
+{
+  const handle = fakeHandle("worker");
+  const manager = managerWith(() => handle);
+  (manager as unknown as { readinessTimeoutMs: number }).readinessTimeoutMs = 5;
+  let roster: Array<{ card: { id: string; name: string }; lifecycleUid?: string; status: string }> = [];
+  const presenceListeners = new Set<() => void>();
+  (manager as unknown as { ep: unknown }).ep = {
+    ref: () => ({ id: "local.manager", name: "manager", role: "manager" }),
+    getRoster: () => roster,
+    waitForPresenceSnapshot: async () => {},
+    on: (event: string, fn: () => void) => { if (event === "presence") presenceListeners.add(fn); },
+    off: (_event: string, fn: () => void) => { presenceListeners.delete(fn); },
+    releaseManagerLease: async () => {},
+    releaseDaemonRenewalLease: async () => {},
+    stop: async () => {},
+  };
+  const uncertain = await manager.resumePreserved(inventoryOf(openInventory));
+  const managed = (manager as unknown as { agents: Map<string, { suppressCleanup?: boolean }> }).agents.get("worker");
+  check("adoption setup: an uncertain resume is retained with cleanup suppressed", !uncertain.ok && managed?.suppressCleanup === true, { ok: uncertain.ok, suppress: managed?.suppressCleanup });
+  const alias = principalKey(DEV_OWNER, "open_principal_resume").key;
+  roster = [{ card: { id: alias, name: "worker" }, lifecycleUid: uidFor("ghostuid"), status: "idle" }];
+  for (const listener of [...presenceListeners]) listener();
+  check("late adoption ignores a wrong-incarnation presence under the reused alias", managed?.suppressCleanup === true, managed?.suppressCleanup);
+  roster = [{ card: { id: alias, name: "worker" }, status: "idle" }]; // absent uid is also not the incarnation
+  for (const listener of [...presenceListeners]) listener();
+  check("late adoption ignores an absent-incarnation presence", managed?.suppressCleanup === true, managed?.suppressCleanup);
+  roster = [{ card: { id: alias, name: "worker" }, lifecycleUid: uidFor("resume"), status: "idle" }];
+  for (const listener of [...presenceListeners]) listener();
+  check("late adoption accepts the exact recovered incarnation", managed?.suppressCleanup === false, managed?.suppressCleanup);
+}
+
+// Commit proves runtime and exact-principal liveness, not merely retained map membership.
+{
+  const handle = silentExitHandle("worker");
+  const manager = managerWith(() => handle, { resumeAttemptId: "exit_before_commit" });
+  const resumed = await control(manager, "admin", "resumePreserved", {
+    attemptId: "exit_before_commit",
+    inventory: inventoryOf(openInventory),
+  });
+  check("external-style resume activates before silent exit", resumed.ok, resumed.error);
+  handle.exitSilently();
+  const commit = await control(manager, "admin", "commitResume", { attemptId: "exit_before_commit" });
+  check("commit rejects an exited handle still present in manager map", !commit.ok && /runtime is not running/.test(commit.error ?? ""), commit.error);
+}
+
+// Commit proves the EXACT incarnation the readiness fence proved, not just the principal: a
+// wrong-uid presence under the reused alias (a ghost after the true incarnation drops) cannot
+// satisfy the late commit gate.
+{
+  const handle = fakeHandle("worker");
+  const manager = managerWith(() => handle, { resumeAttemptId: "commit_wrong_uid" });
+  const resumed = await control(manager, "admin", "resumePreserved", { attemptId: "commit_wrong_uid", inventory: inventoryOf(openInventory) });
+  check("commit-uid setup: resume activated on the exact incarnation", resumed.ok, resumed.error);
+  // Swap the roster to a ghost: same alias, DIFFERENT incarnation (the true uid presence is gone).
+  (manager as unknown as { ep: { getRoster: () => unknown[] } }).ep.getRoster = () => [{
+    card: { id: principalKey(DEV_OWNER, "open_principal_resume").key, name: "worker" },
+    lifecycleUid: uidFor("ghostuid"),
+    status: "idle",
+  }];
+  const commit = await control(manager, "admin", "commitResume", { attemptId: "commit_wrong_uid" });
+  check("commit refuses a wrong-incarnation presence under the reused alias", !commit.ok && /is not exactly present/.test(commit.error ?? ""), commit.error);
+}
+
+// Static resume validates the credential's embedded nkey against inventory and never mints another.
+{
+  const auth = await createSpaceAuth("preserve-smoke");
+  const identity = newIdentity();
+  // The manager's own space segment (P1), not the bare creds dir: the resume path resolves through
+  // the migrating choke point, so material staged flat would MOVE under the manager's feet and the
+  // recorded path this entry carries would stop resolving mid-scenario.
+  const credsDir = agentCredsDir(root, "preserve-smoke");
+  mkdirSync(credsDir, { recursive: true });
+  const credsPath = join(credsDir, "static-worker.creds");
+  const retainedCreds = await mintCreds(auth, identity, "agent", { lifecycleUid: uidFor(identity.id) });
+  writeFileSync(credsPath, retainedCreds, { mode: 0o600 });
+  const manager = managerWith((name) => fakeHandle(name));
+  (manager as unknown as { auth: unknown }).auth = auth;
+  const entry: ManagerResumeAgent = {
+    ...openInventory,
+    name: "static-worker",
+    identity: { mode: "static", id: identity.id, lifecycleUid: uidFor(identity.id), credential: { kind: "file", path: credsPath, sha256: digest(credsPath) } },
+    launch: { ...openInventory.launch, source: { kind: "persona", ref: "worker", configPath: personaPath, configSha256: digest(personaPath) } },
+    dependencies: [personaPath],
+  };
+  resetCapturedLaunch();
+  const ok = await manager.resumePreserved(inventoryOf(entry));
+  check("static resume accepts matching retained credential", ok.ok && capturedLaunch?.id === identity.id && capturedLaunch?.creds === credsPath, ok);
+  check("static resume threads the recovered incarnation uid into launch", capturedLaunch?.lifecycleUid === uidFor(identity.id), capturedLaunch?.lifecycleUid);
+
+  const mismatchManager = managerWith((name) => fakeHandle(name));
+  (mismatchManager as unknown as { auth: unknown }).auth = auth;
+  const mismatch = await mismatchManager.resumePreserved(inventoryOf({ ...entry, identity: { mode: "static", id: newIdentity().id, lifecycleUid: uidFor("mismatch"), credential: { kind: "file", path: credsPath, sha256: digest(credsPath) } } }));
+  check("static resume fails closed on credential/principal mismatch", !mismatch.ok && /does not match inventory principal/.test(mismatch.agents[0]?.reply.error ?? ""), mismatch.agents);
+
+  const replacementCreds = await mintCreds(auth, newIdentity(), "agent", { lifecycleUid: uidFor("replacement") });
+  writeFileSync(credsPath, retainedCreds, { mode: 0o600 });
+  const spawnDriftEntry: ManagerResumeAgent = {
+    ...entry,
+    identity: { mode: "static", id: identity.id, lifecycleUid: uidFor(identity.id), credential: { kind: "file", path: credsPath, sha256: digest(credsPath) } },
+  };
+  let driftSpawns = 0;
+  let probeCalls = 0;
+  const spawnDriftManager = managerWith((name) => { driftSpawns++; return fakeHandle(name); });
+  (spawnDriftManager as unknown as { auth: unknown }).auth = auth;
+  (spawnDriftManager as unknown as { probeStaticCredential: (creds: string) => Promise<{ ok: true }> }).probeStaticCredential = async () => {
+    probeCalls++;
+    if (probeCalls === 1) writeFileSync(credsPath, replacementCreds, { mode: 0o600 });
+    return { ok: true };
+  };
+  const spawnDrift = await spawnDriftManager.resumePreserved(inventoryOf(spawnDriftEntry));
+  check("static credential drift after batch preflight is caught before spawn", !spawnDrift.ok && driftSpawns === 0 && /changed after the cut/.test(spawnDrift.error ?? ""), spawnDrift);
+
+  writeFileSync(credsPath, retainedCreds, { mode: 0o600 });
+  const commitEntry: ManagerResumeAgent = {
+    ...entry,
+    identity: { mode: "static", id: identity.id, lifecycleUid: uidFor(identity.id), credential: { kind: "file", path: credsPath, sha256: digest(credsPath) } },
+  };
+  const secondIdentity = newIdentity();
+  const secondCredsPath = join(credsDir, "static-worker-two.creds");
+  const secondCreds = await mintCreds(auth, secondIdentity, "agent", { lifecycleUid: uidFor(secondIdentity.id) });
+  writeFileSync(secondCredsPath, secondCreds, { mode: 0o600 });
+  const secondCommitEntry: ManagerResumeAgent = {
+    ...commitEntry,
+    name: "static-worker-two",
+    identity: { mode: "static", id: secondIdentity.id, lifecycleUid: uidFor(secondIdentity.id), credential: { kind: "file", path: secondCredsPath, sha256: digest(secondCredsPath) } },
+  };
+  const commitDriftManager = managerWith((name) => fakeHandle(name), {
+    resumeAttemptId: "static_commit_drift",
+    resumeDurableCommitToken: "2".repeat(64),
+  });
+  (commitDriftManager as unknown as { auth: unknown }).auth = auth;
+  await control(commitDriftManager, "admin", "resumePreserved", { attemptId: "static_commit_drift", inventory: inventoryOf(commitEntry, secondCommitEntry) });
+  writeFileSync(secondCredsPath, replacementCreds, { mode: 0o600 });
+  const commitDrift = await control(commitDriftManager, "admin", "commitResume", { attemptId: "static_commit_drift" });
+  check("replacement recommit revalidates every static entry and refuses later-entry drift", !commitDrift.ok && /static-worker-two/.test(commitDrift.error ?? ""), commitDrift.error);
+  const cannotFinalize = await control(commitDriftManager, "admin", "finalizeResume", { attemptId: "static_commit_drift", durableCommitToken: "0".repeat(64) });
+  check("a failed static authority commit cannot be finalized", !cannotFinalize.ok && /no successful commit/.test(cannotFinalize.error ?? ""), cannotFinalize.error);
+}
+
+// User mode delegates to the provider's read-only retained validator and never grants a replacement.
+{
+  const manager = managerWith((name) => fakeHandle(name));
+  (manager as unknown as { userMode: boolean }).userMode = true;
+  const credsDir = agentCredsDir(root, "preserve-smoke");
+  mkdirSync(credsDir, { recursive: true });
+  const actorTokenPath = join(credsDir, "worker.actor-token");
+  const sentinelPath = join(credsDir, "worker.sentinel.creds");
+  const healthPath = join(credsDir, "worker.auth-health.json");
+  writeFileSync(actorTokenPath, "retained-token", { mode: 0o600 });
+  writeFileSync(sentinelPath, "retained-sentinel", { mode: 0o600 });
+  // Annotated with the user arm pinned: `ManagerResumeAgent` widens `identity` to the whole union,
+  // and the cells below read owner/actor and rebuild the identity, which only one arm carries.
+  const entry: ManagerResumeAgent & { identity: Extract<ManagerResumeIdentity, { mode: "user" }> } = {
+    ...openInventory,
+    identity: {
+      mode: "user",
+      owner: "u_aaaaaaaaaaaaaaaaaaaaaaaaaa",
+      actor: "worker",
+      lifecycleUid: uidFor("userworker"),
+      actorToken: { kind: "file", path: actorTokenPath, sha256: digest(actorTokenPath) },
+      sentinelCredential: { kind: "file", path: sentinelPath, sha256: digest(sentinelPath) },
+      health: { kind: "file", path: healthPath },
+    },
+  };
+  retainedValidationCalls = 0;
+  retainedGrantCalls = 0;
+  resetCapturedLaunch();
+  const result = await manager.resumePreserved(inventoryOf(entry));
+  check("user resume validates retained authority at preflight and immediately before spawn", result.ok && retainedValidationCalls === 2, `${result.error} / calls=${retainedValidationCalls}`);
+  check("provider receives retained token and sentinel contents", lastRetainedInput?.actorToken === "retained-token" && lastRetainedInput?.sentinelCreds === "retained-sentinel", lastRetainedInput);
+  check("user resume never calls grantAgent", retainedGrantCalls === 0, retainedGrantCalls);
+  check("user resume reuses exact owner/actor in launch", capturedLaunch?.userAuth?.owner === entry.identity.owner && capturedLaunch?.userAuth?.actor === entry.identity.actor, capturedLaunch?.userAuth);
+  check("user resume threads the recovered incarnation uid into launch", capturedLaunch?.lifecycleUid === uidFor("userworker"), capturedLaunch?.lifecycleUid);
+  check("user bearer command is reconstructed from provider command", capturedLaunch?.userAuth?.bearerCmd.includes("agent-bearer") === true, capturedLaunch?.userAuth?.bearerCmd);
+
+  // A retained inventory must pin the WHOLE secret family as ONE unit — {actorToken, sentinel,
+  // health} all the lifecycle triple OR all the legacy triple. Two negatives, both must refuse
+  // BEFORE any spawn (a rejected resume records nothing, so teardown never deletes a foreign file):
+  //
+  // (1) FOREIGN HEALTH PATH — the delete gadget: health is not a hashed retained reference, so a
+  //     corrupt inventory could once point it at an arbitrary workspace file that flowed into the
+  //     bearer argv and was rmSync'd at terminal teardown. The atomic pin refuses it.
+  {
+    const victim = join(root, "operator-owned-secret.txt");
+    writeFileSync(victim, "DO NOT DELETE ME", { mode: 0o600 });
+    const foreignHealth: ManagerResumeAgent = { ...entry, identity: { ...entry.identity, health: { kind: "file", path: victim } } };
+    let foreignHealthSpawns = 0;
+    const m = managerWith((name) => { foreignHealthSpawns++; return fakeHandle(name); });
+    (m as unknown as { userMode: boolean }).userMode = true;
+    const r = await m.resumePreserved(inventoryOf(foreignHealth));
+    check("user resume refuses a FOREIGN health path (delete gadget) before any spawn", !r.ok && foreignHealthSpawns === 0 && /one manager-owned secret family|foreign health/.test(JSON.stringify(r)), JSON.stringify(r));
+    check("the foreign (operator-owned) file SURVIVES the refused resume", existsSync(victim));
+  }
+  //
+  // (2) MIXED FAMILY — a lifecycle-keyed actor token paired with a legacy sentinel/health. Both
+  //     files exist and each is individually manager-owned, but they are not ONE family; the pin
+  //     refuses the mix (the old per-file OR-pin accepted it).
+  {
+    const lifecycleActor = agentLifecycleSecretFilePaths(root, "preserve-smoke", "worker", uidFor("userworker")).actorToken;
+    writeFileSync(lifecycleActor, "retained-token", { mode: 0o600 });
+    const mixed: ManagerResumeAgent = { ...entry, identity: { ...entry.identity, actorToken: { kind: "file", path: lifecycleActor, sha256: digest(lifecycleActor) } } };
+    let mixedSpawns = 0;
+    const m = managerWith((name) => { mixedSpawns++; return fakeHandle(name); });
+    (m as unknown as { userMode: boolean }).userMode = true;
+    const r = await m.resumePreserved(inventoryOf(mixed));
+    check("user resume refuses a MIXED secret family (lifecycle token + legacy sentinel/health)", !r.ok && mixedSpawns === 0 && /one manager-owned secret family/.test(JSON.stringify(r)), JSON.stringify(r));
+  }
+
+  // A retained authority row whose incarnation uid differs from the inventory is refused BEFORE any
+  // spawn (the pre-effect uid binding), not left to broker-fail after the child is already running.
+  retainedAuthority = { ...retainedAuthority, lifecycleUid: uidFor("wronguid") };
+  let uidDriftSpawns = 0;
+  const uidMismatchManager = managerWith((name) => { uidDriftSpawns++; return fakeHandle(name); });
+  (uidMismatchManager as unknown as { userMode: boolean }).userMode = true;
+  const uidMismatch = await uidMismatchManager.resumePreserved(inventoryOf(entry));
+  check("user resume refuses a retained authority whose incarnation uid differs from the inventory, before any spawn",
+    !uidMismatch.ok && uidDriftSpawns === 0 && /not the inventory's/.test(JSON.stringify(uidMismatch)), JSON.stringify(uidMismatch));
+  retainedAuthority = { ...retainedAuthority, lifecycleUid: uidFor("userworker") };
+
+  retainedAuthority = { ...retainedAuthority, allowSubscribe: ["other"] };
+  const mismatchManager = managerWith((name) => fakeHandle(name));
+  (mismatchManager as unknown as { userMode: boolean }).userMode = true;
+  const mismatch = await mismatchManager.resumePreserved(inventoryOf(entry));
+  check("user authority drift fails before launch", !mismatch.ok && /failed preflight/.test(mismatch.error ?? ""), mismatch);
+  retainedAuthority = { ...retainedAuthority, allowSubscribe: ["general"] };
+
+  let userDriftSpawns = 0;
+  const userSpawnDriftManager = managerWith((name) => { userDriftSpawns++; return fakeHandle(name); });
+  (userSpawnDriftManager as unknown as { userMode: boolean }).userMode = true;
+  afterRetainedValidation = () => {
+    afterRetainedValidation = undefined;
+    retainedAuthority = { ...retainedAuthority, allowSubscribe: ["other"] };
+  };
+  const userSpawnDrift = await userSpawnDriftManager.resumePreserved(inventoryOf(entry));
+  check("user ledger/token authority drift after batch preflight is caught before spawn", !userSpawnDrift.ok && userDriftSpawns === 0 && /no longer matches/.test(userSpawnDrift.error ?? ""), userSpawnDrift);
+  retainedAuthority = { ...retainedAuthority, allowSubscribe: ["general"] };
+
+  const userCommitDriftManager = managerWith((name) => fakeHandle(name), {
+    resumeAttemptId: "user_commit_drift",
+    resumeDurableCommitToken: "3".repeat(64),
+  });
+  (userCommitDriftManager as unknown as { userMode: boolean }).userMode = true;
+  const resumed = await control(userCommitDriftManager, "admin", "resumePreserved", {
+    attemptId: "user_commit_drift",
+    inventory: inventoryOf(entry),
+  });
+  retainedAuthority = { ...retainedAuthority, allowSubscribe: ["other"] };
+  const commitDrift = await control(userCommitDriftManager, "admin", "commitResume", { attemptId: "user_commit_drift" });
+  check("replacement recommit revalidates every user authority row and refuses drift", resumed.ok && !commitDrift.ok && /retained authority changed/.test(commitDrift.error ?? ""), commitDrift.error);
+  const cannotFinalize = await control(userCommitDriftManager, "admin", "finalizeResume", { attemptId: "user_commit_drift", durableCommitToken: "0".repeat(64) });
+  check("a failed user authority commit cannot be finalized", !cannotFinalize.ok && /no successful commit/.test(cannotFinalize.error ?? ""), cannotFinalize.error);
+  retainedAuthority = { ...retainedAuthority, allowSubscribe: ["general"] };
+}
+
+// #964: active-mode stop spares by default; explicit withAgents retains the old teardown.
+{
+  const manager = managerWith((name) => fakeHandle(name));
+  const handle = fakeHandle("spared");
+  const map = (manager as unknown as { agents: Map<string, unknown> }).agents;
+  map.set("spared", managed("spared", "spared_id", handle, "persona"));
+  let deprovisions = 0;
+  (manager as unknown as { deprovision: () => Promise<void> }).deprovision = async () => { deprovisions++; };
+  await manager.stop();
+  check("normal stop leaves managed agents running", handle.stops === 0, handle.stops);
+  check("normal stop releases detachable local custody", handle.releases === 1, handle.releases);
+  check("normal stop preserves managed-agent footprint", deprovisions === 0, deprovisions);
+  check("normal stop drops the old manager's table", map.size === 0, map.size);
+}
+
+{
+  const manager = managerWith((name) => fakeHandle(name));
+  const handle = fakeHandle("reaped");
+  const map = (manager as unknown as { agents: Map<string, unknown> }).agents;
+  map.set("reaped", managed("reaped", "reaped_id", handle, "persona"));
+  let deprovisions = 0;
+  (manager as unknown as { deprovision: () => Promise<void> }).deprovision = async () => { deprovisions++; };
+  await manager.stop({ withAgents: true });
+  check("stop withAgents hard-stops managed agents", handle.stops === 1, handle.stops);
+  check("stop withAgents deprovisions managed agents", deprovisions === 1, deprovisions);
+  check("stop withAgents does not use the release-only path", handle.releases === 0, handle.releases);
+}
+
+// Regression: an accepted control stop frees the slot AT ONCE — `stop` replying ✓ has to mean `ps`
+// no longer lists the agent, even while the child is still dying. The exit proof holds the
+// lifecycle drain instead, so a cut still cannot fence ahead of that child.
+{
+  const manager = managerWith((name) => fakeHandle(name));
+  const handle = lingeringHandle("dying");
+  const map = (manager as unknown as { agents: Map<string, unknown> }).agents;
+  map.set("dying", managed("dying", "dying_id", handle, "persona"));
+  (manager as unknown as { deprovision: () => Promise<void> }).deprovision = async () => {};
+  const stopped = await control(manager, "admin", "stop", { name: "dying" });
+  check("an accepted stop replies without waiting for the child to die", stopped.ok === true, stopped.error);
+  const listed = await control(manager, "admin", "ps", {});
+  check(
+    "an accepted stop frees the slot before ps reads it",
+    (listed.data as { name: string }[]).every((a) => a.name !== "dying"),
+    listed.data,
+  );
+  let prepared = false;
+  const preparation = manager.preparePreservation("accepted_stop").then((plan) => { prepared = true; return plan; });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  check("a cut still drains the dying child's exit proof before it inventories", !prepared);
+  handle.finishExit();
+  const plan = await preparation;
+  check(
+    "the drained cut omits the stopped child",
+    plan.inventory.agents.every((a) => a.name !== "dying"),
+    plan.inventory.agents.map((a) => a.name),
+  );
+}
+
+{
+  let waitCalls = 0;
+  const handle: AgentHandle = {
+    name: "late",
+    kind: "tmux",
+    status: () => "exited",
+    stop: () => {},
+    waitForExit: async () => {
+      waitCalls++;
+    },
+    interrupt: () => {},
+    attach: () => {
+      throw new Error("late observer has no attach stream");
+    },
+  };
+  const manager = managerWith(() => handle);
+  (manager as unknown as { agents: Map<string, unknown> }).agents.set(
+    "late",
+    managed("late", "late_id", handle, "persona"),
+  );
+  const result = await manager.preserveState({ attemptId: "late-observer", persistInventory: async () => {} });
+  check("late observer still invokes waitForExit after the child already reports exited", waitCalls === 1, waitCalls);
+  check("late observer cut still completes on a non-seat runtime", result.ok && result.state === "preserved", result);
+}
+
+// A seat checkpoint, driven the way an operator drives it: the cut seals one over a real git
+// working tree, then a destination admits it. Nothing below calls a gate directly. The refusals
+// are produced by running the admission the resume runs, over artifacts on disk, so a check that
+// passes says the shipped path reached the gate.
+{
+  const root = mkdtempSync(join(tmpdir(), "cotal-seat-checkpoint-"));
+  const cwd = join(root, "seat");
+  mkdirSync(cwd, { recursive: true });
+  const git = (...args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8" });
+  execFileSync("git", ["init", "-q", "-b", "main", cwd]);
+  git("config", "user.email", "seat@example.invalid");
+  git("config", "user.name", "seat");
+  writeFileSync(join(cwd, "tracked.txt"), "committed\n");
+  git("add", "tracked.txt");
+  git("commit", "-q", "-m", "base");
+  writeFileSync(join(cwd, "tracked.txt"), "staged\n");
+  git("add", "tracked.txt");
+  writeFileSync(join(cwd, "tracked.txt"), "staged then dirtied\n");
+  writeFileSync(join(cwd, "untracked.txt"), "never committed\n");
+  // The seat's cwd is also the mesh root here, which is the case where --exclude-standard does
+  // not exclude the control directory. A checkpoint that carries it carries the seat's creds.
+  mkdirSync(join(cwd, ".cotal", "auth"), { recursive: true });
+  writeFileSync(join(cwd, ".cotal", "auth", "broker.json"), "SEAT SECRET\n");
+
+  const uid = mintLifecycleUid();
+  const cut = (attemptId: string, generation: number) =>
+    captureSeatCheckpoint(join(seatCheckpointDir(root, attemptId), "seat"), { name: "seat" }, {
+      cwd,
+      space: "checkpoint-space",
+      name: "seat",
+      lifecycleUid: uid,
+      generation,
+      profile: { configSha256: "a".repeat(64) },
+      // No connector resolves in this suite, which is the drain-only default: a continuity promise
+      // is never inferred from a name.
+      connector: undefined,
+    });
+
+  const sealed = cut("cut-1", 0);
+  check(
+    "the cut leaves the seat's control directory out of the capture",
+    !execFileSync("tar", ["-tf", join(seatCheckpointDir(root, "cut-1"), "seat", "repo.untracked.tar")], { encoding: "utf8" })
+      .split("\n").some((entry) => entry.startsWith(".cotal")),
+  );
+  check("an unresolvable connector is sealed as drain-only", sealed.session.continuity === "drain-only", sealed.session);
+  // A class is a promise about bytes. A connector declaring continuation still gets no better than
+  // its fresh-start capability when the cut carried no pointer and no store to reopen from.
+  const declaredExact = captureSeatCheckpoint(join(seatCheckpointDir(root, "cut-exact"), "seat"), { name: "seat" }, {
+    cwd, space: "checkpoint-space", name: "seat", lifecycleUid: uid, generation: 0,
+    profile: { configSha256: "a".repeat(64) },
+    connector: { supportsResume: true, supportsSessionContinuation: true, supportsFreshStart: true },
+    sessionId: "session-that-has-no-bytes-here",
+  });
+  check(
+    "a continuation-capable connector is not sealed as exact when no session bytes were captured",
+    declaredExact.session.continuity === "fresh" && declaredExact.session.pointer === undefined && declaredExact.session.store.length === 0,
+    declaredExact.session,
+  );
+
+  const admit = (attemptId: string, opts: Partial<Parameters<typeof admitSeatCheckpoints>[0]> = {}) =>
+    admitSeatCheckpoints({
+      root, space: "checkpoint-space",
+      checkpointDir: seatCheckpointDir(root, attemptId),
+      liveLifecycleUids: new Set<string>(),
+      ...opts,
+    });
+
+  const admitted = admit("cut-1");
+  check(
+    "admission takes custody at the successor generation and reuses the recorded lifecycle uid",
+    admitted.length === 1 && admitted[0]!.generation === 1 && admitted[0]!.checkpoint.lifecycleUid === uid,
+    admitted,
+  );
+  check(
+    "custody is durable on the destination, so the next cut reads the generation it advanced to",
+    loadSeatWriterGeneration(root, "checkpoint-space", "seat")?.generation === 1,
+  );
+  check("a second destination claiming the same generation is refused", (() => {
+    try { admit("cut-1"); return false; }
+    catch (e) { return /seat-writer-generation-create-lost/.test((e as Error).message); }
+  })());
+
+  // One byte, in place, same size. Size and mtime cannot see this; only the recorded digest can.
+  cut("cut-2", 1);
+  const bundlePath = join(seatCheckpointDir(root, "cut-2"), "seat", "repo.bundle");
+  const bytes = Buffer.from(readFileSync(bundlePath));
+  bytes[bytes.length - 1] ^= 0x01;
+  writeFileSync(bundlePath, bytes);
+  check("a tampered capture is refused by name before custody moves", (() => {
+    try { admit("cut-2"); return false; }
+    catch (e) { return /checkpoint integrity: repo\.bundle hashes to/.test((e as Error).message); }
+  })());
+  check(
+    "the refused checkpoint left custody where it was",
+    loadSeatWriterGeneration(root, "checkpoint-space", "seat")?.generation === 1,
+  );
+
+  // Gate 3 is the one gate with an override, and an override has to report what it admitted.
+  const stale = cut("cut-3", 1);
+  const past = Date.parse(stale.capturedAt) + stale.recencyHorizonMs + 1_000;
+  check("a checkpoint past its horizon is refused with the age, the capture and the horizon", (() => {
+    try { admit("cut-3", { now: past }); return false; }
+    catch (e) {
+      const m = (e as Error).message;
+      return m.includes(stale.capturedAt) && m.includes(`horizon is ${stale.recencyHorizonMs}ms`);
+    }
+  })());
+  const forced = admit("cut-3", { now: past, acceptStale: true });
+  check(
+    "--accept-stale-checkpoint admits it and reports the age it actually admitted",
+    forced[0]!.staleOverrideAgeMs === stale.recencyHorizonMs + 1_000,
+    forced[0],
+  );
+
+  // Gate 2 has no override for authority, and a destination in another space is not this seat's.
+  cut("cut-4", 2);
+  check("a checkpoint from another space is refused", (() => {
+    try { admit("cut-4", { space: "elsewhere" }); return false; }
+    catch (e) { return /record is for space/.test((e as Error).message); }
+  })());
+  check("adopting a lifecycle uid this host believes is live is refused", (() => {
+    try { admit("cut-4", { liveLifecycleUids: new Set([uid]) }); return false; }
+    catch (e) { return /already live and this runtime cannot authoritatively adopt it/.test((e as Error).message); }
+  })());
+  // The profile half of gate 2 only decides anything when the destination supplies its own
+  // revision, and it has no override: the record carries a digest, not the config bytes.
+  check("a destination on a different profile revision is refused naming both digests", (() => {
+    try { admit("cut-4", { currentProfileConfigSha256: () => "c".repeat(64) }); return false; }
+    catch (e) {
+      const m = (e as Error).message;
+      return m.includes("c".repeat(64)) && m.includes("a".repeat(64)) && /restore the launch config/.test(m);
+    }
+  })());
+
+  // All or nothing. A refusal must leave every generation unclaimed, or the retry over a repaired
+  // checkpoint set loses an exclusive create it can never make again.
+  {
+    const pairRoot = mkdtempSync(join(tmpdir(), "cotal-seat-pair-"));
+    const pairCut = (attempt: string, seat: string, dest = pairRoot) =>
+      captureSeatCheckpoint(join(seatCheckpointDir(dest, attempt), seat), { name: seat }, {
+        cwd, space: "pair-space", name: seat, lifecycleUid: uid, generation: 0,
+        profile: { configSha256: "a".repeat(64) }, connector: undefined,
+      });
+    const admitPair = (attempt: string, retained: string[], opts: Partial<Parameters<typeof admitSeatCheckpoints>[0]> = {}) =>
+      admitSeatCheckpoints({
+        root: pairRoot, space: "pair-space",
+        checkpointDir: seatCheckpointDir(pairRoot, attempt),
+        liveLifecycleUids: new Set<string>(),
+        requireCovered: (names) => {
+          const covered = new Set(names);
+          const missing = retained.filter((seat) => !covered.has(seat));
+          if (missing.length) throw new Error(`retained seat(s) ${missing.join(", ")} have no admitted checkpoint`);
+        },
+        ...opts,
+      });
+    const claimed = (seat: string) => loadSeatWriterGeneration(pairRoot, "pair-space", seat)?.generation;
+
+    // Two retained seats, one checkpoint.
+    pairCut("pair-1", "a");
+    check("a retained seat with no checkpoint refuses the whole set", (() => {
+      try { admitPair("pair-1", ["a", "b"]); return false; }
+      catch (e) { return /retained seat\(s\) b have no admitted checkpoint/.test((e as Error).message); }
+    })());
+    check("the refused set left the present seat's generation unclaimed", claimed("a") === undefined, claimed("a"));
+
+    // Two checkpoints, the second tampered: a gate failure must not keep the first seat's claim.
+    pairCut("pair-2", "a");
+    pairCut("pair-2", "b");
+    const victim = join(seatCheckpointDir(pairRoot, "pair-2"), "b", "repo.bundle");
+    const bytes2 = Buffer.from(readFileSync(victim));
+    bytes2[bytes2.length - 1] ^= 0x01;
+    writeFileSync(victim, bytes2);
+    check("a gate failure on the second seat refuses the whole set", (() => {
+      try { admitPair("pair-2", ["a", "b"]); return false; }
+      catch (e) { return /checkpoint integrity: repo\.bundle hashes to/.test((e as Error).message); }
+    })());
+    check("neither seat claimed a generation when one failed a gate", claimed("a") === undefined && claimed("b") === undefined);
+
+    // Both present and intact: both claim, so the refusals above are not simply a dead path.
+    pairCut("pair-3", "a");
+    pairCut("pair-3", "b");
+    const both = admitPair("pair-3", ["a", "b"]);
+    check("a complete, intact set admits and claims every seat", both.length === 2 && claimed("a") === 1 && claimed("b") === 1, both.map((s) => s.name));
+
+    // A failure INSIDE the claim phase. Every gate passes, then the later seat's exclusive create
+    // loses to a generation another destination already holds. The earlier seat's claim must not
+    // survive, or the retry over this same admissible set can never make it again.
+    const collideRoot = mkdtempSync(join(tmpdir(), "cotal-seat-collide-"));
+    const collideCut = (seat: string) =>
+      captureSeatCheckpoint(join(seatCheckpointDir(collideRoot, "collide"), seat), { name: seat }, {
+        cwd, space: "pair-space", name: seat, lifecycleUid: uid, generation: 0,
+        profile: { configSha256: "a".repeat(64) }, connector: undefined,
+      });
+    collideCut("a");
+    collideCut("b");
+    // The later seat's successor, already claimed. `b` sorts after `a`, so `a` is claimed first.
+    advanceSeatWriterGeneration(collideRoot, { space: "pair-space", name: "b", lifecycleUid: uid, generation: 1 });
+    check("a lost create in the claim phase refuses naming that seat", (() => {
+      try {
+        admitSeatCheckpoints({
+          root: collideRoot, space: "pair-space",
+          checkpointDir: seatCheckpointDir(collideRoot, "collide"),
+          liveLifecycleUids: new Set<string>(),
+        });
+        return false;
+      } catch (e) {
+        const m = (e as Error).message;
+        return /seat-writer-generation-create-lost/.test(m) && m.includes('"b"');
+      }
+    })());
+    check(
+      "the earlier seat's generation was released when the later create lost",
+      loadSeatWriterGeneration(collideRoot, "pair-space", "a") === undefined,
+      loadSeatWriterGeneration(collideRoot, "pair-space", "a"),
+    );
+    check(
+      "the generation that was already held is untouched",
+      loadSeatWriterGeneration(collideRoot, "pair-space", "b")?.generation === 1,
+    );
+    rmSync(collideRoot, { recursive: true, force: true });
+
+    rmSync(pairRoot, { recursive: true, force: true });
+  }
+
+
+  // THE RESTORE, driven the way the resume drives it: `admitSeatCheckpoints` runs the gates, then
+  // the same `restoreSeatCheckpoints` the CLI passes as `beforeCustody`, over artifacts on disk.
+  // The operator steps these mirror are the ones in the lane brief: a destination whose seat cwd is
+  // absent, one where it is present, and one holding a leftover staging directory.
+  {
+    const destRoot = mkdtempSync(join(tmpdir(), "cotal-seat-restore-"));
+    const seatCwd = join(destRoot, "seat-tree");
+    const staging = `${seatCwd}.incoming`;
+    // A destination store path, so the session files have somewhere anchored to land.
+    const storeDir = join(root, "store");
+    mkdirSync(storeDir, { recursive: true });
+    const storeFile = join(storeDir, "transcript.jsonl");
+    writeFileSync(storeFile, '{"probe":"restored transcript"}\n');
+    const pointerPath = join(root, ".cotal", "pi-sessions", "probe.json");
+    mkdirSync(dirname(pointerPath), { recursive: true });
+    writeFileSync(pointerPath, JSON.stringify({ version: 1, sessionId: "session-1", status: "running" }));
+
+    const sealedRestore = captureSeatCheckpoint(join(seatCheckpointDir(destRoot, "restore-1"), "seat"), { name: "seat" }, {
+      cwd, space: "restore-space", name: "seat", lifecycleUid: uid, generation: 0,
+      workspaceRoot: root,
+      profile: { configSha256: "a".repeat(64) },
+      connector: { supportsResume: true, supportsSessionContinuation: true, supportsFreshStart: true },
+      sessionId: "session-1",
+      sessionStatePath: pointerPath,
+      sessionStorePaths: [storeDir],
+    });
+    // `exact` takes BOTH halves: the pointer names the session, the store holds the transcript it
+    // reopens. A pointer alone names a session whose bytes the artifact does not contain.
+    const pointerOnly = captureSeatCheckpoint(join(seatCheckpointDir(destRoot, "pointer-only"), "seat"), { name: "seat" }, {
+      cwd, space: "restore-space", name: "seat", lifecycleUid: uid, generation: 0,
+      workspaceRoot: root, profile: { configSha256: "a".repeat(64) },
+      connector: { supportsResume: true, supportsSessionContinuation: true, supportsFreshStart: true },
+      sessionId: "session-1", sessionStatePath: pointerPath,
+    });
+    check(
+      "a pointer with no store does not seal as exact",
+      pointerOnly.session.continuity === "fresh" && pointerOnly.session.store.length === 0,
+      pointerOnly.session,
+    );
+    check(
+      "a cut carrying a pointer and a store seals the class the connector declares",
+      sealedRestore.session.continuity === "exact" && sealedRestore.session.pointer !== undefined && sealedRestore.session.store.length === 1,
+      sealedRestore.session,
+    );
+    check(
+      "each session file records where the destination puts it back, anchored and relative",
+      sealedRestore.session.pointer?.restore?.anchor === "workspace-root" &&
+        sealedRestore.session.store[0]!.restore?.anchor === "workspace-root" &&
+        !sealedRestore.session.pointer!.restore!.path.startsWith("/"),
+      [sealedRestore.session.pointer?.restore, sealedRestore.session.store[0]?.restore],
+    );
+    // The status travels under the SAME selection rule the untracked set was produced under, or
+    // every restore of a seat whose cwd is a mesh root would refuse on the control directory.
+    check(
+      "the recorded status excludes the control directory the capture excludes",
+      sealedRestore.repository.status === "MM tracked.txt\n?? untracked.txt\n",
+      JSON.stringify(sealedRestore.repository.status),
+    );
+
+    const restoreAt = (attempt: string, seatName = "seat") => {
+      const directory = join(seatCheckpointDir(destRoot, attempt), seatName);
+      restoreSeatCheckpoints({
+        root,
+        seats: [{ name: seatName, directory, checkpoint: readSeatCheckpoint(directory), cwd: seatCwd, inventorySessionId: "session-1" }],
+      });
+    };
+
+    // A destination with no cwd at all: the ordinary fresh-destination case.
+    restoreAt("restore-1");
+    const restoredStatus = execFileSync("git", ["status", "--porcelain"], { cwd: seatCwd, encoding: "utf8" });
+    check(
+      "the restored tree reproduces the source's staging state, not just its file contents",
+      restoredStatus === sealedRestore.repository.status, JSON.stringify(restoredStatus),
+    );
+    check(
+      "the staged content is restored to the index, not only to the worktree",
+      execFileSync("git", ["diff", "--cached"], { cwd: seatCwd, encoding: "utf8" })
+        === execFileSync("git", ["diff", "--cached"], { cwd, encoding: "utf8" }),
+    );
+    check(
+      "the untracked file travels as bytes",
+      readFileSync(join(seatCwd, "untracked.txt"), "utf8") === "never committed\n",
+    );
+    check(
+      "the control directory the capture excluded is not in the restored tree",
+      !existsSync(join(seatCwd, ".cotal")),
+    );
+    check(
+      "the session pointer and the store land where the destination's connector reads them",
+      JSON.parse(readFileSync(pointerPath, "utf8")).sessionId === "session-1" &&
+        readFileSync(storeFile, "utf8") === '{"probe":"restored transcript"}\n',
+    );
+
+    // A destination whose cwd is already there: moved aside under a timestamped name, never deleted.
+    cut2: {
+      captureSeatCheckpoint(join(seatCheckpointDir(destRoot, "restore-2"), "seat"), { name: "seat" }, {
+        cwd, space: "restore-space", name: "seat", lifecycleUid: uid, generation: 0,
+        workspaceRoot: root, profile: { configSha256: "a".repeat(64) }, connector: undefined,
+      });
+      captureSeatCheckpoint(join(seatCheckpointDir(destRoot, "restore-2b"), "seat"), { name: "seat" }, {
+        cwd, space: "restore-space", name: "seat", lifecycleUid: uid, generation: 0,
+        workspaceRoot: root, profile: { configSha256: "a".repeat(64) }, connector: undefined,
+      });
+      writeFileSync(join(seatCwd, "decoy.txt"), "provisioned, not preserved\n");
+      restoreAt("restore-2");
+      const superseded = readdirSync(destRoot).filter((entry) => entry.startsWith("seat-tree.superseded."));
+      check("a pre-existing cwd is moved aside under a timestamped superseded name", superseded.length === 1, superseded);
+      check(
+        "the superseded tree keeps what was there, so a wrong checkpoint costs a rename",
+        existsSync(join(destRoot, superseded[0]!, "decoy.txt")),
+      );
+      check("the promoted tree is the checkpoint's, not the one moved aside", !existsSync(join(seatCwd, "decoy.txt")));
+
+      // A SECOND promotion in the same second. A whole-second timestamp alone computes the name the
+      // first one already took, and renaming onto it either loses that tree or fails ENOTEMPTY
+      // naming a rename instead of the real cause. Both superseded trees must survive, distinctly.
+      writeFileSync(join(seatCwd, "second-decoy.txt"), "the second tree moved aside\n");
+      restoreAt("restore-2b");
+      const bothAside = readdirSync(destRoot).filter((entry) => entry.startsWith("seat-tree.superseded."));
+      check(
+        "two promotions in the same second keep both superseded trees under distinct names",
+        bothAside.length === 2 &&
+          bothAside.some((entry) => existsSync(join(destRoot, entry, "decoy.txt"))) &&
+          bothAside.some((entry) => existsSync(join(destRoot, entry, "second-decoy.txt"))),
+        bothAside,
+      );
+      break cut2;
+    }
+
+    // A leftover staging directory is evidence of a failed run: refused, never promoted, never
+    // removed. The shell sequence this replaces promoted exactly such a directory with exit 0.
+    captureSeatCheckpoint(join(seatCheckpointDir(destRoot, "restore-3"), "seat"), { name: "seat" }, {
+      cwd, space: "restore-space", name: "seat", lifecycleUid: uid, generation: 0,
+      workspaceRoot: root, profile: { configSha256: "a".repeat(64) }, connector: undefined,
+    });
+    mkdirSync(staging, { recursive: true });
+    writeFileSync(join(staging, "partial.txt"), "half-restored, no .git\n");
+    check("a leftover staging directory refuses the restore by name", (() => {
+      try { restoreAt("restore-3"); return false; }
+      catch (e) { return /already exists; a staging directory from a failed restore is evidence/.test((e as Error).message); }
+    })());
+    check(
+      "the refused restore removed neither the leftover nor the live tree",
+      existsSync(join(staging, "partial.txt")) && existsSync(join(seatCwd, "tracked.txt")),
+    );
+    rmSync(staging, { recursive: true, force: true });
+
+    // A restore that applies without error can still land a different index, and only the recorded
+    // status sees it. Tamper with the status the record carries and the promotion must refuse.
+    {
+      const directory = join(seatCheckpointDir(destRoot, "restore-4"), "seat");
+      captureSeatCheckpoint(directory, { name: "seat" }, {
+        cwd, space: "restore-space", name: "seat", lifecycleUid: uid, generation: 0,
+        workspaceRoot: root, profile: { configSha256: "a".repeat(64) }, connector: undefined,
+      });
+      const record = JSON.parse(readFileSync(join(directory, "checkpoint.json"), "utf8")) as
+        { repository: { status: string } };
+      record.repository.status = " M tracked.txt\n";
+      writeFileSync(join(directory, "checkpoint.json"), `${JSON.stringify(record, null, 2)}\n`);
+      check("a restored tree whose status differs from the record is a refusal, not a warning", (() => {
+        try {
+          restoreSeatCheckpoints({
+            root,
+            seats: [{ name: "seat", directory, checkpoint: readSeatCheckpoint(directory), cwd: seatCwd }],
+          });
+          return false;
+        } catch (e) { return /reports a different status than the checkpoint recorded/.test((e as Error).message); }
+      })());
+      // The brief's disposition for a failed restore, and the staging directory is the evidence
+      // half of it: the live cwd is back as it was, and the tree that failed verification is left
+      // where an operator can look at it rather than removed.
+      check(
+        "the refused promotion put the previous tree back and left the staging tree as evidence",
+        existsSync(join(seatCwd, "tracked.txt")) && existsSync(join(staging, "tracked.txt")),
+      );
+      rmSync(staging, { recursive: true, force: true });
+    }
+
+    // The pointer is the seat's or it is nobody's: a session id the resume does not reopen refuses
+    // before anything is promoted.
+    {
+      const directory = join(seatCheckpointDir(destRoot, "restore-5"), "seat");
+      captureSeatCheckpoint(directory, { name: "seat" }, {
+        cwd, space: "restore-space", name: "seat", lifecycleUid: uid, generation: 0,
+        workspaceRoot: root, profile: { configSha256: "a".repeat(64) },
+        connector: { supportsResume: true, supportsSessionContinuation: true },
+        sessionId: "session-1", sessionStatePath: pointerPath,
+      });
+      check("a pointer whose session differs from the inventory's is refused", (() => {
+        try {
+          restoreSeatCheckpoints({
+            root,
+            seats: [{ name: "seat", directory, checkpoint: readSeatCheckpoint(directory), cwd: seatCwd, inventorySessionId: "another-session" }],
+          });
+          return false;
+        } catch (e) { return /checkpoint records session session-1, the retained inventory says another-session/.test((e as Error).message); }
+      })());
+      check("the refused pointer left no staging directory to inspect for a step that never ran", !existsSync(staging));
+    }
+
+    // A seat whose cwd IS a workspace root. The capture excludes the control directory by design,
+    // so promoting the restored tree over that cwd would move the destination's live trust material
+    // and maintenance state aside and leave it with none. Refused before staging.
+    {
+      const rootSeat = join(destRoot, "root-seat");
+      mkdirSync(join(rootSeat, ".cotal", "auth"), { recursive: true });
+      writeFileSync(join(rootSeat, ".cotal", "auth", "broker.json"), "LIVE TRUST MATERIAL\n");
+      const directory = join(seatCheckpointDir(destRoot, "restore-7"), "seat");
+      captureSeatCheckpoint(directory, { name: "seat" }, {
+        cwd, space: "restore-space", name: "seat", lifecycleUid: uid, generation: 0,
+        workspaceRoot: root, profile: { configSha256: "a".repeat(64) }, connector: undefined,
+      });
+      check("a seat whose cwd holds a control directory is refused before staging", (() => {
+        try {
+          restoreSeatCheckpoints({
+            root,
+            seats: [{ name: "seat", directory, checkpoint: readSeatCheckpoint(directory), cwd: rootSeat }],
+          });
+          return false;
+        } catch (e) { return /holds a control directory at .*a checkpoint never carries one/s.test((e as Error).message); }
+      })());
+      check(
+        "the destination's live control directory survives that refusal unchanged",
+        readFileSync(join(rootSeat, ".cotal", "auth", "broker.json"), "utf8") === "LIVE TRUST MATERIAL\n" &&
+          !existsSync(`${rootSeat}.incoming`) &&
+          readdirSync(destRoot).filter((entry) => entry.startsWith("root-seat.superseded.")).length === 0,
+      );
+    }
+
+    // THE INCARNATION MISMATCH, through the shipped resume helper rather than a copy of its logic.
+    // A checkpoint whose lifecycle uid is not the one the retained inventory carries describes a
+    // different incarnation, and the refusal has to land before the restore moves a tree and before
+    // a generation is claimed, or the all-or-nothing rule is only a claim.
+    {
+      const mismatchRoot = mkdtempSync(join(tmpdir(), "cotal-seat-uid-"));
+      const mismatchCwd = join(mismatchRoot, "seat-tree");
+      mkdirSync(mismatchCwd, { recursive: true });
+      writeFileSync(join(mismatchCwd, "LIVE.txt"), "the live tree\n");
+      const other = mintLifecycleUid();
+      captureSeatCheckpoint(join(seatCheckpointDir(mismatchRoot, "uid-1"), "seat"), { name: "seat" }, {
+        cwd, space: "restore-space", name: "seat", lifecycleUid: uid, generation: 0,
+        workspaceRoot: mismatchRoot, profile: { configSha256: "a".repeat(64) }, connector: undefined,
+      });
+      check("a checkpoint naming another incarnation than the inventory refuses the resume", (() => {
+        try {
+          admitAndRestoreSeatCheckpoints(mismatchRoot, "restore-space", "uid-1", {}, {
+            agents: [{ name: "seat", identity: { lifecycleUid: other }, launch: { cwd: mismatchCwd } }],
+          });
+          return false;
+        } catch (e) { return /checkpoint records lifecycle .*the retained inventory says/.test((e as Error).message); }
+      })());
+      check(
+        "that refusal moved no tree, promoted nothing, and claimed no generation",
+        readFileSync(join(mismatchCwd, "LIVE.txt"), "utf8") === "the live tree\n" &&
+          !existsSync(`${mismatchCwd}.incoming`) &&
+          readdirSync(mismatchRoot).filter((entry) => entry.startsWith("seat-tree.superseded.")).length === 0 &&
+          loadSeatWriterGeneration(mismatchRoot, "restore-space", "seat") === undefined,
+      );
+      // The same helper on a MATCHING uid restores and claims, so the refusal above is a decision
+      // rather than a helper that always throws.
+      captureSeatCheckpoint(join(seatCheckpointDir(mismatchRoot, "uid-2"), "seat"), { name: "seat" }, {
+        cwd, space: "restore-space", name: "seat", lifecycleUid: uid, generation: 0,
+        workspaceRoot: mismatchRoot, profile: { configSha256: "a".repeat(64) }, connector: undefined,
+      });
+      admitAndRestoreSeatCheckpoints(mismatchRoot, "restore-space", "uid-2", {}, {
+        agents: [{ name: "seat", identity: { lifecycleUid: uid }, launch: { cwd: mismatchCwd } }],
+      });
+      check(
+        "a matching incarnation restores the tree and claims the successor generation",
+        execFileSync("git", ["status", "--porcelain"], { cwd: mismatchCwd, encoding: "utf8" }) === sealedRestore.repository.status &&
+          loadSeatWriterGeneration(mismatchRoot, "restore-space", "seat")?.generation === 1,
+      );
+      rmSync(mismatchRoot, { recursive: true, force: true });
+    }
+
+    // A store file inside the seat's own tree would be captured by the untracked archive AND placed
+    // again on top of what the extraction wrote. Refused at the cut.
+    check("a store inside the seat's working tree is refused at the cut", (() => {
+      try {
+        captureSeatCheckpoint(join(seatCheckpointDir(destRoot, "restore-6"), "seat"), { name: "seat" }, {
+          cwd, space: "restore-space", name: "seat", lifecycleUid: uid, generation: 0,
+          workspaceRoot: root, profile: { configSha256: "a".repeat(64) },
+          connector: { supportsSessionContinuation: true },
+          sessionStorePaths: [cwd],
+        });
+        return false;
+      } catch (e) { return /is already carried by the untracked capture of/.test((e as Error).message); }
+    })());
+
+    rmSync(destRoot, { recursive: true, force: true });
+  }
+
+  rmSync(root, { recursive: true, force: true });
+}
+
+console.log(`\nPRESERVE-STATE SMOKE ${failures === 0 ? "OK" : "FAILED"} (${failures} failures)`);
+process.exit(failures === 0 ? 0 : 1);

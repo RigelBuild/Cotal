@@ -1,0 +1,683 @@
+import { writeSync } from "node:fs";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Box, Text, useApp, useFocusManager, useInput, useStdout } from "ink";
+import { mentionsIn, type CotalEndpoint, type Presence } from "@cotal-ai/core";
+import { useMesh } from "./mesh.js";
+import { attachSeat } from "../commands/agents.js";
+import { detachKey } from "@cotal-ai/workspace/attach";
+import { cliControl } from "../lib/control.js";
+import { Tabs } from "./ui/Tabs.js";
+import { Tiles } from "./ui/Tiles.js";
+import { Roster, harnessTag, useRosterView } from "./ui/Roster.js";
+import { sidePaneSize } from "./ui/theme.js";
+import { Feed, useFeedView } from "./ui/Feed.js";
+import { NeedsYou } from "./ui/NeedsYou.js";
+import { Dm } from "./ui/Dm.js";
+import { Topo, type TopoVariant } from "./ui/topo/Topo.js";
+import { StatusBar } from "./ui/StatusBar.js";
+import { Help } from "./ui/Help.js";
+import { Search } from "./ui/Search.js";
+import { CommandPalette } from "./ui/CommandPalette.js";
+import { Confirm, type ConfirmTarget } from "./ui/Confirm.js";
+import { Prompt } from "./ui/Prompt.js";
+import { Detail, type DetailTarget } from "./ui/Detail.js";
+import { runCommand, type CommandCtx } from "./commands.js";
+import { offlineRecipientNotice } from "@cotal-ai/workspace";
+import { extensionNames } from "../ext-loader.js";
+import { spawnPersona } from "../lib/spawn-defaults.js";
+import { launchAgent } from "./launch.js";
+import { NewAgent } from "./ui/NewAgent.js";
+import type { FeedEntry, FocusId } from "./mesh.js";
+import { control, controlPs, createManagedPoller, deleteChannel, type ControlCtx, type ControlOp } from "@cotal-ai/workspace/control";
+
+/** An in-progress compose: post to a channel, DM a peer, or reply to a feed message. */
+type ComposeTarget =
+  | { kind: "channel"; channel: string; value: string }
+  | { kind: "dm"; toId: string; toName: string; value: string }
+  | { kind: "reply"; entry: FeedEntry; value: string };
+
+/** How often the console re-reads the manager's managed rows (which harness runs each seat). Each
+ *  poll is a full per-action control call (resolve, mint, connect, describe, invoke), so it is
+ *  deliberately slow. */
+const PS_POLL_MS = 10_000;
+
+/**
+ * The lazygit-style console: channel tabs · golden-signal tiles · roster · live feed · status bar,
+ * plus the NEEDS-YOU rail (`n`), the DM lens (`d`), and the Ctrl+P operator command palette. `useMesh`
+ * owns the observer endpoint; panels lay out `mesh` and (when `canWrite`) the palette publishes
+ * chat over the same endpoint. Control (`D` kill, `:spawn` / `:purge` / `:status` / `:ps`)
+ * never rides the observer: each action is one call through the CLI's
+ * per-action control path (console/control.ts), gated on `canControl`. Input is single-source:
+ * this global handler owns the keys/overlays; panels' keys are gated on focus and `blocked`.
+ */
+export function App({
+  ep,
+  tapSubject,
+  onBack,
+  canWrite,
+  canControl,
+  controlCtx,
+  makeParticipant,
+}: {
+  ep: CotalEndpoint;
+  tapSubject?: string;
+  onBack?: () => void;
+  canWrite?: boolean;
+  canControl?: boolean;
+  /** The `--server` / `--creds` half of the control coordinates; the App adds the watched space. */
+  controlCtx?: Omit<ControlCtx, "space">;
+  /** Builds the operator's presence peer (root.tsx); absent where the mesh cannot host one. */
+  makeParticipant?: () => CotalEndpoint;
+}) {
+  const mesh = useMesh(ep, { tapSubject });
+  const { exit } = useApp();
+  const { stdout } = useStdout();
+  const { focus, focusNext, focusPrevious } = useFocusManager();
+
+  const [size, setSize] = useState({ cols: stdout.columns || 80, rows: stdout.rows || 24 });
+  const [activeChannel, setActiveChannel] = useState("all");
+  const [helpOpen, setHelpOpen] = useState(false);
+  const [detail, setDetail] = useState<DetailTarget | null>(null);
+  const [search, setSearch] = useState({ active: false, query: "" });
+  const [focusedId, setFocusedId] = useState<FocusId>("feed");
+  const [mode, setMode] = useState<"normal" | "dm" | "topo">("normal");
+  const [topoVariant, setTopoVariant] = useState<TopoVariant>(0);
+  const [railOpen, setRailOpen] = useState(false);
+  const [palette, setPalette] = useState({ active: false, query: "" });
+  const [newAgent, setNewAgent] = useState(false);
+  const [confirm, setConfirm] = useState<ConfirmTarget | null>(null);
+  const [compose, setCompose] = useState<ComposeTarget | null>(null);
+  const [notice, setNotice] = useState<string | undefined>();
+  const [attachTarget, setAttachTarget] = useState<{ name: string } | null>(null);
+  // Held here, not in the Feed or Roster, which unmount while a detail or another full-screen view is open.
+  const feedView = useFeedView();
+  const rosterView = useRosterView();
+
+  const overlay = helpOpen || detail !== null;
+  const blocked = overlay || search.active || palette.active || newAgent || confirm !== null || compose !== null;
+
+  // ---- geometry (pure from size / mode / rail / search / palette / compose) ---
+  const narrow = size.cols < 80;
+  const composeRow = compose ? 1 : 0;
+  // The filter row hides while the palette or a compose prompt owns the bottom region.
+  const searchRow = (search.active || search.query) && !palette.active && !compose ? 1 : 0;
+  const tilesRow = 1;
+  const noticeRow = notice ? 1 : 0;
+  const bodyH = Math.max(
+    3,
+    size.rows - 3 /* tabs */ - tilesRow - 1 /* status */ - searchRow - noticeRow - composeRow,
+  );
+  // The needs-you rail is a side column only on a genuinely wide terminal; otherwise `n` opens it
+  // full-screen so it never squeezes the feed unreadably. It never coexists with the DM/topo lens.
+  const railAsColumn = railOpen && !narrow && size.cols >= 100 && mode === "normal";
+  const railOverlay = railOpen && mode === "normal" && !railAsColumn;
+  const railW = railAsColumn ? Math.min(34, Math.max(24, Math.floor(size.cols * 0.28))) : 0;
+  const bodyW = size.cols - railW;
+  const roster = sidePaneSize(bodyW, bodyH, narrow);
+  const feed = narrow
+    ? { w: bodyW, h: bodyH - roster.h }
+    : { w: bodyW - roster.w, h: bodyH };
+  const normalFocus: FocusId =
+    focusedId === "roster" ? "roster" : focusedId === "needsyou" && railAsColumn ? "needsyou" : "feed";
+
+  // Focus the right pane after an overlay closes, or when switching into/out of a view.
+  useEffect(() => {
+    if (overlay || confirm || attachTarget || palette.active || newAgent) return;
+    if (railOverlay) focus("needsyou");
+    else if (mode === "dm") focus("dmpeers");
+    else if (mode === "topo") focus("topo");
+    else focus(normalFocus);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [helpOpen, detail, mode, railOpen, confirm, attachTarget, palette.active, newAgent]);
+
+  // One control call against the manager of THIS space (console/control.ts): resolve, mint a
+  // one-shot instrument, call, drop. The observer endpoint is never involved.
+  const ctl = useCallback(
+    (op: ControlOp, args?: Record<string, unknown>) => control(cliControl, { ...controlCtx, space: ep.space }, op, args),
+    [ep.space, controlCtx],
+  );
+
+  // Managed state lives in the manager, not in presence: only the manager knows WHICH harness it
+  // launched (`agent` = connector, `mode` = runtime) for a seat whose card carries no meta. Poll
+  // the manager's rows at a low rate and merge by the non-forgeable id; stop polling when nothing
+  // answers, so an open mesh without a supervisor does not spin on every tick.
+  //
+  // Stopping is SAID ONCE rather than swallowed. A refused permission, an expired credential and
+  // a mesh that simply has no manager all end the poll, and they are different facts: without the
+  // notice the harness tags and the detail card's `runs` just stay blank for the rest of the
+  // session with nothing to tell the operator which of the three happened.
+  const [managed, setManaged] = useState<Map<string, { agent?: string; mode?: string }>>(new Map());
+  useEffect(() => {
+    if (!canControl || !controlCtx) return;
+    let alive = true;
+    // The poller owns the per-instance rows, the single-flight guard and the announce-once state;
+    // a new space or credential builds a new one, so nothing is carried over.
+    const poller = createManagedPoller(
+      () => controlPs(cliControl, { ...controlCtx, space: ep.space }),
+      {
+        rows: (flat) =>
+          setManaged((prev) => {
+            const same =
+              flat.size === prev.size &&
+              [...flat].every(([id, m]) => {
+                const p = prev.get(id);
+                return p !== undefined && p.agent === m.agent && p.mode === m.mode;
+              });
+            return same ? prev : flat;
+          }),
+        partial: (silent, failed) => {
+          const parts = [
+            ...failed.map((f) => `${f.instanceId}: ${f.error}`),
+            ...(silent.length ? [`${silent.length} manager instance(s) gave no answer: ${silent.join(", ")}`] : []),
+          ];
+          setNotice(`managed rows are partial: ${parts.join("; ")}`);
+        },
+        stopped: (error) => setNotice(`no managed-agent rows: ${error}`),
+      },
+    );
+    const tick = async () => {
+      if (!alive) return;
+      await poller.tick();
+    };
+    void tick();
+    const t = setInterval(() => void tick(), PS_POLL_MS);
+    return () => {
+      alive = false;
+      clearInterval(t);
+    };
+  }, [canControl, controlCtx, ep.space]);
+
+  // Keep last-seen ages fresh.
+  const [, tick] = useState(0);
+  useEffect(() => {
+    const t = setInterval(() => tick((n) => n + 1), 1000);
+    return () => clearInterval(t);
+  }, []);
+
+  // Auto-clear the transient action notice.
+  useEffect(() => {
+    if (!notice) return;
+    const t = setTimeout(() => setNotice(undefined), 3000);
+    return () => clearTimeout(t);
+  }, [notice]);
+
+  // Suspend the console and hand the terminal to the seat. The `attachTarget` render commits
+  // App→null and gates the top-level useInput, so Ink releases stdin (ref-counted raw mode) BEFORE
+  // the attach loop takes it. The loop is the CLI's own (`attachSeat`): seat locality, the
+  // one-use holder-bound session over the mesh, reconnect with backoff, end-reason classification,
+  // the abandoned-session hand-back, and the terminal given back before the verdict returns. The
+  // observer endpoint + MeshView keep running in the background (App stays mounted). On return,
+  // re-assert the console's alt-screen / alt-scroll / cursor (the loop leaves us in the main
+  // buffer after a full-screen child) and show the verdict.
+  useEffect(() => {
+    if (!attachTarget) return;
+    let cancelled = false;
+    const { name } = attachTarget;
+    void (async () => {
+      let verdict: Awaited<ReturnType<typeof attachSeat>>;
+      try {
+        verdict = await attachSeat({ ...controlCtx, space: ep.space, name }, { reconnect: true, onRefusal: "throw" });
+      } catch (e) {
+        verdict = { kind: "failed", message: (e as Error).message };
+      }
+      try {
+        writeSync(process.stdout.fd, "\x1b[?1049h\x1b[?1007h\x1b[?25h");
+      } catch {
+        /* stdout gone */
+      }
+      if (cancelled) return;
+      setAttachTarget(null);
+      setNotice(verdict.kind === "ended" ? `detached from ${name}` : verdict.kind === "gone" ? `seat ${name} is gone` : `attach: ${verdict.message}`);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [attachTarget, controlCtx, ep.space]);
+
+  useEffect(() => {
+    const onResize = () => setSize({ cols: stdout.columns || 80, rows: stdout.rows || 24 });
+    stdout.on("resize", onResize);
+    return () => {
+      stdout.off("resize", onResize);
+    };
+  }, [stdout]);
+
+  const tabs = ["all", ...mesh.channels.map((ch) => ch.channel)];
+  const counts: Record<string, number> = {};
+  for (const ch of mesh.channels) counts[ch.channel] = ch.messages;
+
+  // Per-channel unread: pure client state over MeshView's live ARRIVAL counters (the web
+  // sidebar's badges are the same kind of state). The broker's retained count is not the base: it
+  // is capped per sender, so it stops climbing under live traffic and a badge built on it goes
+  // quiet at the cap. Arrivals start at zero for every channel when the console starts, so history
+  // is not unread and no baseline snapshot is needed: a channel with no watermark, including one
+  // that first appears on a mesh that was empty at start, has every arrival unread. Viewing a
+  // concrete channel keeps its watermark pinned to the arrivals so far (viewing clears).
+  const [seen, setSeen] = useState<Record<string, number>>({});
+  useEffect(() => {
+    setSeen((s) => {
+      let next = s;
+      const bump = (channel: string, v: number) => {
+        if (next === s) next = { ...s };
+        next[channel] = v;
+      };
+      // A channel that left the strip (deleted) drops its watermark once it is gone, not before:
+      // dropping it while the tab is still listed would badge everything seen so far as unread.
+      // MeshView drops its arrivals with the channel, so a channel created again later is new, and
+      // every arrival on it is unread, like any channel that appears after the baseline.
+      const listed = new Set(mesh.channels.map((ch) => ch.channel));
+      for (const channel of Object.keys(next))
+        if (!listed.has(channel)) {
+          if (next === s) next = { ...s };
+          delete next[channel];
+        }
+      const cur = mesh.channels.find((ch) => ch.channel === activeChannel)?.arrivals;
+      if (activeChannel !== "all" && cur !== undefined && next[activeChannel] !== cur) bump(activeChannel, cur);
+      return next;
+    });
+    // an activeChannel change must also re-pin the watermark.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mesh.channels, activeChannel]);
+  const unread: Record<string, number> = {};
+  for (const ch of mesh.channels) {
+    const n = ch.arrivals - (seen[ch.channel] ?? 0);
+    if (n > 0 && ch.channel !== activeChannel) unread[ch.channel] = n;
+  }
+
+  // id → short harness tag for the roster (what the agent IS): the card's self-published
+  // meta.connector first, the manager's launch record for a seat whose card carries no meta.
+  const harness = useMemo(() => {
+    const m = new Map<string, string>();
+    for (const p of mesh.agents) {
+      const meta = p.card.meta as Record<string, unknown> | undefined;
+      const connector = typeof meta?.connector === "string" ? meta.connector : managed.get(p.card.id)?.agent;
+      const tag = harnessTag(connector);
+      if (tag) m.set(p.card.id, tag);
+    }
+    return m;
+  }, [mesh.agents, managed]);
+
+  const onFocus = useCallback((id: FocusId) => setFocusedId(id), []);
+  const openAgent = useCallback((p: Presence) => setDetail({ kind: "agent", agent: p }), []);
+  const openMessage = useCallback((e: FeedEntry) => setDetail({ kind: "message", entry: e }), []);
+  const handleKill = useCallback((p: Presence) => setConfirm({ kind: "kill", name: p.card.name }), []);
+  // Attach: open the seat's live terminal. Keyed by NAME (a managed seat need not be a roster peer,
+  // same as `cotal attach --name`). A bad COTAL_DETACH_KEY is refused BEFORE suspending, as a
+  // notice: the loop would only throw it after the takeover, with the screen already gone.
+  const handleAttach = useCallback(
+    (name: string) => {
+      if (!canControl) return setNotice("no control path - a raw --creds file cannot drive the manager; run against a registered mesh");
+      try {
+        detachKey();
+      } catch (e) {
+        return setNotice("attach: " + (e as Error).message);
+      }
+      setNotice(`attaching to ${name}…`);
+      setAttachTarget({ name });
+    },
+    [canControl],
+  );
+  const feedCompose = useCallback(
+    () => setCompose({ kind: "channel", channel: activeChannel === "all" ? "general" : activeChannel, value: "" }),
+    [activeChannel],
+  );
+  const feedReply = useCallback((e: FeedEntry) => setCompose({ kind: "reply", entry: e, value: "" }), []);
+  const rosterCompose = useCallback(
+    (p: Presence) => setCompose({ kind: "dm", toId: p.card.id, toName: p.card.name, value: "" }),
+    [],
+  );
+
+  const composeLabel = (c: ComposeTarget): string =>
+    c.kind === "channel"
+      ? "→ #" + c.channel
+      : c.kind === "dm"
+        ? "→ @" + c.toName
+        : "↩ " + c.entry.from.name + (c.entry.delivery === "multicast" && c.entry.channel ? " #" + c.entry.channel : "");
+
+  // First time the operator sends anything, put the operator on the roster: start the presence
+  // peer (root.tsx's makeParticipant, the observer's own card), so agents see the operator and
+  // their DM replies have a peer to land on; the whole-space tap the open-mesh console already
+  // runs is what shows them in the DM lens. Idempotent, canWrite-gated (a pure-watch session never
+  // calls it). A refused start leaves the operator invisible and is shown; the next send retries.
+  //
+  // OPEN MESH ONLY, and said so rather than degraded: Root offers no peer under auth, where the
+  // tap is narrowed to chat and an agent-grade credential holds no live read of its own DM inbox
+  // (DMs ride its lifecycle-keyed durable, which the observer does not consume), so a reply could
+  // never be shown here. A send there is one-way, and the status line says exactly that once.
+  const participant = useRef<CotalEndpoint | null>(null);
+  const activatedRef = useRef(false);
+  const participantStart = useRef<Promise<boolean> | null>(null);
+  const [onRoster, setOnRoster] = useState(false);
+  const ensureParticipant = useCallback(async (): Promise<boolean> => {
+    if (activatedRef.current || !canWrite) return true;
+    if (participantStart.current) return participantStart.current;
+    if (!makeParticipant) {
+      activatedRef.current = true;
+      setNotice("sent one-way: under this credential replies cannot land in the console");
+      return true;
+    }
+    const start = (async () => {
+      const peer = makeParticipant();
+      // The status bar's "on roster" is a claim about a LIVE presence peer, so it follows the peer's
+      // own connection state rather than being set once and left. `error` only says something went
+      // wrong; `connection` says whether the operator is actually on the roster right now, and the
+      // endpoint re-establishes itself after a terminal close, so a fault is usually followed by a
+      // recovery that must put the claim back. The peer is deliberately RETAINED across a fault:
+      // dropping the reference would leave a live endpoint that still republishes presence, that
+      // the console no longer stops on exit, and that a later send would duplicate under the same
+      // principal.
+      peer.on("connection", ({ connected }: { connected: boolean }) => {
+        if (participant.current === peer) setOnRoster(connected);
+      });
+      peer.on("error", (e: Error) => {
+        if (participant.current === peer) setNotice("participant: " + e.message);
+      });
+      try {
+        await peer.start();
+        participant.current = peer;
+        activatedRef.current = true;
+        setOnRoster(true);
+        return true;
+      } catch (e) {
+        // A peer that never started is dropped, so it must not keep this component's handlers or a
+        // half-open connection behind it. The next send builds a fresh one.
+        peer.removeAllListeners("connection");
+        peer.removeAllListeners("error");
+        peer.on("error", () => {});
+        void peer.stop().catch(() => undefined);
+        setNotice("participant: " + (e as Error).message);
+        return false;
+      }
+    })();
+    participantStart.current = start;
+    try {
+      return await start;
+    } finally {
+      if (participantStart.current === start) participantStart.current = null;
+    }
+  }, [canWrite, makeParticipant]);
+  // The peer leaves with the console (an offline record, like the observer's own stop in useMesh).
+  // Its handlers go first: `stop()` closes the connection, which is itself a disconnect, and a
+  // setState from a component being torn down is a warning at best and a wrong repaint at worst.
+  useEffect(
+    () => () => {
+      const peer = participant.current;
+      participant.current = null;
+      if (!peer) return;
+      peer.removeAllListeners("connection");
+      peer.removeAllListeners("error");
+      peer.on("error", () => {}); // the factory's guard, restored: a stray error must not throw
+      void peer.stop();
+    },
+    [],
+  );
+
+  // Send the in-progress compose over the live endpoint.
+  const submitCompose = () => {
+    const c = compose;
+    if (!c) return;
+    setCompose(null);
+    const text = c.value.trim();
+    if (!text) return;
+    const ok = (label: string) => () => setNotice(label);
+    const fail = (e: unknown) => setNotice("send: " + (e as Error).message);
+    // A DM to a peer the roster shows offline at send also says what happens to it.
+    const dmLabel = (lead: string, id: string, name: string) =>
+      ep.getRoster().find((p) => p.card.id === id)?.status === "offline" ? `${lead}${name}  ${offlineRecipientNotice(name)}` : lead + name;
+    void ensureParticipant().then((ready) => {
+      if (!ready) return;
+      if (c.kind === "channel")
+        void ep.multicast(text, { channel: c.channel, mentions: mentionsIn(text) }).then(ok("→ #" + c.channel)).catch(fail);
+      else if (c.kind === "dm") void ep.unicast(c.toId, text).then(ok(dmLabel("→ ", c.toId, c.toName))).catch(fail);
+      else {
+        const e = c.entry;
+        const channel = e.delivery === "multicast" && e.channel;
+        const send = channel
+          ? ep.multicast(text, { channel, replyTo: e.id, mentions: mentionsIn(text) })
+          : ep.unicast(e.from.id, text, { replyTo: e.id });
+        void send.then(ok(channel ? "↩ " + e.from.name : dmLabel("↩ ", e.from.id, e.from.name))).catch(fail);
+      }
+    }, fail); // a participant start that throws before its own catch must not drop the message silently
+  };
+
+  // Run a typed palette line against the live endpoint.
+  const readPaletteAgents = useCallback(() => controlPs(cliControl, { ...controlCtx, space: ep.space }), [controlCtx, ep.space]);
+  const runPaletteLine = (line: string) => {
+    setPalette({ active: false, query: "" });
+    const ctx: CommandCtx = {
+      ep,
+      snapshot: mesh,
+      activeChannel,
+      setMode,
+      setActiveChannel,
+      toggleRail: () => setRailOpen((v) => !v),
+      openHelp: () => setHelpOpen(true),
+      back: onBack,
+      exit,
+      notify: setNotice,
+      control: ctl,
+      ps: () => controlPs(cliControl, { ...controlCtx, space: ep.space }),
+      confirmPurge: () => setConfirm({ kind: "purge", space: ep.space }),
+      confirmDelchan: (channel: string) => setConfirm({ kind: "delchan", channel }),
+      startAttach: handleAttach,
+      ensureParticipant,
+    };
+    runCommand(line, ctx, !!canWrite, !!canControl);
+  };
+
+  // Confirmed destructive action (kill / purge; space-delete is handled in the picker). Both go
+  // through the control door: `stop` is the CLI's own `cotal stop` (seat locality, then the
+  // targeted despawn with any-mode reach on a static or open mesh, owner reach on a user mesh);
+  // `purge` is the manager.admin op behind the typed-name confirm.
+  const onConfirmed = (opts?: { force?: boolean }) => {
+    const c = confirm;
+    setConfirm(null);
+    if (c?.kind === "kill") {
+      const graceful = !opts?.force;
+      setNotice(`${graceful ? "stopping" : "force-killing"} ${c.name}…`);
+      void ctl("stop", { name: c.name, graceful }).then((r) =>
+        setNotice(r.ok ? `${graceful ? "stopped" : "force-killed"} ${c.name}` : `stop: ${r.error ?? "failed"}`),
+      );
+    } else if (c?.kind === "purge") {
+      setNotice(`purging ${c.space}…`);
+      void ctl("purge", {}).then((r) => setNotice(r.ok ? "purged space history" : `purge: ${r.error ?? "failed"}`));
+    } else if (c?.kind === "delchan") {
+      // Core's clearChannel with the web's per-action authority (console/control.ts). The tab
+      // vanishes on the next channel poll (MeshView rebuilds the list from the broker) and its
+      // unread bookkeeping goes with it; leave it now if it is the one being viewed.
+      setNotice(`deleting #${c.channel}…`);
+      void deleteChannel({ ...controlCtx, space: ep.space }, c.channel).then((r) => {
+        if (!r.ok) return setNotice(`delchan: ${r.error}`);
+        setNotice(`deleted #${c.channel} · ${r.purged} messages purged`);
+        setActiveChannel((ch) => (ch === c.channel ? "all" : ch));
+      });
+    }
+  };
+
+  useInput(
+    (input, key) => {
+      if (helpOpen) return setHelpOpen(false);
+      if (detail) return setDetail(null);
+      if (search.active) return; // the Search line owns input while open
+      if (input === "?") return setHelpOpen(true);
+      if (input === "/") return setSearch((s) => ({ active: true, query: s.query }));
+      if (key.ctrl && input === "p") return setPalette({ active: true, query: "" });
+      if (key.escape) {
+        // lazygit-style "back": pop one level per press, then return to the space overview.
+        if (mode === "dm" || mode === "topo") return setMode("normal");
+        if (railOverlay) return setRailOpen(false);
+        if (search.query) return setSearch({ active: false, query: "" });
+        if (onBack) return onBack();
+        return;
+      }
+      if (input === "q") return exit();
+      if (onBack && input === "b" && mode === "normal") return onBack(); // quick back to the overview
+      if (input === "d" && !key.ctrl) return setMode((m) => (m === "dm" ? "normal" : "dm")); // Ctrl-d = scroll
+      if (input === "t") return setMode((m) => (m === "topo" ? "normal" : "topo"));
+      if (input === "v" && mode === "topo") return setTopoVariant((v) => ((v + 1) % 3) as TopoVariant);
+      if (mode === "topo" && input >= "1" && input <= "3")
+        return setTopoVariant((Number(input) - 1) as TopoVariant);
+      if (input === "n") return setRailOpen((v) => !v);
+      if (key.leftArrow || input === "h") return focusPrevious();
+      if (key.rightArrow || input === "l") return focusNext();
+      if (input === "[" || input === "]") {
+        const cur = Math.max(0, tabs.indexOf(activeChannel));
+        const next = input === "]" ? Math.min(tabs.length - 1, cur + 1) : Math.max(0, cur - 1);
+        return setActiveChannel(tabs[next]);
+      }
+      if (input >= "1" && input <= "9") {
+        const idx = Number(input) - 1;
+        if (idx < tabs.length) setActiveChannel(tabs[idx]);
+      }
+    },
+    { isActive: !attachTarget && !palette.active && !newAgent && confirm === null && compose === null },
+  );
+
+  // Attached: render nothing so Ink releases stdin/stdout to the seat (the suspend effect owns the
+  // terminal). App stays mounted, so the observer endpoint + MeshView survive in the background.
+  if (attachTarget) return null;
+  if (helpOpen) return <Help focusedId={focusedId} width={size.cols} height={size.rows} />;
+  if (detail) return <Detail target={detail} feed={mesh.feed} width={size.cols} height={size.rows} managed={managed} />;
+  if (confirm)
+    return (
+      <Confirm target={confirm} width={size.cols} height={size.rows} onConfirm={onConfirmed} onCancel={() => setConfirm(null)} />
+    );
+  if (railOverlay)
+    return (
+      <NeedsYou
+        waiting={mesh.signals.waiting}
+        boxWidth={size.cols}
+        boxHeight={size.rows}
+        blocked={blocked}
+        onFocus={onFocus}
+        onOpenDetail={openAgent}
+      />
+    );
+
+  return (
+    <Box flexDirection="column" width={size.cols} height={size.rows}>
+      <Tabs tabs={tabs} active={activeChannel} counts={counts} unread={unread} width={size.cols} />
+      <Tiles counts={mesh.signals.counts} stalestLiveTs={mesh.signals.stalestLiveTs} width={size.cols} />
+      {mode === "dm" ? (
+        <Dm
+          dms={mesh.signals.dms}
+          dmVisible={mesh.status.dmVisible}
+          width={size.cols}
+          height={bodyH}
+          narrow={narrow}
+          blocked={blocked}
+          onFocus={onFocus}
+        />
+      ) : mode === "topo" ? (
+        <Topo
+          feed={mesh.feed}
+          agents={mesh.agents}
+          membership={mesh.membership}
+          channels={mesh.channels}
+          nameOf={mesh.nameOf}
+          variant={topoVariant}
+          width={size.cols}
+          height={bodyH}
+          blocked={blocked}
+          onFocus={onFocus}
+          onOpenAgent={openAgent}
+          onOpenMessage={openMessage}
+        />
+      ) : (
+        <Box flexDirection={narrow ? "column" : "row"} height={bodyH}>
+          <Box flexDirection={narrow ? "column" : "row"} width={bodyW} height={bodyH}>
+            <Roster
+              view={rosterView}
+              agents={mesh.agents}
+              endpoints={mesh.endpoints}
+              query={search.query}
+              boxWidth={roster.w}
+              boxHeight={roster.h}
+              blocked={blocked}
+              onFocus={onFocus}
+              onOpenDetail={openAgent}
+              onKill={canControl ? handleKill : undefined}
+              onAttach={canControl ? (p) => handleAttach(p.card.name) : undefined}
+              harness={harness}
+              onCompose={canWrite ? rosterCompose : undefined}
+            />
+            <Feed
+              view={feedView}
+              entries={mesh.feed}
+              activeChannel={activeChannel}
+              query={search.query}
+              boxWidth={feed.w}
+              boxHeight={feed.h}
+              blocked={blocked}
+              onFocus={onFocus}
+              onOpenDetail={openMessage}
+              onCompose={canWrite ? feedCompose : undefined}
+              onReply={canWrite ? feedReply : undefined}
+            />
+          </Box>
+          {railAsColumn ? (
+            <NeedsYou
+              waiting={mesh.signals.waiting}
+              boxWidth={railW}
+              boxHeight={bodyH}
+              blocked={blocked}
+              onFocus={onFocus}
+              onOpenDetail={openAgent}
+            />
+          ) : null}
+        </Box>
+      )}
+      {notice ? (
+        <Box width={size.cols} paddingX={1}>
+          <Text color="cyan" wrap="truncate-end">
+            {notice}
+          </Text>
+        </Box>
+      ) : null}
+      {compose ? (
+        <Prompt
+          label={composeLabel(compose)}
+          value={compose.value}
+          width={size.cols}
+          onChange={(v) => setCompose((c) => (c ? { ...c, value: v } : c))}
+          onSubmit={submitCompose}
+          onCancel={() => setCompose(null)}
+        />
+      ) : searchRow ? (
+        <Search
+          query={search.query}
+          active={search.active}
+          width={size.cols}
+          onChange={(q) => setSearch((s) => ({ ...s, query: q }))}
+          onSubmit={() => setSearch((s) => ({ ...s, active: false }))}
+          onCancel={() => setSearch({ active: false, query: "" })}
+        />
+      ) : null}
+      <StatusBar
+        status={mesh.status}
+        rates={mesh.rates}
+        activeChannel={activeChannel}
+        agentCount={mesh.agents.length}
+        mode={mode}
+        canBack={!!onBack}
+        canWrite={!!canWrite}
+        canControl={!!canControl}
+        onRoster={onRoster}
+        width={size.cols}
+      />
+      {palette.active || newAgent ? <Box position="absolute" width={size.cols} height={size.rows}
+        alignItems="center" justifyContent="center">
+        {newAgent ? <NewAgent space={ep.space} width={size.cols} height={size.rows}
+          applications={extensionNames("connector")} defaultPersona={spawnPersona(undefined, [], { space: ep.space }).ref}
+          onLaunch={(input) => launchAgent({ ...controlCtx, space: ep.space }, input)}
+          onClose={() => setNewAgent(false)}
+          onBack={() => { setNewAgent(false); setPalette({ active: true, query: "" }); }} />
+          : <CommandPalette active query={palette.query} snapshot={mesh} canWrite={!!canWrite}
+            canControl={!!canControl} width={size.cols} readManaged={readPaletteAgents}
+            onChange={(query) => setPalette({ active: true, query })} onRun={runPaletteLine}
+            onNewAgent={() => { setPalette({ active: false, query: "" }); setNewAgent(true); }}
+            onCancel={() => setPalette({ active: false, query: "" })} />}
+      </Box> : null}
+    </Box>
+  );
+}

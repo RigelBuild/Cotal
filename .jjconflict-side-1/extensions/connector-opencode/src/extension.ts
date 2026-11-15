@@ -1,0 +1,323 @@
+import { execFileSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { resolve } from "node:path";
+import { registry, type Connector, type LaunchOpts, type LaunchSpec, type ModelCatalog, type ModelCatalogOpts, type ModelInfo } from "@cotal-ai/core";
+import { aclEnv, connectorLaunchOptions, eventChannel, launchArmsEvents, launchEnv, controlEndpoint, materialEnv, MODEL_PROVIDER_KEYS } from "@cotal-ai/connector-core";
+import { opencodeLine } from "./opencode-line.js";
+
+/** The bundled in-process plugin (esbuild → `dist/plugin/index.js`). A DIRECTORY target, not a
+ *  file: OpenCode 2.x drops a file plugin path (`configured plugin path must be a directory`)
+ *  but loads a directory whose `index.js` is the module. 1.x loads the same directory too — one
+ *  bundle target serves both lines. `opencode serve` loads
+ *  it by absolute path from the inline config, so it runs *inside* the server and shares its SDK
+ *  client. Resolved relative to this module — beside the built `dist/extension.js`, so the
+ *  connector must be built+bundled (`pnpm build`). */
+const PLUGIN_DIR = fileURLToPath(new URL("./plugin", import.meta.url));
+
+/** The launcher shim (`dist/serve.js`): starts `opencode serve` with the plugin, then attaches a
+ *  foreground `opencode` TUI to the exact session the plugin drives (see launch.ts). */
+const SERVE_SHIM = fileURLToPath(new URL("./serve.js", import.meta.url));
+
+function discoveryEnv(): NodeJS.ProcessEnv {
+  const env = { ...process.env };
+  delete env.OPENCODE_CONFIG_CONTENT;
+  for (const k of Object.keys(env)) if (k.startsWith("COTAL_")) delete env[k];
+  return env;
+}
+
+function execErrorMessage(e: unknown): string {
+  const err = e as Error & { stderr?: Buffer | string };
+  const stderr = Buffer.isBuffer(err.stderr) ? err.stderr.toString("utf8") : err.stderr;
+  return (stderr?.trim() || err.message).replace(/\s+/g, " ");
+}
+
+function readJsonBlock(lines: string[], start: number): { value: unknown; end: number } {
+  const parts: string[] = [];
+  for (let i = start; i < lines.length; i++) {
+    parts.push(lines[i]);
+    try {
+      return { value: JSON.parse(parts.join("\n")), end: i };
+    } catch {
+      // Keep accumulating the pretty-printed JSON object.
+    }
+  }
+  throw new Error("opencode models output ended before a model metadata JSON block closed");
+}
+
+function parseModels(stdout: string): ModelInfo[] {
+  const lines = stdout.split(/\r?\n/);
+  const models: ModelInfo[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    const id = lines[i].trim();
+    if (!/^[^\s/]+\/\S+$/.test(id)) continue;
+
+    let raw: Record<string, unknown> | undefined;
+    if (lines[i + 1]?.trim().startsWith("{")) {
+      const block = readJsonBlock(lines, i + 1);
+      i = block.end;
+      if (block.value && typeof block.value === "object" && !Array.isArray(block.value)) raw = block.value as Record<string, unknown>;
+    }
+
+    const variantsRaw = raw?.variants;
+    const variants = variantsRaw && typeof variantsRaw === "object" && !Array.isArray(variantsRaw)
+      ? Object.entries(variantsRaw as Record<string, unknown>)
+        .filter(([, v]) => !(v && typeof v === "object" && !Array.isArray(v) && (v as { disabled?: unknown }).disabled === true))
+        .map(([name, v]) => ({ name, ...(v && typeof v === "object" && !Array.isArray(v) ? { options: v as Record<string, unknown> } : {}) }))
+      : undefined;
+
+    const provider = typeof raw?.providerID === "string" ? raw.providerID : id.split("/", 1)[0];
+    models.push({
+      id,
+      provider,
+      ...(typeof raw?.name === "string" ? { name: raw.name } : {}),
+      ...(variants?.length ? { variants } : {}),
+    });
+  }
+  return models;
+}
+
+function listOpenCodeModels(opts: ModelCatalogOpts = {}): ModelCatalog {
+  const env = discoveryEnv();
+  // The file a launch runs: the operator pin, then the path boot resolved, then the bare name. The
+  // pin is read here because discoveryEnv strips every COTAL_* key, which is what keeps a catalog
+  // probe from looking like a managed seat. A later PATH change cannot pick a different file.
+  const bin = process.env.COTAL_OPENCODE_BIN?.trim() || opts.resolvedBinaries?.opencode || "opencode";
+  // Detect the line first (same rule launch.ts uses), on that file, before running any 2.x-incompatible
+  // subcommand: `opencode models --pure --verbose` exits 1 on 2.x with the help text rather than a
+  // real catalog.
+  const versionRaw = execFileSync(bin, ["--version"], {
+    encoding: "utf8",
+    env,
+    stdio: ["ignore", "pipe", "pipe"],
+  }).trim();
+  const line = opencodeLine(versionRaw, "opencode");
+  if (line === 2)
+    return {
+      models: [],
+      unavailable: "OpenCode 2.x serves its model catalog from a running opencode server, not the CLI; pass --model provider/model",
+    };
+  const args = ["models", "--pure", "--verbose"];
+  if (opts.refresh) args.push("--refresh");
+  try {
+    const stdout = execFileSync(bin, args, {
+      encoding: "utf8",
+      env,
+      stdio: ["ignore", "pipe", "pipe"],
+      maxBuffer: 16 * 1024 * 1024,
+    });
+    return { source: "opencode models --pure --verbose", models: parseModels(stdout) };
+  } catch (e) {
+    throw new Error(`opencode models failed: ${execErrorMessage(e)}`);
+  }
+}
+
+/**
+ * The OpenCode connector: launches a watchable `opencode` TUI bound to the agent's session, using
+ * OpenCode's client/server split (see launch.ts). The Cotal mesh bridge runs as an in-process plugin
+ * inside a headless `opencode serve`: it holds the {@link MeshAgent}, registers the cotal_* tools
+ * natively (from the shared specs, at parity with Claude Code), reports presence off the event bus,
+ * and owns ONE session it drives — injecting each incoming peer batch through the authenticated
+ * OpenCode server API on the same serve process the TUI attaches to. The shim then attaches a
+ * foreground TUI to that session, so a human watching sees the agent work and can type into it.
+ *
+ * Config rides in `OPENCODE_CONFIG_CONTENT` (inline JSON, the highest merge layer), so the
+ * operator's `~/.config/opencode` is never written.
+ * `permission:"allow"` keeps a supervised agent from stalling on a tool approval the human may not
+ * be at the keyboard to grant. Self-registers on import; the manager resolves it by type "opencode".
+ */
+export const opencodeConnector: Connector = {
+  kind: "connector",
+  name: "opencode",
+  supportsFreshStart: true,
+  requires: ["opencode"],
+  supportsModelVariant: true,
+  supportsPrompt: true, // OpenCode serves a first turn from an initial message — see buildLaunch
+  // OpenCode can spend longer than the generic 30s window bootstrapping a cold server before
+  // loading the plugin; readiness also checks that server's provider list before mesh presence.
+  readinessTimeoutMs: 120_000,
+  // Both plugins wake the session for a run turn and hand a once task over at most once.
+  supportsTurnRelay: true,
+  listModels: listOpenCodeModels,
+  // DECLARING THIS IS WHAT MAKES `--events` REACHABLE. Both the CLI and the manager refuse an armed
+  // launch whose connector does not implement it, before anything is provisioned, rather than mint a
+  // grant nothing will ever publish to. A connector that emits and does not say so here is refused
+  // at the door with its emitter complete and untouched.
+  //
+  // It is core's own derivation and is not re-derived here, so the channel the manager mints the
+  // grant for and the subject the session publishes to come from ONE function. A second derivation
+  // would be a second place the subject is decided, and the two would drift the first time either
+  // changed. It takes the PRINCIPAL: a display name is not an identity on this mesh, and a
+  // name-keyed channel would fuse two principals' streams onto one subject.
+  eventChannel,
+  buildLaunch(opts: LaunchOpts): LaunchSpec {
+    if (opts.continueSession) throw new Error("opencode connector does not support exact-session continuation");
+    // Resuming an existing session isn't wired for opencode: the connector runs `opencode serve` +
+    // a plugin that CREATES its own session then attaches a TUI, so a fork must plumb into
+    // session-creation (SDK fork / the serve attach), not argv. Throw rather than spawn fresh
+    // silently (no fallbacks). Tracked as a follow-up (issue #154).
+    if (opts.resume)
+      throw new Error(
+        "opencode connector: resuming an existing session (resume) is not implemented — it needs " +
+          "session-creation plumbing (SDK fork), not an argv flag. Tracked in issue #154.",
+      );
+    // Tool-sharing isn't wired for opencode: its OPENCODE_CONFIG_CONTENT is a merge layer, so an
+    // opencode agent already INHERITS the operator's MCP servers (the opposite default to Claude's
+    // strict isolation). A `connectors.opencode.mcpServers` entry would need inverse (opt-OUT)
+    // semantics that don't exist yet — throw rather than silently ignore it (no fallbacks).
+    if (opts.mcpServers && Object.keys(opts.mcpServers).length > 0)
+      throw new Error(
+        "opencode connector: tool-sharing (connectors.opencode.mcpServers) is not implemented. " +
+          "opencode agents currently inherit the operator's MCP servers through its config merge " +
+          "layer; restricting that down to a chosen subset needs an inverse opt-out filter, which " +
+          "is a separate feature.",
+      );
+    // Identity rides the process env: the plugin runs in the opencode process and inherits it.
+    // Provider inputs cross only through the connector's declared allow-list; spawn.env adds names.
+    // Minted before the env is built: the token goes into the launch material, the path into the env.
+    const control = controlEndpoint(opts.space, opts.name);
+    const env: Record<string, string> = {
+      ...launchEnv({ providerKeys: MODEL_PROVIDER_KEYS, envAllow: opts.envAllow }),
+      ...aclEnv(opts),
+      COTAL_SPACE: opts.space,
+      COTAL_NAME: opts.name,
+    };
+    // Preserve an operator's machine-wide COTAL_OPENCODE_BIN pin from launchEnv. The manager's
+    // boot-resolved executable is a fallback, not permission to overwrite that explicit choice.
+    if (opts.resolvedBinaries?.opencode) env.COTAL_OPENCODE_RESOLVED_BIN = opts.resolvedBinaries.opencode;
+    // The AG-UI event plane. Supporting connectors arm by default; `events: false` is the explicit
+    // opt-out. `COTAL_EVENTS` arms the emitter, and arming is not authorization: a
+    // publish grant on a channel is not a request to publish to it, so an agent file that can write
+    // `allowPublish` cannot turn on a stream of another seat's tool inputs and outputs by doing so.
+    // `COTAL_WORKSPACE_ROOT` rides with it because the emitter's write-ahead log has to live
+    // somewhere a LATER start will look, and there is no safe default: a log written under the
+    // launch cwd is invisible to the next start, which then reads an already-published thread as
+    // virgin and republishes sequences the stream has already seen. Sent only when events are on.
+    //
+    // This is deliberately NOT folded into `COTAL_OPENCODE_HOME` below, which falls back to the
+    // process cwd. That fallback is safe for a SQLite file and a pidfile, which only ever have to be
+    // found by the process that wrote them. It is not safe for the log, which exists to be found by
+    // a process that has not started yet.
+    if (launchArmsEvents(opts)) {
+      env.COTAL_EVENTS = "1";
+      if (!opts.workspaceRoot)
+        throw new Error(
+          "opencode connector: events were requested but the launch carries no workspaceRoot, so the " +
+            "event write-ahead log has nowhere to live that a later start would look. Refusing rather " +
+            "than defaulting to the working directory.",
+        );
+      env.COTAL_WORKSPACE_ROOT = opts.workspaceRoot;
+    }
+    if (opts.role) env.COTAL_ROLE = opts.role;
+    if (opts.id) env.COTAL_ID = opts.id;
+    if (opts.lifecycleUid) env.COTAL_LIFECYCLE_UID = opts.lifecycleUid;
+    if (opts.backfillFloor !== undefined) env.COTAL_BACKFILL_FLOOR = String(opts.backfillFloor);
+    if (opts.acceptedToken) env.COTAL_ACCEPTED_TOKEN = opts.acceptedToken;
+    // The auto-submitted first turn (`cotal spawn --prompt`). It rides the child ENV, the same
+    // carrier codex uses (COTAL_CODEX_PROMPT): the plugin runs inside `opencode serve`, which
+    // inherits this env, so the text reaches the one component that can issue a turn without going
+    // through argv (where the TUI would also see it) or through OPENCODE_CONFIG_CONTENT, which is
+    // opencode's own schema-validated surface and not ours to extend. A prompt with no text in it
+    // cannot be delivered as a turn, so refuse the launch rather than start a seat that ignores it.
+    if (opts.prompt !== undefined) {
+      const prompt = opts.prompt.trim();
+      if (!prompt)
+        throw new Error(
+          "opencode connector: an initial prompt was given but it is empty — there is no first turn to submit",
+        );
+      env.COTAL_OPENCODE_PROMPT = prompt;
+    }
+    // Where launch.ts roots this agent's SQLite DB + serve pidfile. Pin it to the manager's
+    // workspace root so a per-agent launch cwd (which the manager can point at any repo) doesn't
+    // drop `.cotal/opencode/<name>` into the target tree. Standalone `cotal spawn` has no manager
+    // workspace → root it at the launch dir (this process's cwd, which the child inherits), the
+    // prior behavior. launch.ts requires this env (no silent cwd fallback).
+    env.COTAL_OPENCODE_HOME = opts.workspaceRoot ?? process.cwd();
+
+    const config: Record<string, unknown> = {
+      $schema: "https://opencode.ai/config.json",
+      permission: "allow",
+      plugin: [PLUGIN_DIR],
+      // `/reconnect` — the manual recovery surface for a wedged mesh link. OpenCode has no
+      // host reconnect (unlike Claude Code's /mcp reconnect), and a plugin can't register a
+      // slash command via the Hooks API, so inject it through the config layer we already own.
+      // It's a TOOL-FORCING template: the human types /reconnect → one model turn whose only
+      // move is to call `cotal_reconnect` (in-process, local — it never rides the wedged link).
+      // The leading "Reconnecting…" reads as immediate TUI status; the rest is the imperative.
+      command: {
+        reconnect: {
+          description: "Rebuild this session's Cotal mesh connection (recovery from a wedged link)",
+          template:
+            "Reconnecting to the Cotal mesh… Call the cotal_reconnect tool now — do not explain, do not ask, just invoke it. Do not summarize — the tool reports its own status.",
+        },
+      },
+    };
+
+    // An agent file carries identity (read in-session via COTAL_AGENT_FILE) plus persona, which the
+    // plugin applies in-session (opencode has no `--append-system-prompt`).
+    if (opts.configPath) env.COTAL_AGENT_FILE = resolve(opts.configPath);
+    // The model/variant are config defaults (the session — and the attached TUI — use them). Pin
+    // them to a dedicated primary agent made the default, so an operator's own `default_agent` in
+    // ~/.config/opencode (with its own model) can't override what a Cotal spawn asks for — the session
+    // the plugin drives runs the persona's selectors, not the operator's default agent's.
+    const { model, variant } = opts;
+    const cotalAgent: Record<string, unknown> = { mode: "primary" };
+    if (model) {
+      config.model = model;
+      env.COTAL_MODEL = model;
+      cotalAgent.model = model;
+    }
+    if (variant) {
+      env.COTAL_VARIANT = variant;
+      cotalAgent.variant = variant;
+    }
+    // Opaque connector options → config for the cotal agent (the session the plugin drives), RAW
+    // passthrough: each option is merged into the agent config as-is and validated by opencode's own
+    // config schema. No deny-list — the spawn capability is the trust boundary (see
+    // connectorLaunchOptions), not the config keys. `mode`/`model`/`variant` are still set by the
+    // connector; an option of the same name simply overrides that default (last write wins), same as
+    // any other config field.
+    let hasLaunchOptions = false;
+    for (const [k, v] of connectorLaunchOptions("opencode", opts.launchOptions)) {
+      cotalAgent[k] = v;
+      hasLaunchOptions = true;
+    }
+    if (model || variant || hasLaunchOptions) {
+      config.agent = { cotal: cotalAgent };
+      config.default_agent = "cotal";
+    }
+
+    env.OPENCODE_CONFIG_CONTENT = JSON.stringify(config);
+
+    // Local control endpoint: the manager sends a cooperative {op:"shutdown"} here on a signal-less
+    // runtime (ConPTY/Windows), where a hard kill skips cleanup and the agent lingers until its
+    // presence TTL expires. The plugin (in the opencode server process) starts the control server and
+    // leaves the mesh cleanly on shutdown. Minted here; passed to the plugin in the child env (the
+    // token never on argv/logs) — opencode serve inherits this process env, the attached TUI strips
+    // COTAL_*. Returned in the LaunchSpec so the manager holds it in memory to drive the stop.
+    env.COTAL_CONTROL_SOCKET = control.path;
+
+    // Creds, broker URL and the control token ride a 0600 file; only its path is exported. It is
+    // written after every refusal above, and its directory is a launch artifact the launcher removes
+    // once the child has exited.
+    //
+    // The plugin drops even that path once it has read it, and WHERE it does so is the part worth
+    // stating: this connector's seat process is a shim that starts `opencode serve` and a TUI
+    // attached to it, and the plugin runs inside the SERVER. The server is also the process that
+    // executes the session's tool calls, so a shell this seat runs inherits neither the material
+    // nor a reference to it. The shim itself keeps the reference, because the server it starts is
+    // the reader; it runs no tools of its own.
+    const artifacts: string[] = [];
+    Object.assign(env, materialEnv({ creds: opts.creds, servers: opts.servers, controlToken: control.token, eventsRequired: opts.eventsRequired, userAuth: opts.userAuth }, artifacts));
+
+    // Run the shim (node dist/serve.js): `opencode serve` + an attached foreground TUI.
+    return {
+      command: process.execPath,
+      args: [SERVE_SHIM],
+      env,
+      control,
+      ...(artifacts.length > 0 ? { artifacts } : {}),
+    };
+  },
+};
+
+registry.register(opencodeConnector);

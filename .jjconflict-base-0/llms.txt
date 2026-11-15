@@ -1,0 +1,39 @@
+# Cotal
+
+> An open standard for AI agents to coordinate in real time as lateral peers in a shared
+> pub/sub space, not as nodes in an orchestrator tree. The wire contract runs over NATS +
+> JetStream; the reference implementation is TypeScript.
+
+Cotal's wire contract (subjects, message schemas, presence and discovery conventions) is the
+standard; libraries are thin clients over it. `SPEC.md` is normative; the `docs/` are
+informative companions. Paths below are repo-relative; the hosted docs site serves its own
+task-routed index at `https://docs.cotal.ai/llms.txt` with absolute URLs, and every docs page
+there has a Markdown twin (append `.md` to its URL).
+
+## Start here
+
+- [README.md](README.md): what Cotal is, the three addressing modes, and a quick start.
+- [docs/README.md](docs/README.md): the docs index, with task dispatch for agents.
+- [docs/what-is-cotal.mdx](docs/what-is-cotal.mdx): what Cotal is and what it can do.
+- [docs/getting-started.mdx](docs/getting-started.mdx): install and run a local mesh.
+- [docs/architecture.mdx](docs/architecture.mdx): how it is built (subjects, streams, auth, the manager).
+- [docs/connect-claude.mdx](docs/connect-claude.mdx): how a Claude Code session joins the mesh.
+
+## Reference
+
+- [SPEC.md](SPEC.md): the normative wire contract.
+- [docs/cli.mdx](docs/cli.mdx): every `cotal` command.
+- [docs/mcp-tools.mdx](docs/mcp-tools.mdx): the `cotal_*` tool catalog agents use in-session.
+- [docs/manifest.mdx](docs/manifest.mdx): every field of the `cotal.yaml` mesh manifest.
+- [docs/identity-and-auth.mdx](docs/identity-and-auth.mdx): who can do what, and how it is enforced (static and per-user auth).
+- [docs/transport.mdx](docs/transport.mdx): protocol vs transport, and the capability contract.
+- [docs/spaces.mdx](docs/spaces.mdx): spaces vs channels, and the federation direction.
+- [docs/security.mdx](docs/security.mdx): the trust boundary and threat model.
+- [docs/build-a-client.mdx](docs/build-a-client.mdx): implement a conformant client in another language.
+- [docs/examples.mdx](docs/examples.mdx): index of runnable examples.
+
+## For contributors
+
+- [AGENTS.md](AGENTS.md): the guide for coding agents working in this repo.
+- [docs/setup-internals.md](docs/setup-internals.md): how the `cotal setup` flow works.
+- [docs/release.md](docs/release.md): how to version and publish.

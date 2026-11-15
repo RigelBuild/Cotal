@@ -1,0 +1,40 @@
+{
+  "suite": [
+    "bin/smoke/install-probe-ci.smoke.ts"
+  ],
+  "guard": "pnpm smoke:install-probe-ci",
+  "command": "pnpm smoke:install-probe-ci",
+  "completionMarker": "SUITE COMPLETE",
+  "grades": "tool",
+  "proveWith": "pnpm mutation-proof --config bin/smoke/mutations/install-probe-ci.json",
+  "why": [
+    "Package-shape probing runs during candidate preparation before native qualification.",
+    "Each entry removes one structural invariant checked by the named cell."
+  ],
+  "mutations": [
+    {
+      "name": "the prepared candidate job is removed from cold setup",
+      "file": ".github/workflows/cold-setup.yml",
+      "find": "  candidate:\n    needs: [native, workspace-native]\n",
+      "replace": "  candidate-disabled:\n    needs: [native, workspace-native]\n",
+      "expectRed": "cold setup owns the pre-publication package-shape probe",
+      "cell": "cold setup owns the pre-publication package-shape probe"
+    },
+    {
+      "name": "native qualification stops depending on the probed candidate",
+      "file": ".github/workflows/cold-setup.yml",
+      "find": "    needs: candidate\n",
+      "replace": "    needs: []\n",
+      "expectRed": "native qualification depends on the probed candidate",
+      "cell": "native qualification depends on the probed candidate"
+    },
+    {
+      "name": "the probe script reference is removed from candidate preparation",
+      "file": ".github/workflows/cold-setup.yml",
+      "find": "        run: node scripts/post-publish-install-probe.mjs",
+      "replace": "        run: echo 'probe disabled'",
+      "expectRed": "cold candidate runs the post-publish-install-probe script",
+      "cell": "cold candidate runs the post-publish-install-probe script"
+    }
+  ]
+}

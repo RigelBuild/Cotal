@@ -1,0 +1,941 @@
+/**
+ * STARTUP RECONCILE availability smoke (#755) — a real JWT broker, real durable orphan slot
+ * rows, and a real Manager process. It proves the manager's typed control service is registered
+ * while its static-orphan terminal sweep is still running, rather than holding the instance lease
+ * while the whole space has no control plane.
+ *
+ * The fixture writes several ACTIVE orphan rows before start. The manager therefore cannot finish
+ * reconciliation before the first terminal transition lands. We await that first transition, then
+ * invoke `status` over the real ep.one rail. A green status reply while later slots remain ACTIVE
+ * proves overlap and availability before sweep completion. In the old serial start() order, that
+ * invocation has no service registration yet, so the assertion fails. Two-window heal-then-
+ * register is slower than empty-ledger stub terminals, so the fixture holds after the first
+ * retirement long enough for the control plane to come up while later rows stay ACTIVE.
+ *
+ * The sweep still owns a per-alias gate: a new spawn for an alias whose row is being reconciled is
+ * refused until that exact terminal attempt returns; it cannot race the terminal and reuse its name.
+ *
+ * Run: pnpm smoke:manager-reconcile-startup   (needs nats-server + node on PATH)
+ */
+import { createHash, randomUUID } from "node:crypto";
+import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { connect } from "@nats-io/transport-node";
+import { Kvm } from "@nats-io/kv";
+import { jetstream } from "@nats-io/jetstream";
+import {
+  createSpaceAuth,
+  CotalEndpoint,
+  CONTROL_DELIVERY_ADMIN,
+  evictDeniedPrincipalWithCreds,
+  evictDeniedPrincipalsWithCreds,
+  mintConnectionEvictorCreds,
+  mintCreds,
+  mintMembershipObserverCreds,
+  newIdentity,
+  deliveryBucket,
+  leaseKey,
+  principalKey,
+  mintCheckpoint,
+  mintLifecycleUid,
+  setupSpaceStreams,
+  standaloneConnectOpts,
+  DEV_OWNER,
+  recordsBucket,
+  actionContext,
+  bindGoal,
+  createGoal,
+  digestIdToken,
+  recordGoalIndex,
+  readGoalResult,
+  clearGoalIndex,
+  type GoalRef,
+  epAuthBucket,
+  epCall,
+  registry,
+  type AgentHandle,
+  type Connector,
+  type ControlReply,
+  type EpCaller,
+  type LaunchSpec,
+} from "@cotal-ai/core";
+import { authDir, createManagerInstanceIdentity, saveSpaceAuth, workspaceSecretStore } from "@cotal-ai/workspace";
+import { Manager } from "../src/manager.js";
+import { LegacyPtyRuntime } from "../src/runtime/pty.js";
+import { MANAGER_ENDPOINT, MANAGER_CONTRACTS } from "../src/manager-service-contract.js";
+import { activateStaticLifecycle, casStaticSlot, readStaticSlot, staticLifecycleTransport } from "../src/static-lifecycle.js";
+import { bootBroker } from "./_boot-broker.js";
+
+// The machine-home registry is not under test; a foreign or damaged record in the operator's
+// ~/.cotal must not refuse this suite's starts (loadMeshes reads every record it finds).
+for (const k of Object.keys(process.env)) if (k === "COTAL_HOME" || k.startsWith("COTAL_")) delete process.env[k];
+process.env.COTAL_HOME = mkdtempSync(join(tmpdir(), "cotal-reconcile-start-home-"));
+
+const ORPHANS = 8;
+const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+const until = async (condition: () => Promise<boolean>, ms: number): Promise<boolean> => {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    if (await condition()) return true;
+    await wait(25);
+  }
+  return false;
+};
+
+let pass = 0, fail = 0;
+const check = (name: string, condition: boolean, extra?: unknown): void => {
+  if (condition) { pass++; console.log(`  ✓ ${name}`); }
+  else { fail++; console.log(`  ✗ FAIL: ${name}`, extra === undefined ? "" : JSON.stringify(extra)); }
+};
+
+const space = `reconcile-start-${randomUUID().slice(0, 8)}`;
+const auth = await createSpaceAuth(space);
+const broker = await bootBroker(auth);
+const workspaceRoot = mkdtempSync(join(tmpdir(), "cotal-reconcile-start-ws-"));
+const managerInstanceId = mintLifecycleUid();
+mkdirSync(join(workspaceRoot, ".cotal", "agents"), { recursive: true });
+saveSpaceAuth(authDir(workspaceRoot), auth);
+const managerServeIdentity = newIdentity();
+createManagerInstanceIdentity(workspaceRoot, space, () => ({ instanceId: managerInstanceId, serveIdentity: managerServeIdentity }));
+for (let n = 0; n < ORPHANS; n++)
+  writeFileSync(join(workspaceRoot, ".cotal", "agents", `orphan-${n}.md`), `---\nname: orphan-${n}\nrole: worker\n---\nbody\n`);
+// The connector is deliberately valid. If the alias guard is removed, the request gets past
+// admission and must fail for a later lifecycle reason rather than being confused with a missing
+// connector refusal.
+const reconcileStub: Connector = {
+  kind: "connector",
+  name: "reconcile-stub",
+  requires: ["node"],
+  buildLaunch: (): LaunchSpec => { throw new Error("reconcile-stub: alias guard did not refuse"); },
+};
+registry.register(reconcileStub);
+
+const callerIdentity = newIdentity();
+const caller: EpCaller = { owner: DEV_OWNER, actor: callerIdentity.id, uid: mintLifecycleUid() };
+let manager: Manager | undefined;
+let callerNc: Awaited<ReturnType<typeof connect>> | undefined;
+let observerNc: Awaited<ReturnType<typeof connect>> | undefined;
+let delivery: CotalEndpoint | undefined;
+
+/** An ACTIVE durable static row with no manager-owned process: the exact orphan shape after a crash. */
+async function writeOrphan(alias: string): Promise<void> {
+  const identity = newIdentity();
+  const lifecycleUid = mintLifecycleUid();
+  const creds = await mintCreds(auth, newIdentity(), "lifecycle-executor", {
+    lifecycleExecutor: { owner: DEV_OWNER, actor: identity.id, lifecycleUid, alias },
+  });
+  const nc = await connect({ servers: broker.servers, ...standaloneConnectOpts({ creds, tls: false }), maxReconnectAttempts: 0 });
+  try {
+    const kvm = new Kvm(nc);
+    const transport = staticLifecycleTransport(await kvm.open(recordsBucket(space)), await kvm.open(epAuthBucket(space)));
+    await activateStaticLifecycle(transport, { owner: DEV_OWNER, alias, actor: identity.id, lifecycleUid, managerInstance: managerInstanceId, ownerInstanceId: managerInstanceId });
+    const current = await readStaticSlot(transport, DEV_OWNER, alias);
+    if (!current) throw new Error(`missing just-created slot ${alias}`);
+    await casStaticSlot(transport, { ...current.row, phase: "active" }, current.revision);
+  } finally {
+    await nc.drain().catch(() => nc.close());
+  }
+}
+
+async function phase(alias: string): Promise<string | undefined> {
+  const records = await new Kvm(observerNc!).open(recordsBucket(space));
+  return (await readStaticSlot(staticLifecycleTransport(records, records), DEV_OWNER, alias))?.row.phase;
+}
+
+try {
+  await setupSpaceStreams({ servers: broker.servers, space, creds: await mintCreds(auth, newIdentity(), "provisioner") });
+  const observerCreds = await mintMembershipObserverCreds(auth, newIdentity());
+  const evictorCreds = await mintConnectionEvictorCreds(auth, newIdentity());
+  const deliveryIdentity = newIdentity();
+  delivery = new CotalEndpoint({
+    space,
+    servers: broker.servers,
+    creds: await mintCreds(auth, deliveryIdentity, "delivery"),
+    card: { id: deliveryIdentity.id, name: "delivery", role: "delivery", kind: "endpoint" },
+    channels: [],
+    consume: false,
+    registerPresence: false,
+    watchPresence: false,
+    watchChannels: false,
+  });
+  delivery.on("error", () => {});
+  await delivery.start();
+  // The #1694 binding needs a real holder: this fixture daemon acquires `lease.0` itself (the
+  // endpoint's own acquire stamps its principal AND incarnation), so its answer carries
+  // `holdsDeliveryLease: true` against a row the manager can read. The SR1 block below retires
+  // this row and re-acquires it for its own holder responder.
+  await delivery.acquireDeliveryLease(0).catch(() => {});
+  delivery.serveControl(CONTROL_DELIVERY_ADMIN, async (req): Promise<ControlReply> => {
+    if (req.op === "reloadStoreIdentity") {
+      // The answerer's wire identity and its LIVE lease claim, computed exactly as the shipped
+      // daemon-side op computes it.
+      let holds = false;
+      try {
+        const own = await delivery!.readDeliveryLeaseEntry(0);
+        holds = own !== undefined && delivery!.ownsDeliveryLease(own.info);
+      } catch { holds = false; }
+      return {
+        ok: true,
+        data: {
+          identity: workspaceSecretStore(workspaceRoot).identity,
+          responder: principalKey("local", deliveryIdentity.id).key,
+          holdsDeliveryLease: holds,
+        },
+      };
+    }
+    if (req.op === "lifecycleMemberships") return { ok: true, data: { complete: true, channels: [] } };
+    // A restarting manager evicts its superseded serve family as one set (the daemon's batch op),
+    // executed by core's shipped batch sweep.
+    if (req.op === "evictPrincipals") {
+      const principals = (req.args as { principals?: string[] })?.principals ?? [];
+      return {
+        ok: true,
+        data: await evictDeniedPrincipalsWithCreds({
+          servers: broker.servers,
+          observerCreds,
+          evictorCreds,
+          accountId: auth.account.pub,
+          principals,
+        }),
+      };
+    }
+    if (req.op !== "evictPrincipal") return { ok: false, error: `unsupported delivery-admin op "${req.op}"` };
+    const principal = String((req.args as { principal?: unknown })?.principal ?? "");
+    return {
+      ok: true,
+      data: await evictDeniedPrincipalWithCreds({
+        servers: broker.servers,
+        observerCreds,
+        evictorCreds,
+        accountId: auth.account.pub,
+        principal,
+      }),
+    };
+  }, { boundReply: true });
+  for (let n = 0; n < ORPHANS; n++) await writeOrphan(`orphan-${n}`);
+
+  observerNc = await connect({
+    servers: broker.servers,
+    ...standaloneConnectOpts({ creds: await mintCreds(auth, newIdentity(), "provisioner"), tls: false }),
+    maxReconnectAttempts: 0,
+  });
+  callerNc = await connect({
+    servers: broker.servers,
+    ...standaloneConnectOpts({
+      creds: await mintCreds(auth, callerIdentity, "agent", {
+        lifecycleUid: caller.uid,
+        endpointCapabilities: [
+          { endpoint: MANAGER_ENDPOINT, command: "status" },
+          { endpoint: MANAGER_ENDPOINT, command: "spawn" },
+        ],
+      }),
+      tls: false,
+    }),
+    maxReconnectAttempts: 0,
+  });
+
+  manager = new Manager({ space, servers: broker.servers, runtime: "pty", workspaceRoot });
+  // These orphan rows carry no custody reference; a custodial runtime would rightly retain them as
+  // `no-reference` (custody-fail-closed covers that). This suite tests reconcile mechanics, so it
+  // runs the non-custodial pty runtime, whose reap has nothing to prove.
+  (manager as unknown as { runtime: LegacyPtyRuntime }).runtime = new LegacyPtyRuntime();
+  const retirement = manager as unknown as {
+    driveStaticRetirement(agent: { id: string; name: string; lifecycleUid: string }, orphan: boolean): Promise<void>;
+  };
+  const driveStaticRetirement = retirement.driveStaticRetirement.bind(manager);
+  let heldAfterFirst = false;
+  retirement.driveStaticRetirement = async (agent, orphan) => {
+    await driveStaticRetirement(agent, orphan);
+    if (heldAfterFirst) return;
+    heldAfterFirst = true;
+    await wait(5_000);
+  };
+  const starting = manager.start();
+
+  const firstTerminalStarted = await until(async () => (await phase("orphan-0")) !== "active", 20_000);
+  check("a real orphan terminal began (the fixture reached startup reconciliation)", firstTerminalStarted, { phase: await phase("orphan-0") });
+
+  // Registration itself has several broker round trips. Wait until the real ep rail answers, but
+  // require that a later planned orphan is still active at that moment: a serial startup cannot
+  // satisfy both conditions.
+  let status: Awaited<ReturnType<typeof epCall>> | undefined;
+  let statusError: string | undefined;
+  const statusWhileReconciling = await until(async () => {
+    try {
+      status = await epCall(
+        callerNc!,
+        space,
+        { mode: "one" },
+        { endpoint: MANAGER_ENDPOINT, command: "status", contract: MANAGER_CONTRACTS.status, caller },
+        { deadlineMs: 1_000, currentEpoch: async () => 0 },
+      );
+      return status.reply.ok === true && (await phase(`orphan-${ORPHANS - 1}`)) === "active";
+    } catch (error) {
+      statusError = (error as Error).message;
+      return false;
+    }
+  }, 20_000);
+  check(
+    "status serves while later orphan rows remain ACTIVE (manager is not globally unavailable during reconcile)",
+    statusWhileReconciling,
+    { reply: status?.reply, statusError, lastPhase: await phase(`orphan-${ORPHANS - 1}`) },
+  );
+
+  // Drive the *same* entry point as the served spawn handler, but await its inner lifecycle path:
+  // `spawn` is an ACTION and returns its acceptance before that path finishes, so a wire reply alone
+  // cannot distinguish an alias gate from a later failure. The real service/control proof is above;
+  // this waits for the actual alias admission verdict and proves the no-race guard it relies on.
+  const directSpawn = await manager.startAgent({ name: `orphan-${ORPHANS - 1}`, agent: "reconcile-stub" });
+  check(
+    "spawn for an alias still reconciling is refused by its reconcile gate before lifecycle provisioning",
+    directSpawn.ok === false && /still reconciling/i.test(directSpawn.error ?? ""),
+    directSpawn,
+  );
+
+  // THE SEAT'S TURN RELAY HAS THE SAME BOOT WINDOW, and its empty answer is worse than a refusal:
+  // a seat reads `{turns: []}` as "you hold nothing" and a `not-found` yield as "drop it", while it
+  // reads a refusal as "keep what you hold". Between registration and `reconcileGoalIndex` the
+  // pending-turn index holds nothing a predecessor accepted, so both doors have to refuse.
+  {
+    const booting = new Manager({ space, servers: broker.servers, runtime: "pty", workspaceRoot });
+    (booting as unknown as { runtime: LegacyPtyRuntime }).runtime = new LegacyPtyRuntime();
+    const doors = booting as unknown as {
+      turnPendingFor: (c: { owner: string; actor: string; uid: string }) => unknown;
+      serveTurnYield: (c: { owner: string; actor: string; uid: string }, raw: Record<string, unknown>) => Promise<{ goalId: string; state: string }>;
+    };
+    const seat = { owner: "local", actor: "seat", uid: "u1" };
+    const pull = ((): { code?: string; message?: string } | "served" => {
+      try { doors.turnPendingFor(seat); return "served"; } catch (e) { return e as { code?: string; message?: string }; }
+    })();
+    check("a seat pulling turns before the goal index is rebuilt is REFUSED, never told it holds none",
+      pull !== "served" && (pull as { code?: string }).code === "unavailable"
+        && /still reconciling/i.test((pull as { message?: string }).message ?? ""), pull);
+    const yielded = await doors.serveTurnYield(seat, { goalId: "g", status: "done" })
+      .then(() => "served" as const, (e: unknown) => e as { code?: string; message?: string });
+    check("and a yield in the same window is refused rather than answered not-found",
+      yielded !== "served" && (yielded as { code?: string }).code === "unavailable"
+        && /still reconciling/i.test((yielded as { message?: string }).message ?? ""), yielded);
+
+    // ONCE THE INDEX IS REBUILT, an ELAPSED turn is still not servable. Only the oldest unsettled
+    // turn per seat is handed over, so an expired one at the head dammed every later turn for that
+    // seat: its own run has already thrown from its pause and its hold is expirable, so the seat
+    // would be sent work whose yield is refused, and the live turn behind it would never surface.
+    const seeded = booting as unknown as {
+      goalReconcileDone: boolean;
+      pendingTurns: Map<string, Record<string, unknown>>;
+    };
+    seeded.goalReconcileDone = true;
+    const turnRow = (goalId: string, acceptedAt: number, deadlineAt: number) => ({
+      ref: { endpoint: "m", caller: { owner: seat.owner, actor: seat.actor, uid: seat.uid }, goalId },
+      goalId, seat: { name: "s", ...seat }, payload: goalId, acceptedAt, deadlineAt,
+      holdToken: goalId.padEnd(20, "0"), holdEpoch: 0,
+    });
+    const t0 = Date.now();
+    seeded.pendingTurns.set("stale", turnRow("stale", t0 - 60_000, t0 - 1_000));
+    seeded.pendingTurns.set("live", turnRow("live", t0 - 30_000, t0 + 60_000));
+    const served = doors.turnPendingFor(seat) as { turns: { goalId: string }[] };
+    check("an ELAPSED turn is not served and does not dam the seat's queue: the live one behind it surfaces",
+      served.turns.length === 1 && served.turns[0]?.goalId === "live", served);
+
+    // A YIELD WHOSE REPLY WAS LOST. The commit deletes the pending turn, so the retry found
+    // nothing and heard `not-found` — which a seat reads as "drop it", reporting failure for work
+    // the run already has. The answer the first reply carried is served again instead.
+    const retryDoors = seeded as unknown as {
+      goalWriter?: unknown;
+      turnAcceptances: Map<string, { acceptance: Record<string, unknown>; leftoverSince?: number; settled?: { state: string; at: number } }>;
+      sweepTurnDeadlines: () => Promise<void>;
+    };
+    retryDoors.goalWriter = { ctx: {} };
+    seeded.pendingTurns.delete("stale");
+    seeded.pendingTurns.delete("live");
+    retryDoors.turnAcceptances.set("done-already", {
+      acceptance: { name: "s", owner: seat.owner, actor: seat.actor, uid: seat.uid, goalId: "done-already", fingerprint: "f", deadlineAt: t0 + 60_000, executor: { lifecycleUid: "x", epoch: 0 } },
+      settled: { state: "succeeded", at: Date.now() },
+    });
+    const retried = await doors.serveTurnYield(seat, { goalId: "done-already", status: "done" })
+      .then((r) => r as { goalId: string; state: string }, (e: unknown) => e as { code?: string; message?: string });
+    check("a retried yield is served the answer the lost reply carried, never `not-found`",
+      (retried as { state?: string }).state === "succeeded", retried);
+    const stranger = { owner: "local", actor: "someone-else", uid: "u2" };
+    const refusedRetry = await doors.serveTurnYield(stranger, { goalId: "done-already", status: "done" })
+      .then(() => "served" as const, (e: unknown) => e as { code?: string });
+    check("and only to the addressee it was addressed to",
+      refusedRetry !== "served" && (refusedRetry as { code?: string }).code === "not-found", refusedRetry);
+
+    // AND THE ANSWER IS NOT KEPT FOREVER. It exists for the window a lost reply is retried in;
+    // holding it past that is one entry per turn for the process lifetime, which is what the map
+    // used to be. The sweep is what drops it.
+    retryDoors.turnAcceptances.set("long-done", {
+      acceptance: { name: "s", owner: seat.owner, actor: seat.actor, uid: seat.uid, goalId: "long-done", fingerprint: "f", deadlineAt: t0, executor: { lifecycleUid: "x", epoch: 0 } },
+      settled: { state: "succeeded", at: Date.now() - 10 * 60_000 },
+    });
+    await retryDoors.sweepTurnDeadlines();
+    check("the sweep drops a settled answer once its retry window has passed, and keeps a fresh one",
+      !retryDoors.turnAcceptances.has("long-done") && retryDoors.turnAcceptances.has("done-already"),
+      [...retryDoors.turnAcceptances.keys()]);
+    // A FAILED DEADLINE COMMIT leaves an acceptance with no `settled` (pending was the latch
+    // and is already gone). That entry used to pin the sweep forever once maybeStopTurnSweep
+    // stopped wiping the map. Age it off leftoverSince (when the latch dropped), NEVER off
+    // deadlineAt: a turn that expired after a long outage would otherwise be pruned on the
+    // first tick and take the GoalRef with it. The two clocks are inverted so aging off
+    // deadlineAt cannot pass.
+    retryDoors.turnAcceptances.set("stale-unsettled", {
+      acceptance: { name: "s", owner: seat.owner, actor: seat.actor, uid: seat.uid, goalId: "stale-unsettled", fingerprint: "f", deadlineAt: Date.now() + 60_000, executor: { lifecycleUid: "x", epoch: 0 } },
+      leftoverSince: Date.now() - 10 * 60_000,
+    });
+    retryDoors.turnAcceptances.set("fresh-unsettled", {
+      acceptance: { name: "s", owner: seat.owner, actor: seat.actor, uid: seat.uid, goalId: "fresh-unsettled", fingerprint: "f", deadlineAt: t0 - 10 * 60_000, executor: { lifecycleUid: "x", epoch: 0 } },
+      leftoverSince: Date.now(),
+    });
+    await retryDoors.sweepTurnDeadlines();
+    check("the sweep drops a stale unsettled acceptance once its retry window has passed, and keeps a fresh one",
+      !retryDoors.turnAcceptances.has("stale-unsettled") && retryDoors.turnAcceptances.has("fresh-unsettled"),
+      [...retryDoors.turnAcceptances.keys()]);
+    retryDoors.turnAcceptances.delete("fresh-unsettled");
+    // AND THE SWEEP STOPS ONCE THE LAST ANSWER IS GONE. The settle-time callers of the stop check
+    // run when an answer has just been remembered, so they never see the map empty; the prune is
+    // the one event after which nothing is owed, and it is the sweep's own to notice.
+    const sweepDoors = seeded as unknown as { turnSweepTimer?: unknown; ensureTurnSweep: () => void };
+    retryDoors.turnAcceptances.set("done-already", {
+      acceptance: retryDoors.turnAcceptances.get("done-already")!.acceptance,
+      settled: { state: "succeeded", at: Date.now() - 10 * 60_000 },
+    });
+    sweepDoors.ensureTurnSweep();
+    check("the sweep runs while a settled answer is still within its window", sweepDoors.turnSweepTimer !== undefined);
+    await retryDoors.sweepTurnDeadlines();
+    check("and stops itself once the prune leaves it nothing to do: no pending turn, no answer to serve",
+      sweepDoors.turnSweepTimer === undefined && retryDoors.turnAcceptances.size === 0,
+      { timer: sweepDoors.turnSweepTimer !== undefined, answers: retryDoors.turnAcceptances.size });
+  }
+
+  await starting;
+  const sweepSettled = await until(async () => (await phase(`orphan-${ORPHANS - 1}`)) === "retired", 20_000);
+  check("startup sweep completes after the manager has served", sweepSettled, { phase: await phase(`orphan-${ORPHANS - 1}`) });
+
+  // THE BOOT SWEEP ADOPTING A PREDECESSOR'S ACCEPTED TURN. Two things were wrong with it and both
+  // are invisible from outside: the agents map is EMPTY during reconcile (seats re-register later,
+  // on the resume path), so "not in the map" was read as "dead" and every adopted turn was stamped
+  // as addressing a dead seat — its deadline terminal then carried `agentDownAt` and the run raised
+  // L4002 where the reference says L4003. And a goal whose spec could not be read had its
+  // acceptance time replaced with the BOOT INSTANT, which sorts it behind every turn accepted
+  // since: a predecessor's oldest turn served last, by a queue whose whole job is oldest-first.
+  {
+    const adopting = new Manager({ space, servers: broker.servers, runtime: "pty", workspaceRoot });
+    (adopting as unknown as { runtime: LegacyPtyRuntime }).runtime = new LegacyPtyRuntime();
+    const doors = adopting as unknown as {
+      managerInstanceId: string;
+      goalWriter?: unknown;
+      pendingTurns: Map<string, { acceptedAt: number; seatDiedAt?: number; seat: { name: string } }>;
+      adoptTurnGoal: (e: { ref: GoalRef; iid: string; allocated?: { name: string; owner?: string; actor: string; uid: string }; note?: string }) => Promise<void>;
+    };
+    // The fixture writes through the LIVE manager's own goal-writer connection: these records are
+    // the ones a manager writes, and no other credential in this suite may write them.
+    const live = manager as unknown as { goalWriter?: { nc: unknown; ctx: Parameters<typeof bindGoal>[0]; identity: unknown } };
+    const gw = live.goalWriter;
+    if (gw === undefined) throw new Error("the live manager has no goal-writer connection; the adoption fixture cannot write its goal");
+    const actx = gw.ctx;
+    doors.goalWriter = gw;
+    // An unstarted Manager has no instance id yet (start() mints or restores one). The hold below
+    // is minted under an instance id, and the goal-writer cred may schedule only under the LIVE
+    // manager's, so the adopting incarnation presents as that instance: the shape a restart has,
+    // where the successor reads the predecessor's records under the same persisted id.
+    doors.managerInstanceId = (manager as unknown as { managerInstanceId: string }).managerInstanceId;
+    // The schedule publish is pinned to the serving instance's EPOCH as well as its id (the
+    // goal-writer's egress rows), so the hold is minted under the live manager's serve epoch,
+    // exactly what the accept path stamps as `holdEpoch`.
+    const serveEpoch = (manager as unknown as { serviceServe?: { grant: { epoch: number } } }).serviceServe?.grant.epoch ?? 0;
+    const seatUid = mintLifecycleUid();
+    const runner: EpCaller = { owner: "local", actor: "runner", uid: mintLifecycleUid() };
+    // The manager keys a relay, and derives its hold, by the caller triple plus the goal id.
+    const relayKey = (id: string) => `${runner.owner}.${runner.actor}.${runner.uid}.${id}`;
+    // The hold token is the manager's own derivation (a module-private function), built here from
+    // the same input so the fixture's hold is the one the yield path claims.
+    const holdTokenOf = (id: string) => digestIdToken(`${relayKey(id)}:turn-deadline`);
+    const goalId = "g".repeat(43);
+    const ref: GoalRef = { endpoint: MANAGER_ENDPOINT, caller: runner, goalId };
+    const ACCEPTED_AT = Date.now() - 90_000;
+    await bindGoal(actx, ref, "fp-adopt");
+    await createGoal(actx, ref, {
+      fingerprint: "fp-adopt", command: "turn",
+      caller: { id: `${runner.owner}.${runner.actor}`, lifecycleUid: runner.uid },
+      acceptedEpoch: 0, requestId: goalId, sourceSeq: 0, acceptedAt: ACCEPTED_AT, readinessDeadlineMs: 600_000,
+      // The §13.6 target pin the accept path writes: the yield's commit proves the executor's
+      // currency against it, and a goal with no pin is refused there as a wiring confusion.
+      target: { owner: "local", actor: "seat9", lifecycleUid: seatUid, mappingRevision: 0 },
+    });
+    const allocated = { name: "adopted-seat", owner: "local", actor: "seat9", uid: seatUid };
+    const DEADLINE_AT = Date.now() + 600_000;
+    // The note records the hold token, as the accept path writes it.
+    const noteOf = (id: string) => JSON.stringify({ payload: "do the thing", deadlineAt: DEADLINE_AT, holdEpoch: serveEpoch, holdToken: holdTokenOf(id) });
+    const note = noteOf(goalId);
+    await recordGoalIndex(actx, ref, doors.managerInstanceId, allocated, note);
+    // The turn's HOLD, minted exactly as the accept path mints it: the record over the goal-writer's
+    // KV, the `.schedule` request over the SERVE connection (the timer row is the serving instance's
+    // own, SPEC 13.9; the goal-writer holds none, and minting over it is broker-denied). The yield
+    // claims the hold, so a fixture without it is a turn no seat could ever yield.
+    const serveJs = jetstream((manager as unknown as { serviceServe: { nc: Parameters<typeof jetstream>[0] } }).serviceServe.nc);
+    await mintCheckpoint(actx.kv, serveJs, space, {
+      ref: { endpoint: MANAGER_ENDPOINT, token: holdTokenOf(goalId) },
+      instanceId: doors.managerInstanceId, epoch: serveEpoch,
+      goal: { caller: runner, goalId },
+      holder: { id: MANAGER_ENDPOINT, lifecycleUid: doors.managerInstanceId },
+      deadline: DEADLINE_AT, now: ACCEPTED_AT,
+    });
+
+    await doors.adoptTurnGoal({ ref, iid: doors.managerInstanceId, allocated, note });
+    const adopted = doors.pendingTurns.get(relayKey(goalId));
+    check("the boot sweep adopts a predecessor's accepted turn back into the pending index",
+      adopted !== undefined && adopted.seat.name === "adopted-seat", adopted);
+    check("stamped with the acceptance time its goal RECORDS, never the instant the manager booted",
+      adopted?.acceptedAt === ACCEPTED_AT, { recorded: ACCEPTED_AT, adopted: adopted?.acceptedAt });
+    check("and NOT marked as addressing a dead seat: an empty agents map at boot is not evidence of death",
+      adopted?.seatDiedAt === undefined, adopted?.seatDiedAt);
+    // AND THE ADOPTED TURN'S ANSWER IS REMEMBERED. Adoption rebuilt the pending relay and not the
+    // acceptance the retry answer is remembered against, so a yield whose reply was lost after a
+    // restart heard `not-found` on the one path adoption exists for. The seat yields once (the
+    // reply is "lost"), then retries the same goal and must hear the answer it earned.
+    const adoptDoors = adopting as unknown as {
+      serveTurnYield: (c: { owner: string; actor: string; uid: string }, raw: Record<string, unknown>) => Promise<{ goalId: string; state: string }>;
+      goalReconcileDone: boolean;
+    };
+    adoptDoors.goalReconcileDone = true;
+    // The yield's commit proves the executor's LIVE currency against the agents map (a seat that
+    // died between its yield and the commit refuses `expired`); the adopting manager here never
+    // started, so its map is empty and the fixture registers the seat the way a resume would.
+    let adoptedState: "running" | "exited" = "running";
+    const adoptedHandle: AgentHandle = {
+      name: allocated.name, kind: "fixture",
+      status: () => adoptedState,
+      stop: () => { adoptedState = "exited"; },
+      waitForExit: async () => {},
+      interrupt: () => {},
+      attach: () => { throw new Error("adopted turn fixture has no terminal session"); },
+    };
+    const adoptedPersonaPath = join(workspaceRoot, ".cotal", "agents", `${allocated.name}.md`);
+    const adoptedPersona = `---\nname: ${allocated.name}\n---\nAdopted turn fixture.\n`;
+    writeFileSync(adoptedPersonaPath, adoptedPersona);
+    const adoptedEntry = {
+      id: allocated.actor, name: allocated.name, lifecycleUid: seatUid,
+      agent: "reconcile-stub", spawner: `${runner.owner}.${runner.actor}`, startedAt: ACCEPTED_AT,
+      handle: adoptedHandle,
+      launch: {
+        source: {
+          kind: "persona" as const, ref: allocated.name, configPath: adoptedPersonaPath,
+          configSha256: createHash("sha256").update(adoptedPersona).digest("hex"),
+        },
+        cwd: workspaceRoot, allowSubscribe: [], events: false,
+      },
+    };
+    const adoptedAgents = (adopting as unknown as { agents: Map<string, typeof adoptedEntry> }).agents;
+    adoptedAgents.set(allocated.name, adoptedEntry);
+    const adoptedSeat = { owner: "local", actor: allocated.actor, uid: seatUid };
+    const asValue = (e: unknown) => ({ code: (e as { code?: string }).code, message: String((e as Error).message).slice(0, 200) });
+    const first = await adoptDoors.serveTurnYield(adoptedSeat, { goalId, status: "done" }).then((r) => r, asValue);
+    const retried = await adoptDoors.serveTurnYield(adoptedSeat, { goalId, status: "done" }).then((r) => r, asValue);
+    check("an adopted turn yields, and a retry of that yield is served the answer it earned, never `not-found`",
+      (first as { state?: string }).state === "succeeded" && (retried as { state?: string }).state === "succeeded",
+      { first, retried });
+
+    // A RELAY RECORD WITH NO HOLD. The hold is minted after the index entry and the goal record,
+    // so a crash between them leaves exactly this shape. Adopted, it would be a pending turn
+    // nothing can settle: the sweep would try to expire a pause that was never minted, every tick,
+    // and its seat could never yield it. Left unsettled instead, said once.
+    const holdless = "h".repeat(43);
+    const holdlessRef: GoalRef = { endpoint: MANAGER_ENDPOINT, caller: runner, goalId: holdless };
+    await bindGoal(actx, holdlessRef, "fp-holdless");
+    await createGoal(actx, holdlessRef, {
+      fingerprint: "fp-holdless", command: "turn",
+      caller: { id: `${runner.owner}.${runner.actor}`, lifecycleUid: runner.uid },
+      acceptedEpoch: 0, requestId: holdless, sourceSeq: 0, acceptedAt: ACCEPTED_AT, readinessDeadlineMs: 600_000,
+      target: { owner: "local", actor: "seat9", lifecycleUid: seatUid, mappingRevision: 0 },
+    });
+    await recordGoalIndex(actx, holdlessRef, doors.managerInstanceId, allocated, noteOf(holdless));
+    await doors.adoptTurnGoal({ ref: holdlessRef, iid: doors.managerInstanceId, allocated, note: noteOf(holdless) });
+    check("a turn whose hold was never minted is not adopted as pending: nothing could settle it",
+      !doors.pendingTurns.has(relayKey(holdless)) && !(adopting as unknown as { turnAcceptances: Map<string, unknown> }).turnAcceptances.has(relayKey(holdless)),
+      { pending: doors.pendingTurns.has(relayKey(holdless)) });
+
+    // A FLOOR THAT NAMES NO OWNER, the record an older manager wrote with the owner in its note.
+    // The seat is read from the floor alone, so this relay is garbled and left, hold and all.
+    const ownerless = "o".repeat(43);
+    const ownerlessRef: GoalRef = { endpoint: MANAGER_ENDPOINT, caller: runner, goalId: ownerless };
+    await bindGoal(actx, ownerlessRef, "fp-ownerless");
+    await createGoal(actx, ownerlessRef, {
+      fingerprint: "fp-ownerless", command: "turn",
+      caller: { id: `${runner.owner}.${runner.actor}`, lifecycleUid: runner.uid },
+      acceptedEpoch: 0, requestId: ownerless, sourceSeq: 0, acceptedAt: ACCEPTED_AT, readinessDeadlineMs: 600_000,
+      target: { owner: "local", actor: "seat9", lifecycleUid: seatUid, mappingRevision: 0 },
+    });
+    const ownerlessFloor = { name: allocated.name, actor: allocated.actor, uid: seatUid };
+    const olderNote = JSON.stringify({ ...(JSON.parse(noteOf(ownerless)) as object), owner: "local" });
+    await recordGoalIndex(actx, ownerlessRef, doors.managerInstanceId, ownerlessFloor, olderNote);
+    await mintCheckpoint(actx.kv, serveJs, space, {
+      ref: { endpoint: MANAGER_ENDPOINT, token: holdTokenOf(ownerless) },
+      instanceId: doors.managerInstanceId, epoch: serveEpoch,
+      goal: { caller: runner, goalId: ownerless },
+      holder: { id: MANAGER_ENDPOINT, lifecycleUid: doors.managerInstanceId },
+      deadline: DEADLINE_AT, now: ACCEPTED_AT,
+    });
+    await doors.adoptTurnGoal({ ref: ownerlessRef, iid: doors.managerInstanceId, allocated: ownerlessFloor, note: olderNote });
+    check("a turn whose floor names no owner is not adopted, even with an owner in its note",
+      !doors.pendingTurns.has(relayKey(ownerless)), { pending: doors.pendingTurns.get(relayKey(ownerless)) });
+
+    // #1262: a late yield after the deadline committed. The CI flake is not "the deny lost to a
+    // success" — the deny held — and it is not the durable goal-index drop itself: the yield path
+    // never consults that index. After commitTurnDeadline deletes the pending entry (the latch is
+    // the delete, BEFORE the terminal CAS) the only in-memory answer a late yield can find is
+    // turnAcceptances.settled. Two orderings both happen on a live manager and both have to name
+    // the terminal the goal actually reached, never `not-found`:
+    //
+    //   1. terminal committed, index still present, settled answer not yet remembered
+    //      (the window between pendingTurns.delete and rememberSettledTurn; also the window a
+    //      concurrent sweep's maybeStopTurnSweep can clear turnAcceptances while the commit is
+    //      still in flight, so rememberSettledTurn no-ops)
+    //   2. terminal committed AND the index already cleared (the state the auth-mesh smoke's
+    //      resultOf wait actually observes before it yields)
+    //
+    // Forced here through the same serveTurnYield door, after the durable deny is on the plane,
+    // by dropping the in-memory maps the yield currently consults. No live timer, no broker
+    // perturbation: the hold is minted already-due so expireCheckpoint is the shipped owner
+    // expiry, and commitTurnDeadline is the shipped deny. Two goal ids, because the index
+    // entry is create-only and cannot be restored after a clear.
+    const LATE_ACCEPTED = Date.now() - 5_000;
+    const LATE_DEADLINE = Date.now() - 1_000;
+    const lateDoors = adopting as unknown as {
+      pendingTurns: Map<string, {
+        ref: GoalRef; goalId: string;
+        seat: { name: string; owner: string; actor: string; uid: string };
+        payload: string; acceptedAt: number; deadlineAt: number;
+        holdToken: string; holdEpoch: number;
+      }>;
+      turnAcceptances: Map<string, { acceptance: Record<string, unknown>; ref?: GoalRef; leftoverSince?: number; settled?: { state: string; at: number } }>;
+      expireTurnHold: (p: { ref: GoalRef; goalId: string; holdToken: string }) => Promise<{ settle?: string } | undefined>;
+      commitTurnDeadline: (p: { ref: GoalRef; goalId: string; holdToken: string; seat: { name: string; owner: string; actor: string; uid: string }; payload: string; acceptedAt: number; deadlineAt: number; holdEpoch: number }) => Promise<void>;
+      serveTurnYield: (c: { owner: string; actor: string; uid: string }, raw: Record<string, unknown>) => Promise<{ goalId: string; state: string }>;
+    };
+    const armLate = async (goalId: string, fingerprint: string) => {
+      const ref: GoalRef = { endpoint: MANAGER_ENDPOINT, caller: runner, goalId };
+      const lateNote = JSON.stringify({ payload: "too late", deadlineAt: LATE_DEADLINE, holdEpoch: serveEpoch });
+      await bindGoal(actx, ref, fingerprint);
+      await createGoal(actx, ref, {
+        fingerprint, command: "turn",
+        caller: { id: `${runner.owner}.${runner.actor}`, lifecycleUid: runner.uid },
+        acceptedEpoch: 0, requestId: goalId, sourceSeq: 0, acceptedAt: LATE_ACCEPTED, readinessDeadlineMs: 1_000,
+        target: { owner: "local", actor: allocated.actor, lifecycleUid: seatUid, mappingRevision: 0 },
+      });
+      await recordGoalIndex(actx, ref, doors.managerInstanceId, allocated, lateNote);
+      const holdToken = holdTokenOf(goalId);
+      await mintCheckpoint(actx.kv, serveJs, space, {
+        ref: { endpoint: MANAGER_ENDPOINT, token: holdToken },
+        instanceId: doors.managerInstanceId, epoch: serveEpoch,
+        goal: { caller: runner, goalId },
+        holder: { id: MANAGER_ENDPOINT, lifecycleUid: doors.managerInstanceId },
+        deadline: LATE_DEADLINE, now: LATE_ACCEPTED,
+      });
+      const pending = {
+        ref, goalId,
+        seat: { name: allocated.name, owner: "local" as const, actor: allocated.actor, uid: seatUid },
+        payload: "too late", acceptedAt: LATE_ACCEPTED, deadlineAt: LATE_DEADLINE,
+        holdToken, holdEpoch: serveEpoch,
+      };
+      lateDoors.pendingTurns.set(relayKey(goalId), pending);
+      lateDoors.turnAcceptances.set(relayKey(goalId), {
+        acceptance: {
+          name: allocated.name, owner: "local", actor: allocated.actor, uid: seatUid, goalId,
+          fingerprint, deadlineAt: LATE_DEADLINE,
+          executor: { lifecycleUid: doors.managerInstanceId, epoch: serveEpoch },
+        },
+        ref,
+      });
+      return { ref, pending };
+    };
+
+    {
+      const lateId = "d".repeat(43);
+      const { ref, pending } = await armLate(lateId, "fp-late-1");
+      const expired = await lateDoors.expireTurnHold(pending);
+      check("a due hold the manager owns expires as `expired` (the deny's predicate)",
+        expired?.settle === "expired", expired);
+      await lateDoors.commitTurnDeadline(pending);
+      const deniedLate = await readGoalResult(actx, ref);
+      check("the deadline deny is the goal's terminal, reason `turn-deadline`; no success over it",
+        deniedLate?.state === "failed" && (deniedLate.data as { reason?: string } | undefined)?.reason === "turn-deadline",
+        deniedLate);
+      const stamped = lateDoors.turnAcceptances.get(relayKey(lateId));
+      check("commitTurnDeadline stamps leftoverSince when the pending latch drops, not the original deadline",
+        typeof stamped?.leftoverSince === "number" && stamped.leftoverSince > LATE_DEADLINE,
+        stamped);
+      // Ordering 1: terminal committed, index still present (we skip the clear), settled
+      // answer not remembered. This is the window between pendingTurns.delete and
+      // rememberSettledTurn (and the window a concurrent sweep's maybeStopTurnSweep can
+      // drop the settled field while leaving the acceptance the yield still addresses).
+      lateDoors.pendingTurns.delete(relayKey(lateId));
+      const kept1 = lateDoors.turnAcceptances.get(relayKey(lateId));
+      if (kept1) delete kept1.settled;
+      const afterCommitBeforeIndexDrop = await lateDoors.serveTurnYield(adoptedSeat, { goalId: lateId, status: "done" }).then((r) => r, asValue);
+      check("a yield after the deny committed, before the index drop, is told the turn ended failed, never `not-found`",
+        (afterCommitBeforeIndexDrop as { state?: string }).state === "failed"
+          && (afterCommitBeforeIndexDrop as { code?: string }).code !== "not-found",
+        afterCommitBeforeIndexDrop);
+      check("and that late yield did not record a success over the deny",
+        (await readGoalResult(actx, ref))?.state === "failed", await readGoalResult(actx, ref));
+    }
+
+    {
+      const lateId = "e".repeat(43);
+      const { ref, pending } = await armLate(lateId, "fp-late-2");
+      await lateDoors.expireTurnHold(pending);
+      await lateDoors.commitTurnDeadline(pending);
+      // Ordering 2: terminal committed AND the index already cleared — the auth-mesh smoke's
+      // observed state when it yields after resultOf returns the deny.
+      await clearGoalIndex(actx, ref);
+      lateDoors.pendingTurns.delete(relayKey(lateId));
+      const kept2 = lateDoors.turnAcceptances.get(relayKey(lateId));
+      if (kept2) delete kept2.settled;
+      const afterIndexDrop = await lateDoors.serveTurnYield(adoptedSeat, { goalId: lateId, status: "done" }).then((r) => r, asValue);
+      check("a yield after the deny committed AND the index dropped is still told the turn ended failed, never `not-found`",
+        (afterIndexDrop as { state?: string }).state === "failed"
+          && (afterIndexDrop as { code?: string }).code !== "not-found",
+        afterIndexDrop);
+      check("and that late yield did not record a success over the deny either",
+        (await readGoalResult(actx, ref))?.state === "failed", await readGoalResult(actx, ref));
+    }
+
+    await adopting.stop({ withAgents: true }).catch(() => {});
+  }
+
+  // ── SR1 (#1694): a queue-grouped NON-HOLDER answering the store-identity challenge ──
+  //
+  // The delivery-admin rail is a queue group: EVERY process holding a `delivery` credential for the
+  // space is bound, while only the holder of `lease.0` reloads standing credentials. Two responders
+  // are stood up here — the LEASE HOLDER (a real acquire of `lease.0`, answering with a FOREIGN
+  // store so the identity comparison alone would refuse it) and a NON-HOLDER (bound only after the
+  // reproduction manager has started, naming the manager's own store). The ownership decision is
+  // then driven through the public renewal pass (`claimDaemonRenewalOwnership` → start() and every
+  // timer tick) until the non-holder answers.
+  //
+  // RED-FIRST HISTORY: at base eac62fec8 the second cell below asserted `daemonRenewalOwner ===
+  // true` — the manager read "shared" off the non-holder's bare store identity and TOOK the renewal
+  // lease (reproduced green; see the lane notes). The reply now carries the #1694 binding, so the
+  // same drive must refuse: an honest non-holder is refused by its own claim, and the lease row
+  // (which names the holder) refuses it twice over.
+  {
+    // Retire the fixture daemon's row BEFORE anything closes (a release at the BROKER's current
+    // revision, the shipped pattern), so the holder below can acquire the shard.
+    const fixtureRev = (await delivery!.readDeliveryLeaseEntry(0))?.revision;
+    await (delivery as unknown as {
+      releaseDeliveryLease(s: number, rev?: number): Promise<void>;
+    }).releaseDeliveryLease(0, fixtureRev);
+    await manager!.stop({ withAgents: true }).catch(() => {});
+    await delivery!.stop().catch(() => {});
+
+    // THE HOLDER: a real endpoint that acquires lease.0 itself (principal + incarnation stamped by
+    // the endpoint's own acquire, exactly the shipped shape) and answers with a foreign store.
+    const holderId = newIdentity();
+    const CARD = (id: string) => principalKey("local", id).key;
+    const evict = async (req: { op: string; args?: unknown }): Promise<ControlReply> => {
+      if (req.op === "lifecycleMemberships") return { ok: true, data: { complete: true, channels: [] } };
+      if (req.op === "evictPrincipals") {
+        const principals = (req.args as { principals?: string[] })?.principals ?? [];
+        return {
+          ok: true,
+          data: await evictDeniedPrincipalsWithCreds({
+            servers: broker.servers, observerCreds, evictorCreds, accountId: auth.account.pub, principals,
+          }),
+        };
+      }
+    if (req.op !== "evictPrincipal") return { ok: false, error: `unsupported delivery-admin op "${req.op}"` };
+      const principal = String((req.args as { principal?: unknown })?.principal ?? "");
+      return {
+        ok: true,
+        data: await evictDeniedPrincipalWithCreds({
+          servers: broker.servers, observerCreds, evictorCreds, accountId: auth.account.pub, principal,
+        }),
+      };
+    };
+    const holder = new CotalEndpoint({
+      space,
+      servers: broker.servers,
+      creds: await mintCreds(auth, holderId, "delivery"),
+      card: { id: holderId.id, name: "delivery-holder", role: "delivery", kind: "endpoint" },
+      channels: [], consume: false, registerPresence: false, watchPresence: false, watchChannels: false,
+    });
+    holder.on("error", () => {});
+    await holder.start();
+    let holderAnswers = 0;
+    let holderStore: "foreign" | "manager-own" = "foreign";
+    const holderSub = holder.serveControl(CONTROL_DELIVERY_ADMIN, async (req): Promise<ControlReply> => {
+      if (req.op === "reloadStoreIdentity") {
+        holderAnswers++;
+        // The reply carries the #1694 binding: the answerer's wire identity and its LIVE lease
+        // claim, computed exactly as the shipped daemon-side op computes it. The store flips from
+        // foreign (start refused as divergent) to the manager's own (a later pass takes the lease)
+        // for the blocker-2 staging below.
+        const own = await holder.readDeliveryLeaseEntry(0);
+        const holds = own !== undefined && holder.ownsDeliveryLease(own.info);
+        return {
+          ok: true,
+          data: {
+            identity: workspaceSecretStore(holderStore === "foreign" ? join(workspaceRoot, "holder-store") : workspaceRoot).identity,
+            responder: CARD(holderId.id),
+            holdsDeliveryLease: holds,
+          },
+        };
+      }
+      return evict(req);
+    }, { boundReply: true });
+    // Acquire the freed shard as THIS holder; the acquire stamps principal + incarnation.
+    await holder.acquireDeliveryLease(0);
+
+    // The reproduction manager: SAME root as the stopped one (its instance identity file is
+    // persisted, so this is the restart shape). It starts while the holder is the sole responder:
+    // a foreign store is the ordinary "divergent" pass, so the start itself is clean.
+    const sr1 = new Manager({ space, servers: broker.servers, runtime: "pty", workspaceRoot });
+    await sr1.start();
+    const doors = sr1 as unknown as {
+      daemonRenewalOwner: boolean;
+      renewDaemonCreds: () => Promise<void>;
+    };
+
+    // THE NON-HOLDER: same rail, no lease, names the MANAGER'S OWN store — the answer a bare
+    // identity could not tell apart from the holder's, and the one that produced the false
+    // "shared" at base. Bound AFTER the start so the start's own challenge cannot hit it.
+    const nonHolderId = newIdentity();
+    const nonHolder = new CotalEndpoint({
+      space,
+      servers: broker.servers,
+      creds: await mintCreds(auth, nonHolderId, "delivery"),
+      card: { id: nonHolderId.id, name: "delivery-nonholder", role: "delivery", kind: "endpoint" },
+      channels: [], consume: false, registerPresence: false, watchPresence: false, watchChannels: false,
+    });
+    nonHolder.on("error", () => {});
+    await nonHolder.start();
+    let nonHolderAnswers = 0;
+    nonHolder.serveControl(CONTROL_DELIVERY_ADMIN, async (req): Promise<ControlReply> => {
+      if (req.op === "reloadStoreIdentity") {
+        nonHolderAnswers++;
+        // A DISHONEST non-holder — the attack #1694 actually files: the row names the other
+        // responder, and a responder that does not hold the lease can assert that it does. The
+        // claim alone must never carry the pass; the binding test (row holder != answerer) is
+        // what refuses this answer.
+        return {
+          ok: true,
+          data: { identity: workspaceSecretStore(workspaceRoot).identity, responder: CARD(nonHolderId.id), holdsDeliveryLease: true },
+        };
+      }
+      return evict(req);
+    }, { boundReply: true });
+
+    check("the challenge CAN be driven to the non-holder (the queue group answered from it)",
+      await until(async () => { await doors.renewDaemonCreds(); return nonHolderAnswers > 0; }, 30_000),
+      { nonHolderAnswers, holderAnswers });
+    check("a NON-HOLDER answer with the manager's own store is REFUSED: the manager does not take the renewal lease (#1694)",
+      doors.daemonRenewalOwner === false,
+      { daemonRenewalOwner: doors.daemonRenewalOwner, nonHolderAnswers, holderAnswers });
+
+    // ROUND 2, blocker 2 REPRODUCTION SHAPE: a manager that already HELD the renewal lease must
+    // LOSE it when a later pass refuses. This manager started while the holder answered with a
+    // FOREIGN store, so it never held the lease — the cells below stage the held-lease state
+    // explicitly before driving the refusal.
+
+    // ── the absence half of #1694: a no-responder rail outcome is settled from the lease row ──
+    //
+    // The rail's own "no responder" is not evidence of absence: it is reachable while a live holder
+    // owns the shard (the responder unbound, or an answer in a shape the client reads as that
+    // error). Case 1: BOTH responder subscriptions come off the rail while the holder still owns
+    // lease.0, so requestDeliveryAdmin throws the no-responder shape with a holder on record.
+    //
+    // ROUND 2, blocker 2: the manager driving the refusal must first HOLD the renewal lease, or a
+    // kept lease cannot be observed. This block re-points the holder's store answer at THIS
+    // manager's root and drives a pass while the holder still answers, so the pass reads "shared"
+    // and takes the lease; THEN the responders come off the rail for the refusal.
+    holderStore = "manager-own";
+    const tookLease = await until(async () => { await doors.renewDaemonCreds(); return doors.daemonRenewalOwner === true; }, 30_000);
+    check("the manager held the renewal lease before the refusal (started shared, then the responder answered its store)",
+      tookLease && doors.daemonRenewalOwner === true, { daemonRenewalOwner: doors.daemonRenewalOwner });
+
+    await nonHolder.stop().catch(() => {});
+    try { holderSub.unsubscribe(); } catch { /* already closed */ }
+    let refusal = "";
+    const holderRow = await (sr1 as unknown as {
+      ep: { readDeliveryLeaseEntry(s: number): Promise<{ info: { holder: string } } | undefined> };
+    }).ep.readDeliveryLeaseEntry(0);
+    check("the row still names the holder while the rail has no responder (the ambiguous state)",
+      holderRow !== undefined && typeof holderRow.info.holder === "string" && holderRow.info.holder.length > 0,
+      holderRow);
+    // The refusal is LOUD and RECORDED, never fatal (each daemon's own timer is the backstop), so
+    // it surfaces on the renewal pass's own error channel — capture that channel, not a rethrow.
+    const said: string[] = [];
+    const origSay = console.error;
+    console.error = (...a: unknown[]) => { said.push(a.map(String).join(" ")); };
+    try { await doors.renewDaemonCreds(); }
+    catch (e) { refusal = (e as Error).message; }
+    finally { console.error = origSay; }
+    const passLog = said.join("\n");
+    check("a no-responder rail while the row names a holder REFUSES (undetermined, never absent) and the manager holds no renewal lease",
+      (refusal.includes("names a holder") || passLog.includes("names a holder")) && doors.daemonRenewalOwner === false,
+      { refusal, passLog, daemonRenewalOwner: doors.daemonRenewalOwner });
+
+    // ROUND 2, blocker 1: the row EXISTS (a live PUT) but its bytes do not parse. The core reader
+    // swallows the parse failure into `undefined`, so this reads as no-row → "absent" → the manager
+    // takes the renewal lease over a lease row it could not read. Staged by publishing raw
+    // unparseable bytes to lease.0 under the holder's own delivery cred (the sole lease-key
+    // writer), then driving the same public pass.
+    {
+      const bucket = await (holder as unknown as {
+        deliveryRegistry(): Promise<{ update(k: string, v: Uint8Array, rev: number): Promise<number>; get(k: string): Promise<{ revision: number } | undefined> }>;
+      }).deliveryRegistry();
+      const row = await bucket.get(leaseKey(0));
+      await bucket.update(leaseKey(0), new TextEncoder().encode("{not-json"), row!.revision);
+    }
+    let unreadableRefusal = "";
+    const said2: string[] = [];
+    const origSay2 = console.error;
+    console.error = (...a: unknown[]) => { said2.push(a.map(String).join(" ")); };
+    try { await doors.renewDaemonCreds(); }
+    catch (e) { unreadableRefusal = (e as Error).message; }
+    finally { console.error = origSay2; }
+    check("a lease row that EXISTS but does not parse is UNREADABLE, not absent: the pass refuses and the manager holds no renewal lease",
+      (unreadableRefusal.includes("could not read") || said2.join("\n").includes("could not read")) && doors.daemonRenewalOwner === false,
+      { unreadableRefusal, passLog: said2.join("\n"), daemonRenewalOwner: doors.daemonRenewalOwner });
+
+    // Case 3: the corrupt row is REPLACED with a holderless one (a row that names no holder —
+    // `bucket.update` under the holder's own cred, the one lease-key writer) and the rail still
+    // reports no responder. Today's "absent" must survive: the same manager's next pass may take
+    // the lease. (Deleting the whole stream would take the bucket away, and "bucket missing" is
+    // an undetermined read, not an absent row.)
+    {
+      const bucket = await (holder as unknown as {
+        deliveryRegistry(): Promise<{ update(k: string, v: Uint8Array, rev: number): Promise<number>; get(k: string): Promise<{ revision: number } | undefined> }>;
+      }).deliveryRegistry();
+      const row = await bucket.get(leaseKey(0));
+      await bucket.update(leaseKey(0), new TextEncoder().encode(JSON.stringify({ holder: "", since: Date.now(), ready: false })), row!.revision);
+    }
+    await holder.stop().catch(() => {});
+    let absentRefusal = "";
+    try { await doors.renewDaemonCreds(); }
+    catch (e) { absentRefusal = (e as Error).message; }
+    check("a holderless or absent lease row with no responder reads ABSENT: the manager may take the renewal lease (the daemon is not bound yet)",
+      absentRefusal === "" && doors.daemonRenewalOwner === true,
+      { absentRefusal, daemonRenewalOwner: doors.daemonRenewalOwner });
+
+    await sr1.stop({ withAgents: true }).catch(() => {});
+  }
+
+
+} finally {
+  await callerNc?.drain().catch(() => callerNc?.close());
+  await observerNc?.drain().catch(() => observerNc?.close());
+  await manager?.stop({ withAgents: true }).catch(() => {});
+  await delivery?.stop().catch(() => {});
+  await broker.stop().catch(() => {});
+}
+
+const EXPECTED_CELLS = 33;
+console.log(`\n${fail === 0 ? "MANAGER RECONCILE STARTUP SMOKE OK ✅" : "MANAGER RECONCILE STARTUP SMOKE FAILED"}  (${pass} passed, ${fail} failed)`);
+if (pass + fail !== EXPECTED_CELLS) {
+  console.log(`SUITE INCOMPLETE — ran ${pass + fail} of ${EXPECTED_CELLS} cells; a partial run is not a pass`);
+  process.exit(1);
+}
+process.exit(fail === 0 ? 0 : 1);

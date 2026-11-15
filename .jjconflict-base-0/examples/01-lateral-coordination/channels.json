@@ -1,0 +1,13 @@
+{
+  "defaults": { "replay": true },
+  "channels": {
+    "general": { "description": "Open coordination — anyone, anything." },
+    "review": {
+      "replay": false,
+      "description": "Design critique. State the claim, then the critique.",
+      "instructions": "Reply only to new claims, not the backlog. Keep it tight."
+    },
+    "commands": { "replay": false, "description": "Fast control chatter — no history replay." },
+    "decisions": { "replay": true, "replayWindow": "7d", "description": "Durable record of what was decided and why." }
+  }
+}

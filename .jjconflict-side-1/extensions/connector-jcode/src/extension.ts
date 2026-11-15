@@ -1,0 +1,232 @@
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { join, resolve } from "node:path";
+import { userJcodeHome } from "@1jehuang/jcode-sdk";
+import { registry, type Connector, type LaunchOpts, type LaunchSpec, type ModelCatalog, type ModelInfo, type OnceSeat } from "@cotal-ai/core";
+import { aclEnv, connectorLaunchOptions, controlEndpoint, eventChannel, launchArmsEvents, launchEnv, materialEnv } from "@cotal-ai/connector-core";
+import { parse as parseToml } from "smol-toml";
+import { JCODE_READINESS_TIMEOUT_MS } from "./readiness-bound.js";
+import { discardOnceReceipt, retireOnceTree } from "./private-lifecycle.js";
+import { jcodeForkRecordPath, jcodeSeatHome, ownedJcodeFork, readJcodeForkSource } from "./session-fork.js";
+
+const FROM_BUILD = import.meta.url.includes("/dist/");
+const HOST_ENTRY = fileURLToPath(new URL(`./${FROM_BUILD ? "host.js" : "host-main.ts"}`, import.meta.url));
+const HOST_COMMAND = FROM_BUILD
+  ? process.execPath
+  : fileURLToPath(new URL("../node_modules/.bin/tsx", import.meta.url));
+
+type JcodeCatalogConfig = {
+  providers?: Record<string, {
+    model_catalog?: unknown;
+    models?: unknown;
+  }>;
+};
+
+function stringList(value: unknown): string[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string" || !item.trim()))
+    throw new Error("reasoning_efforts must be an array of non-empty strings");
+  return value.map((item) => item.trim());
+}
+
+/** Read the same operator config Jcode copies into each private instance. This is a DECLARED local
+ *  catalog, not a provider acceptance probe: live providers on the same host have rejected tiers
+ *  declared here, so the metadata marks that distinction instead of presenting it as authority. */
+export function listJcodeModels(): ModelCatalog {
+  const path = join(userJcodeHome(), "config.toml");
+  let text: string;
+  try {
+    text = readFileSync(path, "utf8");
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    throw new Error(`jcode model catalog could not read Jcode config: unreadable${code ? ` (${code})` : ""}`);
+  }
+
+  let raw: JcodeCatalogConfig;
+  try {
+    raw = parseToml(text) as JcodeCatalogConfig;
+  } catch {
+    throw new Error("jcode model catalog could not parse Jcode config: malformed TOML");
+  }
+
+  const providers = raw.providers;
+  if (!providers || typeof providers !== "object")
+    throw new Error("jcode model catalog has no [providers] table in Jcode config");
+
+  const models: ModelInfo[] = [];
+  const seen = new Set<string>();
+  let enabledProviders = 0;
+  for (const [provider, config] of Object.entries(providers)) {
+    if (!config || typeof config !== "object" || config.model_catalog !== true) continue;
+    enabledProviders++;
+    if (!Array.isArray(config.models))
+      throw new Error(`jcode model catalog provider ${provider} enables model_catalog but has no [[providers.${provider}.models]] entries`);
+    for (const [index, value] of config.models.entries()) {
+      if (!value || typeof value !== "object" || Array.isArray(value))
+        throw new Error(`jcode model catalog provider ${provider} entry ${index + 1} is not a table`);
+      const entry = value as Record<string, unknown>;
+      const id = typeof entry.id === "string" ? entry.id.trim() : "";
+      if (!id) throw new Error(`jcode model catalog provider ${provider} entry ${index + 1} has no non-empty id`);
+      const key = `${provider}\0${id}`;
+      if (seen.has(key)) throw new Error(`jcode model catalog repeats ${provider}/${id}`);
+      seen.add(key);
+      const efforts = stringList(entry.reasoning_efforts);
+      models.push({
+        id,
+        provider,
+        ...(efforts?.length
+          ? {
+              variants: efforts.map((name) => ({
+                name,
+                options: {
+                  provenance: "declared-config",
+                  authoritative: false,
+                  warning: "declared by Jcode config; provider acceptance is validated only at launch",
+                },
+              })),
+            }
+          : {}),
+      });
+    }
+  }
+
+  if (!enabledProviders)
+    throw new Error("jcode model catalog has no provider with model_catalog = true in Jcode config");
+  if (!models.length)
+    throw new Error(`jcode model catalog enabled ${enabledProviders} provider(s) in Jcode config but declared no models`);
+  return { source: "declared Jcode config", models };
+}
+
+/**
+ * Jcode's stable Harness API is the supported integration seam: the host creates one private
+ * `JcodeClient.launch()` instance and drives its one session. The managed JCODE_HOME also contains
+ * a per-seat `.jcode/mcp.json`, so the harness spawns this package's stdio MCP bridge and calls the
+ * shared cotal_* tool surface without inheriting Cotal's launch material.
+ */
+export const jcodeConnector: Connector = {
+  kind: "connector",
+  name: "jcode",
+  requires: ["jcode"],
+  // Jcode may download model material, bring up its MCP bridge, then run a provider-backed
+  // cotal_orientation turn before it joins. A generic 30s presence window is therefore not a
+  // verdict for this connector; keep the manager's wait bounded but long enough for that required
+  // bootstrap sequence (#827).
+  readinessTimeoutMs: JCODE_READINESS_TIMEOUT_MS,
+  // variant = Jcode's per-session reasoning effort (`set_reasoning_effort`). The accepted surface is
+  // per provider/profile/model. RuntimeInfo verifies the active route before the tier is carried
+  // verbatim to Jcode, which owns the capability and ladder decisions.
+  supportsModelVariant: true,
+  supportsToolListAnnounce: true, // MCP McpServer.registerTool; SDK fires tools/list_changed
+  supportsPrompt: true, // Jcode serves a first turn from an initial message — see buildLaunch
+  // `--resume` forks the named session from the operator's Jcode home into the seat's private home
+  // before its instance starts (session-fork.ts). The seat owns the copy; the source is only read.
+  supportsResume: true,
+  // The host wakes the session for a run turn and hands a once task over at most once. A once
+  // seat's Jcode server outlives its host when the host dies without teardown, so its exit is not
+  // the end of the task until retireAfterExit proves that tree gone.
+  supportsTurnRelay: true,
+  async retireAfterExit(seat: OnceSeat) {
+    const home = jcodeSeatHome(seat.workspaceRoot, seat.space, seat.name);
+    await retireOnceTree(home, seat.lifecycleUid);
+    return { discard: async () => discardOnceReceipt(home, seat.lifecycleUid) };
+  },
+  eventChannel,
+  listModels: listJcodeModels,
+  launchHint: "starting Jcode and joining the mesh (first boot can take several minutes)",
+
+  buildLaunch(opts: LaunchOpts): LaunchSpec {
+    if (process.platform === "win32")
+      throw new Error("jcode connector is not supported on Windows — Jcode's released Harness API bridge is a Unix-socket surface");
+    if (opts.continueSession)
+      throw new Error("jcode connector does not support exact-session continuation — its private Harness API instance is retired with the seat");
+    // Read the source here so a missing or unreadable transcript refuses before the seat launches. A
+    // seat that already owns its fork continues it without the source, which may since have gone.
+    const resumeHome = opts.resume ? userJcodeHome() : undefined;
+    const seatHome = jcodeSeatHome(opts.workspaceRoot ?? process.cwd(), opts.space, opts.name);
+    if (opts.resume && !ownedJcodeFork(seatHome, opts.resume))
+      readJcodeForkSource(resumeHome!, opts.resume);
+    if (opts.mcpServers && Object.keys(opts.mcpServers).length > 0)
+      throw new Error("jcode connector: tool-sharing (connectors.jcode.mcpServers) is not implemented — the connector owns the private MCP configuration that carries cotal_*");
+
+    const control = controlEndpoint(opts.space, opts.name);
+    const env: Record<string, string> = {
+      ...launchEnv({ envAllow: opts.envAllow }),
+      ...aclEnv(opts),
+      COTAL_SPACE: opts.space,
+      COTAL_NAME: opts.name,
+      COTAL_CONTROL_SOCKET: control.path,
+      COTAL_JCODE_HOME: opts.workspaceRoot ?? process.cwd(),
+    };
+    if (opts.resolvedBinaries?.jcode) env.COTAL_JCODE_BIN = opts.resolvedBinaries.jcode;
+    // The host forks from the same home this launch validated, not from whatever its own env resolves.
+    if (opts.resume) {
+      env.COTAL_JCODE_RESUME = opts.resume;
+      env.COTAL_JCODE_RESUME_HOME = resumeHome!;
+    }
+    if (opts.role) env.COTAL_ROLE = opts.role;
+    if (opts.id) env.COTAL_ID = opts.id;
+    if (opts.lifecycleUid) env.COTAL_LIFECYCLE_UID = opts.lifecycleUid;
+    // A once seat records every native launch under its uid, so its tree can be proved gone after
+    // its host exits.
+    if (opts.once) {
+      if (!opts.lifecycleUid) throw new Error("jcode connector: a once seat needs its lifecycle uid to record what it launches");
+      env.COTAL_JCODE_ONCE = "1";
+    }
+    if (opts.backfillFloor !== undefined) env.COTAL_BACKFILL_FLOOR = String(opts.backfillFloor);
+    if (opts.acceptedToken) env.COTAL_ACCEPTED_TOKEN = opts.acceptedToken;
+    // Like Codex, the TUI decision belongs to the process that builds this launch. A foreground
+    // spawn reads the operator shell; a detached spawn is built in the manager and reads its env.
+    // Copied by name because launchEnv does not inherit ambient COTAL_* (this name is per-launch).
+    const tui = process.env.COTAL_JCODE_TUI?.trim();
+    if (tui) env.COTAL_JCODE_TUI = tui;
+
+    // The AG-UI event plane. Supporting connectors arm by default; `events: false` is the explicit
+    // opt-out. `COTAL_EVENTS` arms the emitter, while the eventChannel declaration
+    // above is what lets the CLI or manager grant the matching subject. A grant alone is not a
+    // request to publish. The workspace root rides with the arm because the durable cursor and WAL
+    // must live somewhere a restarted host can find again.
+    if (launchArmsEvents(opts)) {
+      if (!opts.workspaceRoot)
+        throw new Error("jcode connector: events require a workspace root for durable AG-UI state");
+      env.COTAL_EVENTS = "1";
+      env.COTAL_WORKSPACE_ROOT = opts.workspaceRoot;
+    }
+
+    if (opts.prompt !== undefined) {
+      const prompt = opts.prompt.trim();
+      if (!prompt)
+        throw new Error("jcode connector: an initial prompt was given but it is empty — there is no first turn to submit");
+      env.COTAL_JCODE_PROMPT = prompt;
+    }
+
+    if (opts.configPath) env.COTAL_AGENT_FILE = resolve(opts.configPath);
+    if (opts.model) env.COTAL_MODEL = opts.model;
+    if (opts.variant) env.COTAL_VARIANT = opts.variant;
+
+    // The Harness API exposes model selection, but no stable generic equivalent to arbitrary
+    // CLI/config overrides. Do not accept `--opt` merely because Jcode's TUI has flags: an option
+    // this host cannot render would otherwise look honored while being dropped.
+    const launchOptions = connectorLaunchOptions("jcode", opts.launchOptions);
+    if (launchOptions.length)
+      throw new Error(
+        `jcode connector: launch options are not supported by the Harness API host (first option: ${launchOptions[0][0]})`,
+      );
+
+    // Creds, broker URL and the control token ride a 0600 file written after every refusal above.
+    // Its directory is a launch artifact the launcher removes once the child has exited.
+    const artifacts: string[] = [];
+    Object.assign(env, materialEnv({ creds: opts.creds, servers: opts.servers, controlToken: control.token, eventsRequired: opts.eventsRequired, userAuth: opts.userAuth }, artifacts));
+
+    // The fork's provenance is the seat's own record of it, written when the host forks.
+    return {
+      command: HOST_COMMAND,
+      args: [HOST_ENTRY],
+      env,
+      control,
+      ...(opts.resume ? { resumeRecordPath: jcodeForkRecordPath(seatHome) } : {}),
+      ...(artifacts.length > 0 ? { artifacts } : {}),
+    };
+  },
+};
+
+registry.register(jcodeConnector);

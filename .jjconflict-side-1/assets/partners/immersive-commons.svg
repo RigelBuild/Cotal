@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Immersive Commons · horizontal lockup · monogram + wordmark · MMXXVI -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 320" role="img" aria-label="the COMMONS — Immersive Commons">
+  <g fill="none" stroke="#f2ede3" stroke-width="6" stroke-linecap="round">
+    <circle cx="180" cy="160" r="120"/>
+    <circle cx="300" cy="160" r="120"/>
+  </g>
+  <g fill="#f2ede3" font-family="'Cormorant Garamond', 'EB Garamond', Georgia, serif">
+    <text x="490" y="200" font-size="56" font-style="italic" font-weight="300">the</text>
+    <text x="600" y="200" font-size="120" font-weight="500" letter-spacing="22">COMMONS</text>
+    <text x="600" y="248" font-size="20" font-family="'JetBrains Mono', ui-monospace, monospace" letter-spacing="5">IMMERSIVE COMMONS · MMXXVI</text>
+  </g>
+</svg>

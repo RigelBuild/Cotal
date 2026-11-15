@@ -1,0 +1,37 @@
+{
+  "suite": [
+    "implementations/cli/smoke/systemd-supervision.smoke.ts"
+  ],
+  "guard": "The detached supervision warning is bound to the launching systemd invocation and exact false-green unit shape",
+  "command": "pnpm smoke:systemd-supervision",
+  "progressPattern": "✓",
+  "minTicks": 14,
+  "mutations": [
+    {
+      "name": "The detector ignores the systemd invocation identity",
+      "file": "implementations/cli/src/lib/systemd-supervision.ts",
+      "find": "    const unit = unitRecords(stdout).find((record) => record.InvocationID === invocationId);",
+      "replace": "    const unit = unitRecords(stdout)[0];",
+      "expectRed": "a different invocation does not inherit another unit's warning",
+      "cell": "a different invocation does not inherit another unit's warning"
+    },
+    {
+      "name": "The detector warns only for Type=oneshot, so a long-running service type is silent",
+      "file": "implementations/cli/src/lib/systemd-supervision.ts",
+      "find": "  const shape = unit.Type === \"oneshot\" && unit.RemainAfterExit === \"yes\" ? \" is Type=oneshot with RemainAfterExit=yes and\" : \"\";",
+      "replace": "  if (unit.Type !== \"oneshot\") return undefined;\n  const shape = unit.Type === \"oneshot\" && unit.RemainAfterExit === \"yes\" ? \" is Type=oneshot with RemainAfterExit=yes and\" : \"\";",
+      "expectRed": "a Type=simple unit whose main process is background up warns",
+      "cell": "a Type=simple unit whose main process is background up warns",
+      "note": "The detector now warns for every .service unit whose main process is the launcher, and Type only decides whether the warning names the oneshot shape. This mutant puts a Type test back in front of the warning, so a Type=simple unit is silent again."
+    },
+    {
+      "name": "The detector misreads RemainAfterExit, so a oneshot unit that remains after exit does not name its shape",
+      "file": "implementations/cli/src/lib/systemd-supervision.ts",
+      "find": "  const shape = unit.Type === \"oneshot\" && unit.RemainAfterExit === \"yes\" ? \" is Type=oneshot with RemainAfterExit=yes and\" : \"\";",
+      "replace": "  const shape = unit.Type === \"oneshot\" && unit.RemainAfterExit !== \"yes\" ? \" is Type=oneshot with RemainAfterExit=yes and\" : \"\";",
+      "expectRed": "a oneshot RemainAfterExit unit names its shape",
+      "cell": "a oneshot RemainAfterExit unit names its shape",
+      "note": "RemainAfterExit only decides, with Type, whether the warning names the oneshot shape. This mutant inverts that test, so a oneshot unit with RemainAfterExit=yes gets the warning without its shape."
+    }
+  ]
+}

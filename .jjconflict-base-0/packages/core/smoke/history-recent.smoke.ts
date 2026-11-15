@@ -1,0 +1,336 @@
+/**
+ * `channelHistory` / `dmHistory` must return the MOST RECENT messages.
+ *
+ * They used to return the oldest. `js.consumers.get(stream, {...})` builds an ordered consumer that
+ * defaults to `opt_start_seq: 1`, so capping the fetch at `limit` took the first N messages ever
+ * sent, while the API is documented as "recent" and every caller renders it as the latest. On any
+ * channel busier than one page, the dashboard and the agent history tools showed the beginning of
+ * the conversation.
+ *
+ * Also asserted here: reading one page must not cost the whole backlog in transfer, since that is
+ * the other half of why history was slow on a remote mesh.
+ *
+ * Needs nats-server on PATH. Run: pnpm smoke:history-recent
+ */
+import { strict as assert } from "node:assert";
+import { spawn } from "node:child_process";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { jetstream, jetstreamManager } from "@nats-io/jetstream";
+import { connect } from "@nats-io/transport-node";
+import { CotalEndpoint, chatSubject, isReachable, newIdentity, setupSpaceStreams } from "../src/index.js";
+import { SMOKE_BROKER_TOKEN, teardownOnSignal } from "@cotal-ai/smoke-kit";
+import { pickFreePort } from "./_free-port.js";
+
+// An OS-assigned port, not the 14772 this suite used to hardcode. Two concurrent runs did not
+// collide loudly: the first to bind won, the second ATTACHED TO IT, both published 60 messages
+// into the same stream, and both then failed on `reads the whole channel back (120 of 60)`. That
+// reads like a duplicate-delivery bug in history backfill and is a port collision two causes
+// upstream. Reproduced before this line changed.
+const PORT = await pickFreePort();
+const SERVER = `nats://127.0.0.1:${PORT}`;
+const SPACE = "hist";
+const store = mkdtempSync(join(tmpdir(), SMOKE_BROKER_TOKEN));
+let pass = 0;
+const check = (name: string, cond: boolean, extra?: unknown) => {
+  assert.ok(cond, `${name}${extra !== undefined ? ` — ${JSON.stringify(extra)}` : ""}`);
+  pass++;
+  console.log(`  ✓ ${name}`);
+};
+const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+const srv = spawn("nats-server", ["-p", String(PORT), "-js", "-sd", store], { stdio: "ignore" });
+const releaseBroker = teardownOnSignal(srv, store);
+try {
+  let up = false;
+  for (let i = 0; i < 60; i++) { if (await isReachable(SERVER)) { up = true; break; } await wait(150); }
+  if (!up) throw new Error("nats-server did not start");
+
+  await setupSpaceStreams({ servers: SERVER, space: SPACE });
+
+  const id = newIdentity();
+  const ep = new CotalEndpoint({
+    space: SPACE, servers: SERVER, channels: ["talk", "other"], consume: false,
+    registerPresence: false, card: { id: id.id, name: "hist", kind: "endpoint" },
+  });
+  ep.on("error", () => {});
+  await ep.start();
+
+  // 60 messages on the channel under test, INTERLEAVED with another channel so the stream sequences
+  // for "talk" are non-contiguous — the case where a start sequence cannot be computed arithmetically.
+  const TOTAL = 60;
+  for (let i = 0; i < TOTAL; i++) {
+    await ep.multicast(`talk-${i}`, { channel: "talk" });
+    if (i % 3 === 0) await ep.multicast(`other-${i}`, { channel: "other" });
+  }
+  await wait(300);
+
+  const text = (m: { parts?: { kind: string; text?: string }[] }) =>
+    m.parts?.map((p) => (p.kind === "text" ? p.text : "")).join("") ?? "";
+
+  const all = await ep.channelHistory("talk", { limit: 500 });
+  check(`reads the whole channel back (${all.length} of ${TOTAL})`, all.length === TOTAL, all.length);
+  check("full read is oldest-first", text(all[0]!) === "talk-0" && text(all[all.length - 1]!) === `talk-${TOTAL - 1}`,
+    [text(all[0]!), text(all[all.length - 1]!)]);
+
+  // THE REGRESSION GATE.
+  const ten = await ep.channelHistory("talk", { limit: 10 });
+  const tenText = ten.map(text);
+  const newestTen = Array.from({ length: 10 }, (_, i) => `talk-${TOTAL - 10 + i}`);
+  const oldestTen = Array.from({ length: 10 }, (_, i) => `talk-${i}`);
+  check("limit=10 returns 10", ten.length === 10, ten.length);
+  check("limit=10 returns the NEWEST ten", JSON.stringify(tenText) === JSON.stringify(newestTen), tenText);
+  check("limit=10 does NOT return the oldest ten (the bug)", JSON.stringify(tenText) !== JSON.stringify(oldestTen), tenText);
+  check("the page is oldest-first within itself", text(ten[0]!) === `talk-${TOTAL - 10}`, tenText[0]);
+
+  // Other page sizes, including ones that cross the widening threshold.
+  for (const n of [1, 3, 25, 59]) {
+    const page = await ep.channelHistory("talk", { limit: n });
+    const want = Array.from({ length: n }, (_, i) => `talk-${TOTAL - n + i}`);
+    check(`limit=${n} returns the newest ${n}`, JSON.stringify(page.map(text)) === JSON.stringify(want), page.map(text));
+  }
+
+  // A limit larger than the backlog returns everything, and does not pad or throw.
+  const over = await ep.channelHistory("talk", { limit: 1000 });
+  check("limit beyond the backlog returns the whole channel", over.length === TOTAL, over.length);
+
+  // The interleaved channel is unaffected by the other channel's traffic.
+  const otherPage = await ep.channelHistory("other", { limit: 5 });
+  check("a different channel pages independently", otherPage.length === 5 && text(otherPage[4]!).startsWith("other-"), otherPage.map(text));
+
+  // An empty channel is empty, not an error.
+  check("an unused channel returns []", (await ep.channelHistory("never-used", { limit: 10 })).length === 0);
+
+  // ── THE FAR-GAP CASE: a QUIET channel buried under a busy one. Its newest message sits far below
+  //    the stream's last sequence, which is the shape that used to make every window near the stream
+  //    head empty and walk the search back to the beginning. With an exact per-subject ceiling the
+  //    page must come straight back. ────────────────────────────────────────────────────────────────
+  await ep.multicast("quiet-1", { channel: "quiet" });
+  await ep.multicast("quiet-2", { channel: "quiet" });
+  for (let i = 0; i < 400; i++) await ep.multicast(`filler-${i}`, { channel: "noisy" });
+  await wait(300);
+  const quiet = await ep.channelHistory("quiet", { limit: 10 });
+  check("far gap: a quiet channel buried under 400 filler messages still returns its own newest",
+    quiet.length === 2 && text(quiet[0]!) === "quiet-1" && text(quiet[1]!) === "quiet-2", quiet.map(text));
+  const noisyPage = await ep.channelHistory("noisy", { limit: 5 });
+  check("far gap: the busy channel still pages to its newest 5",
+    noisyPage.length === 5 && text(noisyPage[4]!) === "filler-399", noisyPage.map(text));
+  // A channel that was configured but never used must cost one probe and stop, not a search.
+  check("far gap: an unused channel in a busy stream returns [] without a search",
+    (await ep.channelHistory("never-used", { limit: 10 })).length === 0);
+
+  // ── ONE PUBLISHER. Two principals publish on one channel, interleaved. A read with `publisher`
+  //    filters on that principal's own subject, so it returns only what that principal published,
+  //    newest first in the same paging, and a read without it still returns the channel whole. ────
+  {
+    const other = new CotalEndpoint({
+      space: SPACE, servers: SERVER, channels: ["shared"], consume: false,
+      registerPresence: false, card: { id: newIdentity().id, name: "other", kind: "endpoint" },
+    });
+    other.on("error", () => {});
+    await other.start();
+    try {
+      for (let i = 0; i < 6; i++) {
+        await ep.multicast(`mine-${i}`, { channel: "shared" });
+        await other.multicast(`theirs-${i}`, { channel: "shared" });
+      }
+      await wait(300);
+      const whole = await ep.channelHistory("shared", { limit: 50 });
+      check("CONTROL: without a publisher the channel reads whole, both principals interleaved",
+        whole.length === 12 && whole.some((m) => text(m) === "theirs-0"), whole.map(text));
+      const mine = await ep.channelHistory("shared", { limit: 50, publisher: ep.principal });
+      check("publisher: a read names one principal and returns only what that principal published",
+        JSON.stringify(mine.map(text)) === JSON.stringify(Array.from({ length: 6 }, (_, i) => `mine-${i}`)), mine.map(text));
+      const theirs = await ep.channelHistory("shared", { limit: 2, publisher: other.principal });
+      check("publisher: a page of that principal's newest, oldest first",
+        JSON.stringify(theirs.map(text)) === JSON.stringify(["theirs-4", "theirs-5"]), theirs.map(text));
+      const wild = await ep.channelHistory("shared", { limit: 50, publisher: { owner: "*", actor: "*" } })
+        .then(() => "returned", (e: unknown) => (e instanceof Error ? e.message : String(e)));
+      check("publisher: a wildcard in either slot is refused rather than read as any sender",
+        wild.includes("invalid owner/actor token"), wild);
+    } finally {
+      await other.stop();
+    }
+  }
+
+
+  // ── TRUNCATION GATES. These force the two clean-iterator-end shapes directly on the private
+  //    helpers. There is no PUBLIC seam into the endpoint's JetStream client, but a smoke can reach
+  //    the private connection, and that is enough: the consumer bind is real, so bind-time
+  //    `num_pending` is live, and only the fetch iterator's ENDING is simulated - as a clean stop
+  //    with no error, which is exactly what the pinned client does when a connection drops
+  //    ("we don't propagate the error here", @nats-io/jetstream consumer.js).
+  //
+  //    Deleting the completion checks from endpoint.ts must turn these red. That is the property an
+  //    output-only assertion could never have, because the discarded stream-head algorithm returned
+  //    identical values for every fixture in this file.
+  const epNc = (ep as unknown as { nc: import("@nats-io/transport-node").NatsConnection }).nc;
+  const priv = ep as unknown as {
+    lastMatchingSeq(js: unknown, stream: string, subjects: string[]): Promise<number>;
+    drainWindow(js: unknown, stream: string, subjects: string[], start: number, ceiling: number, limit: number): Promise<unknown[]>;
+  };
+  const CHAT = `CHAT_${SPACE}`;
+  const TALK = `cotal.${SPACE}.chat.*.*.talk`;
+
+  /** The real JetStream client, with every consumer's `fetch` truncated to `cut` messages and then
+   *  ended cleanly - the shape a dropped link produces. */
+  const truncatingJs = (cut: number) => {
+    const real = jetstream(epNc);
+    return {
+      ...real,
+      consumers: {
+        ...real.consumers,
+        get: async (...args: unknown[]) => {
+          const c = await (real.consumers.get as (...a: unknown[]) => Promise<Record<string, unknown>>).apply(real.consumers, args);
+          const truncate = (inner: AsyncIterable<unknown> & { stop?: () => void }) => {
+            const gen = (async function* () {
+              let n = 0;
+              for await (const m of inner) { if (n++ >= cut) return; yield m; }
+            })();
+            return Object.assign(gen, { stop: () => inner.stop?.() });
+          };
+          const realFetch = (c.fetch as (o?: unknown) => Promise<AsyncIterable<unknown> & { stop?: () => void }>).bind(c);
+          const realConsume = (c.consume as (o?: unknown) => Promise<AsyncIterable<unknown> & { stop?: () => void }>).bind(c);
+          return Object.assign(Object.create(c as object), {
+            fetch: async (o?: unknown) => truncate(await realFetch(o)),
+            consume: async (o?: unknown) => truncate(await realConsume(o)),
+          });
+        },
+      },
+    };
+  };
+
+  // 1. Last probe: bind says a message is pending, the fetch yields none, iterator ends cleanly.
+  //    Returning 0 here is what made streamHistory report a live channel as empty.
+  let lastThrew: unknown;
+  await priv.lastMatchingSeq(truncatingJs(0), CHAT, [TALK]).then(
+    (v) => { lastThrew = `RETURNED ${v}`; },
+    (e) => { lastThrew = e; },
+  );
+  check("Last probe: pending>0 with zero deliveries RAISES (never reports an empty channel)",
+    lastThrew instanceof Error, String(lastThrew));
+
+  // 2. Window drain: cut after 3 of the pending batch, ending cleanly. Returning those 3 is what
+  //    made a cut-short read look like a convincing short page.
+  let drainThrew: unknown;
+  await priv.drainWindow(truncatingJs(3), CHAT, [TALK], 1, 10_000, 100).then(
+    (r) => { drainThrew = `RETURNED ${(r as unknown[]).length} messages`; },
+    (e) => { drainThrew = e; },
+  );
+  check("window drain: a partial batch ending cleanly RAISES (never a short page)",
+    drainThrew instanceof Error, String(drainThrew));
+
+  // ── CROSS THE DOOR. The two gates above call the private helpers directly, so they prove the
+  //    helpers raise but say NOTHING about whether the public entry point propagates that. If
+  //    `streamHistory`'s catch swallowed an incomplete read back into `[]`, both would stay green
+  //    while the shipped behaviour was the exact bug this branch fixed: "could not read" rendering
+  //    as "no history". That catch has already been wrong once here, so the door needs its own gate.
+  //
+  //    Shadow the private helper on the instance to raise, then call the PUBLIC `channelHistory`.
+  for (const method of ["lastMatchingSeq", "drainWindow"] as const) {
+    const shadowed = ep as unknown as Record<string, unknown>;
+    const real = shadowed[method];
+    shadowed[method] = async () => { throw new Error(`forced ${method} truncation`); };
+    let doorThrew: unknown;
+    await ep.channelHistory("talk", { limit: 10 }).then(
+      (r) => { doorThrew = `RETURNED ${r.length} messages`; },
+      (e) => { doorThrew = e; },
+    );
+    shadowed[method] = real;
+    check(`channelHistory PROPAGATES a cut-short ${method} (never renders it as an empty channel)`,
+      doorThrew instanceof Error && /forced/.test(String((doorThrew as Error).message)), String(doorThrew));
+  }
+  // ...and the door still works normally once the shadow is removed, so the check above cannot pass
+  // by having broken the endpoint.
+  check("channelHistory still reads normally after the door gate",
+    (await ep.channelHistory("talk", { limit: 3 })).length === 3);
+
+  // ── REQUEST-SHAPE GATE: count REQUESTS, not wall clock. An exact per-subject ceiling answers a
+  //    buried channel for about what a near-tail one costs; the discarded stream-head walk widened
+  //    repeatedly and cost visibly more. Wall clock cannot express that (it passes on loopback and
+  //    flakes on a loaded runner), so this measures the endpoint's outbound message delta.
+  const outFor = async (ch: string) => {
+    const b = epNc.stats().outMsgs;
+    await ep.channelHistory(ch, { limit: 5 });
+    return epNc.stats().outMsgs - b;
+  };
+  await outFor("noisy"); // warm any lazily-built client state so the comparison is fair
+  const nearTail = await outFor("noisy");
+  const buried = await outFor("quiet");
+  check(`a buried channel costs about what a near-tail one does (near ${nearTail}, buried ${buried})`,
+    buried <= nearTail + 4, { nearTail, buried });
+
+  // Consumer hygiene: every probe and window is reclaimed. Complements the above - that gate proves
+  // the ceiling is exact, this one proves nothing is left behind.
+  const jsmc = await jetstreamManager((await connect({ servers: SERVER })));
+  const consumers = async () => (await jsmc.streams.info(CHAT)).state.consumer_count;
+  const before = await consumers();
+  await ep.channelHistory("quiet", { limit: 10 });
+  await ep.channelHistory("never-used", { limit: 10 });
+  await wait(300);
+  const after = await consumers();
+  check(`history reclaims every consumer it creates (before ${before}, after ${after})`, after <= before, { before, after });
+
+  // ── multiChannelHistory selects by ARRIVAL, never by the payload's `ts` ───────────────────────
+  // The read batches its filter list and re-cuts the union, so it has to choose a key to re-cut ON.
+  // Stream sequence is the broker's own record of when it took the message; `ts` is a number the
+  // SENDER wrote and nothing validates. They agree on any corpus published by one clock, which is
+  // why an equality between two arms of this same read cannot tell them apart: a merge that sorted
+  // by `ts` would reorder BOTH arms identically and both would still agree with each other.
+  //
+  // So the corpus is built to make them DISAGREE, by publishing the message frames directly with a
+  // chosen `ts` rather than letting `multicast` stamp `Date.now()`. `early` arrives LAST and claims
+  // the OLDEST `ts`; `late` arrives FIRST and claims a `ts` far in the future. Selecting the newest
+  // one by arrival must return `early`. Selecting it by `ts` returns `late`, and that is the whole
+  // difference between the two keys.
+  {
+    const raw = await connect({ servers: SERVER });
+    const skewCh = ["skew-a", "skew-b"];
+    const frame = (channel: string, id: string, ts: number) => ({
+      id, ts, space: SPACE, from: { id: "local.skew", name: "skew" },
+      channel, parts: [{ kind: "text", text: id }],
+    });
+    // `late` first, carrying a ts an hour ahead; `early` second, carrying a ts an hour behind.
+    raw.publish(chatSubject(SPACE, "local", "skew", skewCh[0]),
+      JSON.stringify(frame(skewCh[0], "late", Date.now() + 3_600_000)));
+    raw.publish(chatSubject(SPACE, "local", "skew", skewCh[1]),
+      JSON.stringify(frame(skewCh[1], "early", Date.now() - 3_600_000)));
+    await raw.flush();
+    await raw.close();
+    await wait(200);
+
+    // THE MULTI-BATCH CASE IS THE DISCRIMINATING ONE, and it is asserted FIRST because this suite
+    // stops at the first failure. Measured: a single-batch read CANNOT see the merge key at all.
+    // `streamHistory` has already applied the limit inside that one batch, so `pages.flat()` holds
+    // exactly one row and re-sorting one row cannot reorder anything. Forcing one batch per channel
+    // is what makes the union bigger than the limit, and only then does the key it is re-cut on
+    // decide the answer. A mutation merging by `ts` leaves the single-batch check GREEN and reddens
+    // this one, which is why this one carries the name the fixture points at.
+    const split = await ep.multiChannelHistory(skewCh, { limit: 1, batch: 1 });
+    check("multiChannelHistory merges BATCHES by arrival, not by the highest `ts`",
+      split.length === 1 && split[0].msg.id === "early",
+      { got: split.map((r) => r.msg.id), expected: ["early"] });
+
+    const newest = await ep.multiChannelHistory(skewCh, { limit: 1 });
+    check("and a single unbatched read agrees with the batched one",
+      newest.length === 1 && newest[0].msg.id === "early",
+      { got: newest.map((r) => r.msg.id), expected: ["early"] });
+
+    // CONTROL: the corpus really does disagree, so the two checks above could have gone the other
+    // way. Without this, a corpus whose `ts` happened to match arrival would pass them for free.
+    const both = await ep.multiChannelHistory(skewCh, { limit: 2 });
+    const byTs = [...both].sort((a, b) => a.msg.ts - b.msg.ts).map((r) => r.msg.id);
+    check("CONTROL: `ts` order and arrival order really are opposite on this corpus",
+      byTs.join(",") === "early,late" && both.map((r) => r.msg.id).join(",") === "late,early",
+      { byTs, byArrival: both.map((r) => r.msg.id) });
+  }
+
+  await ep.stop();
+  console.log(`\nhistory-recent smoke: ${pass} checks passed`);
+} finally {
+  srv.kill("SIGKILL");
+  rmSync(store, { recursive: true, force: true });
+  releaseBroker(); // last: ownership is held until this teardown has actually finished
+}
+process.exit(0);

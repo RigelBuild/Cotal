@@ -1,0 +1,210 @@
+import { rmSync } from "node:fs";
+import {
+  registry,
+  SpawnRefused,
+  confirmWatch,
+  type AgentHandle,
+  type ConfirmPane,
+  type LaunchSpec,
+  type Runtime,
+  type RuntimeProvider,
+  type RuntimeReference,
+  type StartupOutcome,
+} from "@cotal-ai/core";
+import * as tmux from "./driver.js";
+
+/** Grace window for a clean exit before a graceful stop force-closes the pane. */
+const GRACE_MS = 1_500;
+/** Bounds the startup-confirm watch's Enter and close, because the watch runs on the manager's event
+ *  loop; the driver bounds its reads. */
+const CONFIRM_CALL = { timeoutMs: 1_000 };
+
+/**
+ * Spawns each agent into its own new tmux window in a shared per-space session, so
+ * spawned teammates get room rather than crowding the spawner. Opened unfocused so the
+ * human stays in their current window; switch to `session:name` to watch the worker.
+ * Watch natively: `attach()` throws. The handle keeps the pane and opening server for control.
+ */
+export class TmuxRuntime implements Runtime {
+  readonly kind = "tmux" as const;
+  readonly streamsTerminal = false;
+  readonly reportsStartupOutcome = true;
+
+  constructor(private readonly session: string) {}
+
+  spawn(name: string, spec: LaunchSpec, cwd: string): AgentHandle {
+    if (!/^[A-Za-z0-9_.-]+$/.test(name))
+      throw new SpawnRefused(
+        `tmux runtime: unsafe agent name ${JSON.stringify(name)} (allowed: letters, digits, _ . -)`,
+      );
+    if (!tmux.available())
+      throw new SpawnRefused("tmux runtime: tmux is not available — is tmux installed and on PATH?");
+
+    // Nothing has the spec's command until openWindow, so a failure before it (a confirm prompt that
+    // cannot match, a session that will not start, a launcher script that cannot be written) is a
+    // refusal.
+    let launch: { command: string; dir: string };
+    let watch: ((pane: ConfirmPane) => void) | undefined;
+    try {
+      if ((spec.confirmBefore?.length || spec.confirmReady?.length || spec.confirmBlockers?.length) && spec.confirm === undefined) throw new Error("startup choices require a final confirmation prompt");
+      watch = spec.confirm === undefined ? undefined : confirmWatch(spec.confirm, spec.confirmBefore, spec.confirmReady, spec.confirmBlockers, spec.confirmNotice);
+      tmux.ensureSession(this.session, cwd);
+      // P3: env -i strips the tmux server's inherited environment; only the connector-declared
+      // env reaches the spawned agent (identity, model key, OS allow-list). privateLaunch keeps those
+      // values out of tmux's command line (ps-visible) — they ride a 0o600 launcher script instead.
+      launch = tmux.privateLaunch(tmux.isolatedCommand(spec.env ?? {}, spec.command, spec.args));
+    } catch (err) {
+      throw new SpawnRefused((err as Error).message);
+    }
+    // Keep tmux's stable server, window and pane ids. Names can change, and panes can move.
+    let window: tmux.WindowRefs;
+    try {
+      window = tmux.openWindow(this.session, name, launch.command, cwd, { focus: false });
+    } catch (err) {
+      rmSync(launch.dir, { recursive: true, force: true });
+      throw err;
+    }
+    const { windowId, paneId, serverPid } = window;
+
+    // A restarted tmux server reuses window and pane ids, so the watch acts only on the one that opened
+    // this window. It ends the seat's pane, wherever it is now: the window may hold another pane by then.
+    const call = { ...CONFIRM_CALL, server: serverPid };
+    let startup: StartupOutcome = "pending";
+    watch?.({
+      settled: (outcome) => { startup = outcome; },
+      read: () => tmux.capturePane(paneId, serverPid),
+      enter: () => tmux.sendKey("Enter", paneId, call),
+      down: () => tmux.sendKey("Down", paneId, call),
+      fail: (message) => {
+        console.error(`tmux runtime: "${name}": ${message}`);
+        try {
+          tmux.closePane(paneId, call);
+        } catch (err) {
+          console.error(`tmux runtime: failed to close pane for "${name}":`, err);
+        }
+      },
+    });
+
+    return this.handle(name, windowId, paneId, serverPid, () => startup);
+  }
+
+  /** The handle follows its seat's pane on the server that opened it, for both spawn and adoption. */
+  private handle(name: string, windowId: string, paneId: string, serverPid: string, startupOutcome?: () => StartupOutcome): AgentHandle {
+    const call = { server: serverPid };
+    return {
+      name,
+      kind: "tmux",
+      ...(startupOutcome ? { startupOutcome } : {}),
+      // Durable enough for a successor manager to close this window if this one dies (see reap).
+      reference: { kind: "tmux", id: `${serverPid}.${windowId}.${paneId}` },
+      status: () => {
+        try {
+          return tmux.paneState(paneId, serverPid);
+        } catch {
+          return "running";
+        }
+      },
+      stop: (opts) => {
+        if (opts?.graceful === false) return tmux.closePane(paneId, call);
+        // Graceful: type `/exit` so the Claude session shuts down cleanly (its SessionEnd
+        // hook leaves the mesh), then close that pane wherever it moved.
+        try {
+          tmux.send("/exit", paneId, call);
+          tmux.sendKey("Enter", paneId, call);
+        } catch {
+          /* pane already gone — still ensure it's closed below */
+        }
+        // Deferred, so a throw here is uncaught in a timer and would crash the manager.
+        // Keep the server fence on the delayed close too: a replacement can reuse the pane id.
+        setTimeout(() => {
+          try {
+            tmux.closePane(paneId, call);
+          } catch (err) {
+            console.error(`tmux runtime: failed to close pane for "${name}":`, err);
+          }
+        }, GRACE_MS);
+      },
+      waitForExit: () => tmux.waitForPaneExit(paneId, call),
+      interrupt: () => {
+        tmux.sendKey("C-c", paneId, call);
+      },
+      attach: () => {
+        throw new Error(
+          `tmux runtime: attach natively — \`tmux attach-session -t ${this.session}\`, then ` +
+            `\`tmux select-window -t ${paneId}\` and \`tmux select-pane -t ${paneId}\``,
+        );
+      },
+    };
+  }
+
+  /** Take back a window an earlier manager opened, by the reference its handle carried (#4095). Only
+   *  the exact seat is adopted: the server that opened it still runs, the pane is still in the
+   *  recorded window, that window is still in this runtime's session, and the pane's process is still
+   *  running. Anything else throws and nothing is touched, so the caller reaps or retires instead.
+   *  The name is the reference's window id; the caller knows the seat's name. */
+  adopt(reference: RuntimeReference): AgentHandle {
+    const { serverPid, windowId, paneId } = parseReference(reference);
+    const running = tmux.serverPid();
+    if (running !== serverPid)
+      throw new Error(`tmux runtime: pane ${paneId} ran on tmux server ${serverPid}, and ${running === undefined ? "no server" : `server ${running}`} runs now`);
+    const paneAt = tmux.paneWindow(paneId);
+    if (paneAt !== windowId)
+      throw new Error(`tmux runtime: pane ${paneId} is ${paneAt === undefined ? "gone" : `in window ${paneAt}`}, not in window ${windowId}`);
+    if (!tmux.windowSessions(windowId).includes(this.session))
+      throw new Error(`tmux runtime: window ${windowId} is not in session "${this.session}"`);
+    if (tmux.paneState(paneId, serverPid) !== "running") throw new Error(`tmux runtime: pane ${paneId} has exited`);
+    return this.handle(windowId, windowId, paneId, serverPid);
+  }
+
+  /** Close a window an earlier manager opened, by the reference its handle carried, and prove the
+   *  window and its pane gone. The window decides, not the pane: a pane that exited can leave its
+   *  window open (`remain-on-exit`, or another pane split into it), so a window this runtime's
+   *  session still holds is closed whatever its pane's state. A server that is gone, or a window and
+   *  pane it no longer lists, means the seat is gone. A pane still listed outside that window, live or
+   *  exited, or a window only other sessions hold, is `absent`: nothing here touches it or proves
+   *  anything about it. tmux checks the pane and the session again in the command that closes the
+   *  window, so a seat whose placement changed after these listings is `absent` too. */
+  async reap(reference: RuntimeReference): Promise<{ outcome: "absent" } | { outcome: "reaped"; detail: string }> {
+    const { serverPid, windowId, paneId } = parseReference(reference);
+    if (tmux.serverPid() !== serverPid) {
+      // Another server answers here. The seat is gone only if the server that ran it is gone too.
+      try {
+        process.kill(Number(serverPid), 0);
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code === "ESRCH")
+          return { outcome: "reaped", detail: `tmux server ${serverPid} that ran pane ${paneId} is gone` };
+      }
+      return { outcome: "absent" };
+    }
+    const paneAt = tmux.paneWindow(paneId);
+    if (paneAt !== undefined && paneAt !== windowId) return { outcome: "absent" };
+    const sessions = tmux.windowSessions(windowId);
+    if (sessions.length === 0) return { outcome: "reaped", detail: `tmux window ${windowId} and pane ${paneId} were already gone` };
+    if (!sessions.includes(this.session)) return { outcome: "absent" };
+    if (!tmux.closeWindowIfHeld(this.session, windowId, paneId)) return { outcome: "absent" };
+    if (tmux.windowSessions(windowId).length > 0) throw new Error(`tmux: window ${windowId} is still listed after kill-window`);
+    await tmux.waitForPaneExit(paneId, { server: serverPid });
+    return { outcome: "reaped", detail: `closed tmux window ${windowId}; pane ${paneId} exited` };
+  }
+}
+
+/** The parts of a reference this runtime's handle carried. The ids reach a tmux format and command
+ *  string, so only tmux's own id shapes pass. */
+function parseReference(reference: RuntimeReference): { serverPid: string; windowId: string; paneId: string } {
+  if (reference.kind !== "tmux") throw new Error(`cannot address runtime kind "${reference.kind}" with tmux`);
+  const match = /^(\d+)\.(@\d+)\.(%\d+)$/.exec(reference.id);
+  if (!match) throw new Error(`tmux runtime: malformed reference ${JSON.stringify(reference.id)}`);
+  const [, serverPid, windowId, paneId] = match;
+  return { serverPid, windowId, paneId };
+}
+
+/** Self-registering runtime provider — `import "@cotal-ai/tmux"` makes the manager's
+ *  `tmux` runtime available without the manager depending on this package. */
+export const tmuxRuntimeProvider: RuntimeProvider = {
+  kind: "runtime",
+  name: "tmux",
+  available: () => tmux.available(),
+  create: (opts) => new TmuxRuntime(opts.session),
+};
+
+registry.register(tmuxRuntimeProvider);

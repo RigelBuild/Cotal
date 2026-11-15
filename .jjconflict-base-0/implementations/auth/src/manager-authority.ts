@@ -1,0 +1,895 @@
+import {
+  EpEnvelopeError,
+  REMOTE_MANAGER_AUTHORITY_OPERATIONS,
+  REMOTE_MANAGER_IDENTITY_NAMES,
+  assertDerivedOwnerToken,
+  assertPrincipalOwnerToken,
+  assertLifecycleToken,
+  assertValidOwnerToken,
+  managedRetirementOpId,
+  parseRemoteManagerEnvelope,
+  remoteManagerActors,
+  type RemoteManagerAuthorityMaterial,
+  type RemoteManagerAuthorityRequest,
+  type RemoteRunAdmissionRequest,
+  type RemoteRunSubmissionRequest,
+  type RemoteRunSubmissionResult,
+  type RemoteRunAttemptRequest,
+  type RemoteRunRevokeRequest,
+  type RemoteRunCancelRequest,
+  type RemoteRunCancelResult,
+  type RunCancelAuthority,
+  type RunCancelCommitCode,
+  type IssuedCaller,
+  readRunCancelInput,
+  commitRunCancellation,
+  type RemoteRunRevokeResult,
+  type RunRevocation,
+  type RunAdmissionView,
+  type RunStatusValue,
+  type RunDriverGrantArgs,
+  type RunOperatorGrantArgs,
+  type RemoteRunAdmissionResult,
+  type RunAdmission,
+  type RunDelegation,
+  type HostedRunAttempt,
+  type IssuedStore,
+  type IssuedSourceRef,
+  type EpCommandAuthority,
+  type EndpointRequest,
+  EP_RAIL_V1,
+  EP_UNBOUND_CALLER_AUTHORITY,
+  admissionKey,
+  admissionSnapshot,
+  createRunAdmission,
+  bindAndAdmitRunSubmission, readRunSubmission, newSubmissionRunId, submissionFingerprint, canonicalJson, KEYED_SUBMISSION_MAX_DEADLINE_MS,
+  revokeRunAdmission,
+  isAccountNkey,
+  isDerivedOwner,
+  isIssuedCaller,
+  isUserNkey,
+  issuedPermitsSubject,
+  parseEpSubject,
+  parseEndpointRequest,
+  checkRequestSubjectAgreement,
+} from "@cotal-ai/core";
+import { CheckpointNotAmendable, CheckpointNotOpen, openCheckpointToken, settledPauseToken, type JournalEntry } from "@cotal-ai/lang";
+import type { KV } from "@nats-io/kv";
+import { assertCurrentManagerRegistration } from "./retained-manager-validation.js";
+import { requireManagerAuthorityHolder, type ManagerAuthorityHolder } from "./platform-control.js";
+import type { ObserveManagerGate } from "./managed-agent-enrollment.js";
+import { RunCancelObservations, type RunCancelObservation, type RunCancelClaim } from "./run-cancel-observation.js";
+
+/** The run attempt the host observes for itself. A null answer is a run with no record or status. */
+export type ObserveManagerRun = (runId: string) => Promise<HostedRunAttempt | null>;
+
+/** Host-only renewal authorization. The embedding host supplies a fresh gate and active run
+ * observation from its authoritative stores, never coordinates asserted by the participant. */
+export async function authorizeRemoteManagerRenewal(args: {
+  request: RemoteManagerAuthorityRequest;
+  owner: string;
+  space: string;
+  accountPublicKey: string;
+  proofSecret: string | Uint8Array;
+  observeManagerGate: ObserveManagerGate;
+  observeRun: ObserveManagerRun;
+}): Promise<void> {
+  const r = parseRemoteManagerAuthorityRequest(args.request);
+  if (!isRenewal(r.operation))
+    requestError("requires a renewal operation");
+  if (r.space !== args.space || r.accountPublicKey !== args.accountPublicKey)
+    throw new EpEnvelopeError("permission-denied", "manager-service renewal is bound to the host-assigned space and account");
+  await assertCurrentManagerRegistration(r, r.processEpoch, args, "manager-service renewal");
+  if (r.operation === "renewRunDriver" && !holdsRunFence(await args.observeRun(r.run!.runId), r))
+    throw new EpEnvelopeError("conflict", "manager-service run renewal does not hold the activated run and takeover fence");
+}
+
+/** Whether a renewRunDriver request still holds the observed run's activated attempt and takeover
+ * fence. The host re-applies it right before issuance because the run can move after the decision. */
+export function holdsRunFence(run: HostedRunAttempt | null, r: RemoteManagerAuthorityRequest): boolean {
+  return run !== null && run.state === "running" && run.instanceId === r.instanceId && run.holder === r.run!.holder &&
+    run.takeoverId === r.run!.takeoverId && run.epoch === r.run!.epoch && run.fencingToken === r.run!.fencingToken;
+}
+
+/** Host-only typed request after the IdP proof and ledger row (a human holder) or the platform
+ * control assignment (a platform holder) have been authenticated. */
+export type IssueRemoteManagerAuthorityArgs = ManagerAuthorityHolder & {
+  request: RemoteManagerAuthorityRequest;
+  /** The host-side phase executor. It validates the live instance/gate state and signs only the
+   * phase's fixed profile set for the caller-generated nkeys. */
+  issue: (args: {
+    owner: string;
+    actors: ReturnType<typeof remoteManagerActors>;
+    request: RemoteManagerAuthorityRequest;
+  }) => Promise<{ credentials: RemoteManagerAuthorityMaterial["credentials"]; nextRegistrationProof?: string }>;
+  /** The host must fresh-read the assigned account, manager gate and, for a run, activated
+   * journal attempt before signing. No callback means the renewal operation is unavailable. */
+  authorizeRenewal?: (args: { owner: string; request: RemoteManagerAuthorityRequest }) => Promise<void>;
+  now?: () => number;
+};
+
+function requestError(what: string): never {
+  throw new EpEnvelopeError("bad-request", `manager-service authority request ${what}`);
+}
+
+/** True when the operation's credential row has a closed set. */
+export function isRenewal(operation: unknown): operation is (typeof RENEWAL_OPERATIONS)[number] {
+  return (RENEWAL_OPERATIONS as readonly unknown[]).includes(operation);
+}
+
+/** Closed request parser: unknown fields and profile-like extensions are refused, never ignored.
+ * `allowPlatform` admits a platform `p_…` retirement target owner, for the platform control holder
+ * only (SPEC 13.1); the retirement check still requires the target owner to equal the holder's. */
+export function parseRemoteManagerAuthorityRequest(raw: unknown, opts: { allowPlatform?: boolean } = {}): RemoteManagerAuthorityRequest {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) requestError("must be an object");
+  const o = raw as Record<string, unknown>;
+  const allowed = new Set(["v", "kind", "operation", "space", "actor", "instanceId", "managerLifecycleUid", "requestId", "registrationProof", "session", "retirement", "contractArtifacts", "identities", "accountPublicKey", "processEpoch", "run", "transferReader"]);
+  for (const key of Object.keys(o)) if (!allowed.has(key)) requestError(`carries unknown field ${JSON.stringify(key)} (the protocol is closed)`);
+  if (!(REMOTE_MANAGER_AUTHORITY_OPERATIONS as readonly unknown[]).includes(o.operation))
+    requestError(`operation must be one of ${REMOTE_MANAGER_AUTHORITY_OPERATIONS.join(", ")}`);
+  const envelope = parseRemoteManagerEnvelope(o, "manager-service-authority", "manager-service authority", o.operation !== "prepare");
+  if (o.operation === "activate" && (!Array.isArray(o.contractArtifacts) || o.contractArtifacts.length === 0 || o.contractArtifacts.length > 64))
+    requestError("activate requires 1-64 canonical manager contractArtifacts");
+  if (o.operation !== "activate" && o.contractArtifacts !== undefined)
+    requestError(`${o.operation} must not carry contractArtifacts`);
+  const renewal = isRenewal(o.operation);
+  if (renewal) {
+    if (!isAccountNkey(o.accountPublicKey))
+      requestError(`${o.operation} requires an accountPublicKey`);
+    if (typeof o.processEpoch !== "number" || !Number.isSafeInteger(o.processEpoch) || o.processEpoch < 0)
+      requestError(`${o.operation} requires a non-negative processEpoch`);
+  } else if (o.accountPublicKey !== undefined || o.processEpoch !== undefined)
+    requestError(`${o.operation} must not carry accountPublicKey or processEpoch`);
+  let run: RemoteManagerAuthorityRequest["run"];
+  if (o.operation === "renewRunDriver") {
+    const r = o.run as Record<string, unknown> | undefined;
+    if (!r || Object.keys(r).sort().join(",") !== "driverId,epoch,fencingToken,holder,mediatorId,runId,takeoverId")
+      requestError("renewRunDriver requires exactly runId, holder, takeoverId, epoch, fencingToken, driverId, mediatorId");
+    const runId = r.runId;
+    const holder = r.holder;
+    const takeoverId = r.takeoverId;
+    const epoch = r.epoch;
+    const fencingToken = r.fencingToken;
+    const driverId = r.driverId;
+    const mediatorId = r.mediatorId;
+    if (typeof runId !== "string" || !/^run-[0-9a-f]{32}$/.test(runId) ||
+        typeof holder !== "string" || !/^[A-Za-z0-9_.-]{1,256}$/.test(holder) ||
+        typeof takeoverId !== "string" || !/^[0-9a-f]{16}$/.test(takeoverId) ||
+        typeof epoch !== "number" || !Number.isSafeInteger(epoch) || epoch < 1 ||
+        typeof fencingToken !== "number" || !Number.isSafeInteger(fencingToken) || fencingToken < 1 ||
+        !isUserNkey(driverId) || !isUserNkey(mediatorId) || driverId === mediatorId ||
+        !holder.endsWith(`.${takeoverId}`))
+      requestError("renewRunDriver requires valid runId, holder, takeoverId, epoch, fencingToken, and distinct driverId/mediatorId");
+    run = { runId, holder, takeoverId, epoch, fencingToken, driverId, mediatorId };
+  } else if (o.run !== undefined) requestError(`${o.operation} must not carry run`);
+  let session: RemoteManagerAuthorityRequest["session"];
+  if (o.operation === "session") {
+    const s = o.session as Record<string, unknown> | undefined;
+    if (!s || Object.keys(s).sort().join(",") !== "endpoint,epoch,exp,id,sessionId" || !isUserNkey(s.id) || s.endpoint !== "manager" ||
+        typeof s.sessionId !== "string" || s.sessionId.length === 0 || typeof s.epoch !== "number" || !Number.isSafeInteger(s.epoch) || s.epoch < 0 ||
+        typeof s.exp !== "number" || !Number.isSafeInteger(s.exp) || s.exp <= 0)
+      requestError("session requires { id, endpoint:\"manager\", sessionId, epoch, exp }");
+    session = { id: s.id, endpoint: s.endpoint, sessionId: s.sessionId, epoch: s.epoch, exp: s.exp };
+  } else if (o.session !== undefined) requestError(`${o.operation} must not carry session`);
+  let retirement: RemoteManagerAuthorityRequest["retirement"];
+  if (o.operation === "retire") {
+    const r = o.retirement as Record<string, unknown> | undefined;
+    if (!r || Object.keys(r).sort().join(",") !== "id,opId,serveEpoch,target")
+      requestError("retire requires retirement exactly { id, target, opId, serveEpoch }");
+    const target = r.target as Record<string, unknown> | undefined;
+    if (!isUserNkey(r.id) ||
+        !target || Object.keys(target).sort().join(",") !== "actor,lifecycleUid,owner" ||
+        typeof target.owner !== "string" || typeof target.actor !== "string" || typeof target.lifecycleUid !== "string" ||
+        typeof r.opId !== "string" || typeof r.serveEpoch !== "number" || !Number.isSafeInteger(r.serveEpoch) || r.serveEpoch < 0)
+      requestError("retire requires a requester user nkey, exact target, lifecycle opId, and non-negative safe serveEpoch");
+    assertLifecycleToken(target.lifecycleUid, "manager authority retirement target lifecycleUid");
+    assertLifecycleToken(r.opId, "manager authority retirement opId");
+    if (r.opId !== managedRetirementOpId(target.lifecycleUid))
+      requestError(`retire opId must be the managed lifecycle's derived terminal operation id for ${target.lifecycleUid}`);
+    retirement = {
+      id: r.id,
+      target: {
+        owner: opts.allowPlatform ? assertPrincipalOwnerToken(target.owner, { allowPlatform: true }) : assertDerivedOwnerToken(target.owner),
+        actor: assertValidOwnerToken(target.actor),
+        lifecycleUid: target.lifecycleUid,
+      },
+      opId: r.opId,
+      serveEpoch: r.serveEpoch,
+    };
+  } else if (o.retirement !== undefined) requestError(`${o.operation} must not carry retirement`);
+  if (o.operation === "transferReader") {
+    const t = o.transferReader as Record<string, unknown> | undefined;
+    if (!t || Object.keys(t).join(",") !== "id" || !isUserNkey(t.id))
+      requestError("transferReader requires transferReader exactly { id } with a user nkey");
+  } else if (o.transferReader !== undefined) requestError(`${o.operation} must not carry transferReader`);
+  return {
+    v: 1,
+    kind: "manager-service-authority",
+    operation: o.operation as RemoteManagerAuthorityRequest["operation"],
+    ...envelope,
+    ...(renewal ? { accountPublicKey: o.accountPublicKey as string, processEpoch: o.processEpoch as number } : {}),
+    ...(run ? { run } : {}),
+    ...(session ? { session } : {}),
+    ...(retirement ? { retirement } : {}),
+    ...(o.operation === "transferReader" ? { transferReader: { id: (o.transferReader as { id: string }).id } } : {}),
+    ...(Array.isArray(o.contractArtifacts) ? { contractArtifacts: o.contractArtifacts } : {}),
+  };
+}
+
+const CREDENTIALS: Record<(typeof REMOTE_MANAGER_AUTHORITY_OPERATIONS)[number], { readonly required: readonly string[]; readonly closed?: true }> = Object.freeze({
+  prepare: Object.freeze({ required: Object.freeze(["supervisor", "executor"]) }),
+  activate: Object.freeze({ required: Object.freeze(["serve", "goalWriter", "sessionLedger"]) }),
+  renew: Object.freeze({ required: Object.freeze(["supervisor", "executor"]) }),
+  session: Object.freeze({ required: Object.freeze(["sessionServing"]) }),
+  retire: Object.freeze({ required: Object.freeze(["retirementRequester"]) }),
+  renewStandingBundle: Object.freeze({ required: REMOTE_MANAGER_IDENTITY_NAMES, closed: true as const }),
+  renewRunDriver: Object.freeze({ required: Object.freeze(["runDriver", "runMediator"]), closed: true as const }),
+  transferReader: Object.freeze({ required: Object.freeze(["transferReader"]) }),
+});
+
+/** Renewal operations are the credential rows with a closed set. Authorization, account
+ * and epoch binding, and that set all read this, so adding or removing a renewal is one row. */
+const RENEWAL_OPERATIONS = (Object.keys(CREDENTIALS) as (keyof typeof CREDENTIALS)[]).filter((operation) => CREDENTIALS[operation].closed);
+
+/** Issue one lifecycle phase after the IdP proof and interactive row were fresh-read. */
+export async function issueRemoteManagerAuthority(args: IssueRemoteManagerAuthorityArgs): Promise<RemoteManagerAuthorityMaterial> {
+  const r = parseRemoteManagerAuthorityRequest(args.request, { allowPlatform: args.holder === "platform" });
+  requireManagerAuthorityHolder(args, r.instanceId, 'manager-service authority needs scope "supervise"; spawn/admin do not imply it');
+  const actors = remoteManagerActors(r.instanceId);
+  const ids = Object.values(r.identities).map((identity) => identity.id);
+  if (r.retirement) ids.push(r.retirement.id);
+  if (r.transferReader) ids.push(r.transferReader.id);
+  if (r.run) ids.push(r.run.driverId, r.run.mediatorId);
+  if (new Set(ids).size !== ids.length)
+    throw new EpEnvelopeError("bad-request", "manager-service identities must be distinct; one nkey cannot collapse separate authority lifetimes");
+  if (isRenewal(r.operation)) {
+    if (!args.authorizeRenewal)
+      throw new EpEnvelopeError("unavailable", `manager-service ${r.operation} needs a host-owned current-account and duty-fence authorization`);
+    await args.authorizeRenewal({ owner: args.owner, request: r });
+  }
+  const issued = await args.issue({ owner: args.owner, actors, request: r });
+  const credentials = issued.credentials;
+  const required = CREDENTIALS[r.operation].required;
+  for (const name of required)
+    if (!(name in credentials))
+      throw new EpEnvelopeError("internal", `manager-service ${r.operation} did not issue required credential ${name}`);
+  if (isRenewal(r.operation) &&
+      Object.keys(credentials).sort().join(",") !== [...required].sort().join(","))
+    throw new EpEnvelopeError("internal", `manager-service ${r.operation} returned credentials outside its closed profile set`);
+  const issuedAt = (args.now ?? Date.now)();
+  const exps = Object.values(credentials).map((credential) => credential!.exp * 1000);
+  return {
+    v: 1,
+    kind: "manager-service-authority",
+    operation: r.operation,
+    space: r.space,
+    owner: args.owner,
+    actor: r.actor,
+    instanceId: r.instanceId,
+    lifecycleUid: r.managerLifecycleUid,
+    requestId: r.requestId,
+    ...(r.registrationProof ? { registrationProof: r.registrationProof } : {}),
+    ...(r.accountPublicKey ? { accountPublicKey: r.accountPublicKey, processEpoch: r.processEpoch } : {}),
+    ...(r.run ? { run: r.run } : {}),
+    ...(r.retirement ? { retirement: r.retirement } : {}),
+    issuedAt,
+    expiresAt: Math.min(...exps),
+    actors,
+    identities: r.identities,
+    ...(issued.nextRegistrationProof ? { nextRegistrationProof: issued.nextRegistrationProof } : {}),
+    credentials,
+  };
+}
+
+type ManagerGate = NonNullable<Awaited<ReturnType<ObserveManagerGate>>>;
+
+function runRequestError(what: string, detail: string): never {
+  throw new EpEnvelopeError("bad-request", `${what} request ${detail}`);
+}
+
+/** Closed parser for what every run request from a registered manager carries: the envelope, the
+ *  assigned account and the process epoch. A field outside those and the request's own `fields` is
+ *  refused, and `what` names the request in every refusal. */
+function parseRegisteredRunRequest(raw: unknown, kind: string, what: string, fields: readonly string[]) {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) runRequestError(what, "must be an object");
+  const o = raw as Record<string, unknown>;
+  const allowed = ["v", "kind", "space", "actor", "instanceId", "managerLifecycleUid", "requestId", "registrationProof", "accountPublicKey", "processEpoch", "identities", ...fields];
+  for (const k of Object.keys(o)) if (!allowed.includes(k)) runRequestError(what, `has unknown field ${k}`);
+  const envelope = parseRemoteManagerEnvelope(o, kind, what);
+  if (!isAccountNkey(o.accountPublicKey)) runRequestError(what, "requires an account public key");
+  if (!Number.isSafeInteger(o.processEpoch) || (o.processEpoch as number) < 0) runRequestError(what, "requires a non-negative processEpoch");
+  return { ...envelope, accountPublicKey: o.accountPublicKey, processEpoch: o.processEpoch as number };
+}
+
+/** Closed parser for {@link RemoteRunAdmissionRequest}: unknown fields refuse, never ignored. */
+export function parseRemoteRunAdmissionRequest(raw: unknown): RemoteRunAdmissionRequest {
+  const what = "manager run admission";
+  const registered = parseRegisteredRunRequest(raw, "manager-run-admission", what, ["run"]);
+  const run = (raw as Record<string, unknown>).run as Record<string, unknown> | null;
+  if (run === null || typeof run !== "object" || Object.keys(run).sort().join(",") !== "runId,subject" ||
+      typeof run.runId !== "string" || !/^run-[0-9a-f]{32}$/.test(run.runId) || typeof run.subject !== "string")
+    runRequestError(what, "requires exactly run.runId (host-minted) and run.subject");
+  return {
+    v: 1, kind: "manager-run-admission", ...registered,
+    run: { runId: run.runId as string, subject: run.subject as string },
+  };
+}
+
+export function parseRemoteRunSubmissionRequest(raw: unknown): RemoteRunSubmissionRequest {
+  const registered = parseRegisteredRunRequest(raw, "manager-run-submission", "manager keyed submission", ["subject"]);
+  const subject = (raw as { subject?: unknown }).subject;
+  if (typeof subject !== "string") runRequestError("manager keyed submission", "requires observed subject");
+  return { v: 1, kind: "manager-run-submission", ...registered, subject: subject as string };
+}
+
+/** One issuer-observed keyed start/read. Initial authorization/evidence validation precedes
+ * binding creation. Its winner rechecks freshness before bounded admission; those fallible reads
+ * may retain binding-only debt without changing the original frozen admission authority. */
+export async function handleRemoteRunSubmission(args: {
+  request: unknown; owner: string; space: string; accountPublicKey: string; proofSecret: string | Uint8Array;
+  endpoint: string; observeManagerGate: ObserveManagerGate; issued: IssuedStore;
+  sourceIsLive: (source: IssuedSourceRef) => Promise<boolean>;
+  takeObserved: (subject: string) => Promise<ObservedRunRequest | undefined>;
+  /** What the ledger grants a principal now, frozen into the admission as what the run hands on. */
+  delegationOf: (owner: string, actor: string) => RunDelegation | undefined;
+  registeredCommand: (instanceId: string, revision: number, command: string) => Promise<Pick<EpCommandAuthority, "class" | "inputDigest" | "outputDigest">>;
+  withStore: <T>(runId: string, submission: { caller: import("@cotal-ai/core").EpCaller; id: string },
+    work: (kv: KV, jsm: import("@nats-io/jetstream").JetStreamManager) => Promise<T>) => Promise<T>;
+}): Promise<RemoteRunSubmissionResult> {
+  const r = parseRemoteRunSubmissionRequest(args.request);
+  const gate = await authenticateRegisteredManager(r, args, "keyed submission");
+  const parsed = parseEpSubject(r.subject);
+  if (!r.subject.startsWith(`cotal.${r.space}.`) || !parsed || parsed.plane !== "request" || parsed.rail !== EP_RAIL_V1
+    || parsed.endpoint !== args.endpoint || parsed.target !== null || parsed.route !== "inst" || parsed.instanceId !== r.instanceId
+    || !["run-start-keyed", "run-submission-status"].includes(parsed.command) || !isIssuedCaller(parsed.caller))
+    throw new EpEnvelopeError("permission-denied", "keyed submission requires this exact instance's observed issued request");
+  const observed = await args.takeObserved(r.subject), c = parsed.caller;
+  if (!observed?.submission || observed.operation.command !== parsed.command || !observed.envelope.bind
+    || observed.envelope.bind.instanceId !== r.instanceId || observed.envelope.bind.epoch !== r.processEpoch)
+    throw new EpEnvelopeError("permission-denied", "keyed submission has no exact observed instance/epoch support proof");
+  const contract = await args.registeredCommand(r.instanceId, gate.registrationRevision, parsed.command);
+  if (contract.class !== observed.envelope.class || contract.inputDigest !== observed.envelope.op.inputDigest
+    || contract.outputDigest !== observed.envelope.op.outputDigest)
+    throw new EpEnvelopeError("permission-denied", "keyed request does not pin the registered contract");
+  if (isDerivedOwner(c.owner) && c.owner !== args.owner)
+    throw new EpEnvelopeError("permission-denied", "keyed request belongs to another owner");
+  const ref = { space: r.space, owner: c.owner, actor: c.actor, uid: c.uid, generation: c.generation };
+  const resolved = await args.issued.resolve(ref, args.sourceIsLive);
+  if (!issuedPermitsSubject(resolved.evidence.permissions.publish, r.subject))
+    throw new EpEnvelopeError("permission-denied", "issued ceiling does not permit the keyed request");
+  const id = observed.operation.command === "run-submission-status" ? observed.operation.submissionId : observed.submission.id;
+  const runId = newSubmissionRunId();
+  const result = await args.withStore(runId, { caller: c, id }, async (kv, jsm) => {
+    if (performance.now() >= observed.submission!.requestEndsAt) throw new EpEnvelopeError("deadline-exceeded", "original observed keyed deadline elapsed");
+    if (parsed.command === "run-submission-status") return { winner: false, view: await readRunSubmission({
+      jsm, space: r.space, endpoint: args.endpoint, caller: c, submissionId: id, instanceId: r.instanceId, processEpoch: r.processEpoch }) };
+    const delegation = args.delegationOf(c.owner, c.actor);
+    const admission: RunAdmission = { version: 1, space: r.space, endpoint: args.endpoint, runId, instanceId: r.instanceId,
+      caller: c, ceiling: resolved.evidence.permissions, provenance: { kind: "issued", ref, resolvedRevision: resolved.revision }, admittedAt: Date.now(),
+      ...(delegation !== undefined ? { delegation } : {}) };
+    return bindAndAdmitRunSubmission({ kv, jsm, admission, submissionId: id, fingerprint: observed.submission!.fingerprint,
+      processEpoch: r.processEpoch, deadline: { requestEndsAt: observed.submission!.requestEndsAt,
+        ...(resolved.evidence.expiresAt !== undefined ? { authorityExpiresAt: resolved.evidence.expiresAt * 1000 } : {}) },
+      assertCurrent: async () => {
+        await authenticateRegisteredManager(r, args, "keyed admission recheck");
+        const fresh = await args.issued.resolve(ref, args.sourceIsLive);
+        if (fresh.revision !== resolved.revision || canonicalJson(fresh.evidence) !== canonicalJson(resolved.evidence))
+          throw new EpEnvelopeError("permission-denied", "original keyed admission authority changed; retain its binding");
+      } });
+  });
+  return { v: 1, kind: "manager-run-submission", requestId: r.requestId, ...result };
+}
+
+/** Authenticate the requesting registered manager: assigned space/account, open gate owned by this
+ *  owner's serve actor, current process epoch, and the current-registration proof. */
+async function authenticateRegisteredManager(
+  r: Pick<RemoteRunAdmissionRequest, "space" | "actor" | "instanceId" | "managerLifecycleUid" | "identities" | "registrationProof" | "accountPublicKey" | "processEpoch">,
+  args: { owner: string; space: string; accountPublicKey: string; proofSecret: string | Uint8Array; observeManagerGate: ObserveManagerGate },
+  what: string,
+): Promise<ManagerGate> {
+  if (r.space !== args.space || r.accountPublicKey !== args.accountPublicKey)
+    throw new EpEnvelopeError("permission-denied", `manager-service ${what} is bound to the host-assigned space and account`);
+  return await assertCurrentManagerRegistration(r, r.processEpoch, args, `manager-service ${what}`);
+}
+
+/**
+ * Host-side first-run admission for a registered signerless manager. The manager is trusted only to
+ * forward the `ep.v1` request subject it served, and only once for a request this host observed its
+ * caller publish. Everything else is derived here: the caller and generation come from the
+ * subject, the evidence and live sources from the issued store, the ceiling from that evidence.
+ * Every refusal happens before the create; an observed forward whose run is already admitted for
+ * the same caller and instance returns the admission already written.
+ */
+export async function admitRemoteRun(args: {
+  request: unknown;
+  owner: string;
+  space: string;
+  accountPublicKey: string;
+  proofSecret: string | Uint8Array;
+  endpoint: string;
+  observeManagerGate: ObserveManagerGate;
+  issued: IssuedStore;
+  sourceIsLive: (source: IssuedSourceRef) => Promise<boolean>;
+  /** Consumes the one observation of a served request subject. */
+  takeObserved: (subject: string) => Promise<ObservedRunRequest | undefined>;
+  /** What the ledger grants a principal now. The admission freezes it as what the run's spawns may
+   *  hand on, so a grant the starter gains later never reaches a helper (SPEC 14.8). */
+  delegationOf: (owner: string, actor: string) => RunDelegation | undefined;
+  admissions: KV;
+  now?: () => number;
+}): Promise<RemoteRunAdmissionResult> {
+  const r = parseRemoteRunAdmissionRequest(args.request);
+  await authenticateRegisteredManager(r, args, "run admission");
+  const parsed = parseEpSubject(r.run.subject);
+  if (!r.run.subject.startsWith(`cotal.${r.space}.`) || parsed === null || parsed.plane !== "request" || parsed.rail !== EP_RAIL_V1 ||
+      parsed.endpoint !== args.endpoint || parsed.command !== "run-start" || parsed.target !== null ||
+      (parsed.route === "inst" && parsed.instanceId !== r.instanceId) || !isIssuedCaller(parsed.caller))
+    throw new EpEnvelopeError("permission-denied", "manager run admission needs the served v1 run-start subject of this space, endpoint and instance with an issued caller");
+  // The subject's caller is the broker's word only if the broker carried it: a manager can name any
+  // live issuance in a subject it never received.
+  if ((await args.takeObserved(r.run.subject)) === undefined)
+    throw new EpEnvelopeError("permission-denied", "the issuing host did not observe this run-start request, or already admitted a forward of it (SPEC 14.8)");
+  const caller = parsed.caller;
+  if (isDerivedOwner(caller.owner) && caller.owner !== args.owner)
+    throw new EpEnvelopeError("permission-denied", "a user's run is admitted only on the participant manager that user registered");
+  const ref = { space: r.space, owner: caller.owner, actor: caller.actor, uid: caller.uid, generation: caller.generation };
+  const resolved = await args.issued.resolve(ref, args.sourceIsLive);
+  const e = resolved.evidence.ref;
+  if (e.space !== ref.space || e.owner !== ref.owner || e.actor !== ref.actor || e.uid !== ref.uid || e.generation !== ref.generation)
+    throw new EpEnvelopeError("permission-denied", "manager run admission evidence names another issued reference");
+  if (!issuedPermitsSubject(resolved.evidence.permissions.publish, r.run.subject))
+    throw new EpEnvelopeError("permission-denied", "the caller's issued ceiling does not permit this run-start subject");
+  const delegation = args.delegationOf(caller.owner, caller.actor);
+  const admission: RunAdmission = {
+    version: 1, space: r.space, endpoint: args.endpoint, runId: r.run.runId, instanceId: r.instanceId,
+    caller, ceiling: resolved.evidence.permissions,
+    provenance: { kind: "issued", ref, resolvedRevision: resolved.revision },
+    admittedAt: (args.now ?? Date.now)(),
+    ...(delegation !== undefined ? { delegation } : {}),
+  };
+  try {
+    const revision = await createRunAdmission(args.admissions, admission);
+    return { v: 1, kind: "manager-run-admission", requestId: r.requestId, runId: r.run.runId, revision, admission: admissionSnapshot(admission) };
+  } catch (err) {
+    if (!(err instanceof EpEnvelopeError) || err.code !== "conflict") throw err;
+    const entry = await args.admissions.get(admissionKey(args.endpoint, r.run.runId));
+    if (entry === null) throw err;
+    const written = admissionSnapshot(JSON.parse(new TextDecoder().decode(entry.value)));
+    const p = written.provenance;
+    if (written.instanceId !== r.instanceId || p.kind !== "issued" || p.ref.owner !== ref.owner || p.ref.actor !== ref.actor ||
+        p.ref.uid !== ref.uid || p.ref.generation !== ref.generation)
+      throw new EpEnvelopeError("conflict", `run ${r.run.runId} is already admitted for another caller or instance`);
+    return { v: 1, kind: "manager-run-admission", requestId: r.requestId, runId: r.run.runId, revision: entry.revision, admission: written };
+  }
+}
+
+const ID_TOKEN = /^[A-Za-z0-9_-]{1,64}$/;
+
+/** The cancellation door accepts only a stage and the exact observed body and subject. */
+export function parseRemoteRunCancelRequest(raw: unknown): RemoteRunCancelRequest {
+  const registered = parseRegisteredRunRequest(raw, "manager-run-cancel", "manager run cancel", ["stage", "subject", "cancel"]);
+  const input = raw as Record<string, unknown>;
+  if ((input.stage !== "inspect" && input.stage !== "commit") || typeof input.subject !== "string")
+    runRequestError("manager run cancel", "requires inspect or commit and an observed subject");
+  return { v: 1, kind: "manager-run-cancel", ...registered, stage: input.stage as "inspect" | "commit",
+    subject: input.subject as string, cancel: readRunCancelInput(input.cancel) };
+}
+
+/** Inspect never grants a later commit. A commit owns its immutable observation before caller
+ *  authorization and store preparation, and checks it again at the native dispatch boundary. */
+export async function handleRemoteRunCancel(args: {
+  request: unknown; owner: string; space: string; endpoint: string; accountPublicKey: string;
+  proofSecret: string | Uint8Array; observeManagerGate: ObserveManagerGate;
+  observations: RunCancelObservations; flush: () => Promise<void>;
+  issued: IssuedStore; sourceIsLive: (source: IssuedSourceRef) => Promise<boolean>;
+  interactiveScope: (caller: IssuedCaller, sources: readonly IssuedSourceRef[]) => Promise<readonly string[] | undefined>;
+  registeredCommand: (instanceId: string, revision: number, command: string) => Promise<Pick<EpCommandAuthority, "class" | "inputDigest" | "outputDigest">>;
+  readAdmission: (runId: string) => Promise<RunAdmissionView>;
+  readRevocation: (runId: string) => Promise<RunRevocation | undefined>;
+  withStore: <T>(runId: string, work: (kv: KV) => Promise<T>) => Promise<T>;
+  assertServing: () => void;
+}): Promise<RemoteRunCancelResult> {
+  const request = parseRemoteRunCancelRequest(args.request);
+  const common = { v: 1 as const, kind: "manager-run-cancel" as const, requestId: request.requestId, runId: request.cancel.runId };
+  // Authenticate the manager before its forward can consume another caller's observation.
+  await authenticateRegisteredManager(request, args, "run cancel");
+  const parsed = parseEpSubject(request.subject);
+  if (!request.subject.startsWith(`cotal.${args.space}.`) || !parsed || parsed.plane !== "request" || parsed.rail !== "v1"
+    || parsed.route !== "inst" || parsed.instanceId !== request.instanceId || parsed.endpoint !== args.endpoint
+    || parsed.command !== "run-cancel" || parsed.target !== null || !isIssuedCaller(parsed.caller))
+    throw new EpEnvelopeError("permission-denied", "run-cancel forward does not name this registered manager's issued request");
+  const caller = parsed.caller;
+  const authorize = async (observation: RunCancelObservation): Promise<{ authority: RunCancelAuthority; view: RunAdmissionView }> => {
+    args.assertServing();
+    if (observation.runId !== request.cancel.runId || observation.reason !== request.cancel.reason
+      || observation.instanceId !== request.instanceId || observation.processEpoch !== request.processEpoch)
+      throw new EpEnvelopeError("permission-denied", "run-cancel forward differs from the observed request");
+    if (performance.now() >= observation.requestEndsAt)
+      throw new EpEnvelopeError("deadline-exceeded", "run-cancel original observed deadline expired");
+    const gate = await authenticateRegisteredManager(request, args, "run cancel recheck");
+    const registered = await args.registeredCommand(request.instanceId, gate.registrationRevision, "run-cancel");
+    if (registered.class !== "ephemeral" || registered.class !== observation.class
+      || registered.inputDigest !== observation.inputDigest || registered.outputDigest !== observation.outputDigest)
+      throw new EpEnvelopeError("permission-denied", "run-cancel observation does not pin the registered contract");
+    const resolved = await args.issued.resolve({ space: args.space, owner: caller.owner, actor: caller.actor, uid: caller.uid, generation: caller.generation }, args.sourceIsLive);
+    if (!issuedPermitsSubject(resolved.evidence.permissions.publish, request.subject))
+      throw new EpEnvelopeError("permission-denied", "run-cancel issued authority does not permit its subject");
+    const view = await args.readAdmission(request.cancel.runId);
+    if (view.admission.space !== args.space || view.admission.endpoint !== args.endpoint || view.admission.runId !== request.cancel.runId)
+      throw new EpEnvelopeError("unavailable", "run-cancel admission names other coordinates");
+    const original = view.admission.caller;
+    let authority: RunCancelAuthority;
+    if (caller.owner === original.owner && caller.actor === original.actor && caller.uid === original.uid) authority = "original";
+    else {
+      const scope = await args.interactiveScope(caller, resolved.evidence.sources);
+      if (scope?.includes("admin")) authority = "admin";
+      else if (caller.owner === original.owner && scope?.includes("run")) authority = "owner-interactive";
+      else throw new EpEnvelopeError("permission-denied", "run-cancel request is not authorized");
+    }
+    args.assertServing();
+    if (performance.now() >= observation.requestEndsAt)
+      throw new EpEnvelopeError("deadline-exceeded", "run-cancel original observed deadline expired");
+    return { authority, view };
+  };
+  if (request.stage === "inspect") {
+    await args.flush();
+    const observation = args.observations.inspect(request.subject);
+    const { authority } = await authorize(observation);
+    // A redelivery may have conflicted during the reads. Inspection still grants nothing.
+    if (args.observations.inspect(request.subject) !== observation)
+      throw new EpEnvelopeError("permission-denied", "run-cancel observation changed");
+    return { ...common, stage: "inspect", authority };
+  }
+  let claim: RunCancelClaim | undefined;
+  try {
+    await args.flush();
+    claim = args.observations.claim(request.subject);
+    const first = await authorize(claim.observation);
+    claim.assertCurrent();
+    if (first.view.revoked) return { ...common, stage: "commit", result: { kind: "committed", outcome: "existed", revocation: first.view.revoked } };
+    const result = await args.withStore(request.cancel.runId, async kv => {
+      const fresh = await authorize(claim!.observation);
+      claim!.assertCurrent();
+      if (fresh.view.revoked) return { kind: "committed" as const, outcome: "existed" as const, revocation: fresh.view.revoked };
+      const revocation: RunRevocation = { version: 1, runId: request.cancel.runId, by: `${caller.owner}.${caller.actor}`, reason: request.cancel.reason, revokedAt: Date.now() };
+      const outcome = await commitRunCancellation(kv, args.endpoint, revocation, () => {
+        args.assertServing();
+        claim!.dispatch();
+      });
+      if (outcome === "created") return { kind: "committed" as const, outcome, revocation };
+      const stored = await args.readRevocation(request.cancel.runId);
+      if (!stored) throw new EpEnvelopeError("unavailable", "run-cancel marker could not be read after an existing write");
+      return { kind: "committed" as const, outcome, revocation: stored };
+    });
+    return { ...common, stage: "commit", result };
+  } catch (error) {
+    claim?.finish();
+    const refusal = args.observations.refusal(request.subject);
+    const allowed = new Set<RunCancelCommitCode>(["permission-denied", "failed-precondition", "deadline-exceeded", "resource-exhausted", "unavailable"]);
+    const code = error instanceof EpEnvelopeError && allowed.has(error.code as RunCancelCommitCode) ? error.code as RunCancelCommitCode : "unavailable";
+    return { ...common, stage: "commit", result: { kind: refusal.kind, code } };
+  } finally { claim?.finish(); }
+}
+
+/** Closed parser for the issuing-host revoke. It carries no asserted owner or attribution. */
+export function parseRemoteRunRevokeRequest(raw: unknown): RemoteRunRevokeRequest {
+  const what = "manager run revoke";
+  const registered = parseRegisteredRunRequest(raw, "manager-run-revoke", what, ["revoke"]);
+  const { revoke } = raw as Record<string, unknown>;
+  if (revoke === null || typeof revoke !== "object" || Array.isArray(revoke)) runRequestError(what, "requires revoke");
+  const r = revoke as Record<string, unknown>;
+  if (Object.keys(r).sort().join(",") !== "reason,runId" || typeof r.runId !== "string" || !/^run-[0-9a-f]{32}$/.test(r.runId) ||
+      typeof r.reason !== "string" || r.reason.length === 0) runRequestError(what, "requires exactly revoke.runId and a non-empty revoke.reason");
+  return { v: 1, kind: "manager-run-revoke", ...registered, revoke: { runId: r.runId, reason: r.reason } };
+}
+
+/** The door has authenticated the holder and read its current scope. The run's owner comes only
+ * from the recorded admission. A platform assignment is not an admin grant. */
+export async function revokeRemoteRun(args: ManagerAuthorityHolder & {
+  request: unknown;
+  space: string;
+  endpoint: string;
+  accountPublicKey: string;
+  proofSecret: string | Uint8Array;
+  observeManagerGate: ObserveManagerGate;
+  readAdmission: (runId: string) => Promise<RunAdmissionView>;
+  readRevocation: (runId: string) => Promise<RunRevocation | undefined>;
+  admissions: KV;
+  now?: () => number;
+}): Promise<RemoteRunRevokeResult> {
+  const r = parseRemoteRunRevokeRequest(args.request);
+  const view = await args.readAdmission(r.revoke.runId);
+  if (view.admission.instanceId !== r.instanceId)
+    throw new EpEnvelopeError("permission-denied", `run ${r.revoke.runId} was admitted on another manager instance; revoke refused`);
+  if (args.holder === "platform" || (view.admission.caller.owner !== args.owner && !args.scope.includes("admin")))
+    throw new EpEnvelopeError("permission-denied", `run ${r.revoke.runId}: revoke requires its admitted owner or a platform admin`);
+  // An admin may act for another owner, but the proof is still that registered manager's proof.
+  const gate = await args.observeManagerGate(r.instanceId);
+  const suffix = `.${remoteManagerActors(r.instanceId).serve}`;
+  if (!gate || !gate.principal.endsWith(suffix))
+    throw new EpEnvelopeError("failed-precondition", "manager run revoke has no current registered manager principal");
+  const managerOwner = gate.principal.slice(0, -suffix.length);
+  await authenticateRegisteredManager(r, { ...args, owner: managerOwner }, "run revoke");
+  await revokeRunAdmission(args.admissions, args.endpoint, {
+    version: 1, runId: r.revoke.runId, by: `${args.owner}.${r.actor}`, reason: r.revoke.reason, revokedAt: (args.now ?? Date.now)(),
+  });
+  const revocation = await args.readRevocation(r.revoke.runId);
+  if (revocation === undefined) throw new EpEnvelopeError("internal", `run ${r.revoke.runId}: revoke wrote no readable marker`);
+  return { v: 1, kind: "manager-run-revoke", requestId: r.requestId, runId: r.revoke.runId, revocation };
+}
+
+/** Closed parser for {@link RemoteRunAttemptRequest}. */
+export function parseRemoteRunAttemptRequest(raw: unknown): RemoteRunAttemptRequest {
+  const what = "manager run attempt";
+  const registered = parseRegisteredRunRequest(raw, "manager-run-attempt", what, ["attempt", "operator"]);
+  const { attempt, operator } = raw as Record<string, unknown>;
+  if ((attempt === undefined) === (operator === undefined)) runRequestError(what, "carries exactly one of attempt or operator");
+  const plain = (v: unknown, keys: string[], optional: string[] = []) => {
+    if (v === null || typeof v !== "object" || Array.isArray(v)) runRequestError(what, "attempt/operator must be an object");
+    const k = Object.keys(v as object);
+    if (k.some((x) => !keys.includes(x) && !optional.includes(x)) || keys.some((x) => !k.includes(x))) runRequestError(what, `attempt/operator must carry exactly ${keys.join(", ")}`);
+    return v as Record<string, unknown>;
+  };
+  const runIdOk = (v: unknown) => typeof v === "string" && /^run-[0-9a-f]{32}$/.test(v);
+  const servedOk = (v: unknown) => v === undefined || (typeof v === "string" && v.length > 0 && v.length <= 1024);
+  if (attempt !== undefined) {
+    const a = plain(attempt, ["runId", "takeoverId", "epoch", "fencingToken", "driverId", "mediatorId"], ["served"]);
+    if (!runIdOk(a.runId) || typeof a.takeoverId !== "string" || !ID_TOKEN.test(a.takeoverId) ||
+        !Number.isSafeInteger(a.epoch) || (a.epoch as number) < 1 || !Number.isSafeInteger(a.fencingToken) || (a.fencingToken as number) < 1 ||
+        !isUserNkey(a.driverId) || !isUserNkey(a.mediatorId) || a.driverId === a.mediatorId)
+      runRequestError(what, "attempt requires a run id, takeover id, positive epoch/fencingToken and distinct driver/mediator nkeys");
+    if (!servedOk(a.served)) runRequestError(what, "attempt served must be a request subject");
+    return { v: 1, kind: "manager-run-attempt", ...registered, attempt: { runId: a.runId as string, takeoverId: a.takeoverId, epoch: a.epoch as number, fencingToken: a.fencingToken as number, driverId: a.driverId, mediatorId: a.mediatorId, ...(a.served !== undefined ? { served: a.served as string } : {}) } };
+  }
+  const op = plain(operator, ["id", "takeoverId"], ["runId", "answers", "served"]);
+  if (!isUserNkey(op.id) || typeof op.takeoverId !== "string" || !ID_TOKEN.test(op.takeoverId) ||
+      (op.runId !== undefined && !runIdOk(op.runId)))
+    runRequestError(what, "operator requires an nkey id, a takeover id and an optional run id");
+  let answers: { runId: string; stepKey: string; amend?: true } | undefined;
+  if (op.answers !== undefined) {
+    const t = plain(op.answers, ["runId", "stepKey"], ["amend"]);
+    if (!runIdOk(t.runId) || typeof t.stepKey !== "string" || t.stepKey.length === 0 || t.stepKey.length > 1024 || op.runId !== undefined ||
+        (t.amend !== undefined && t.amend !== true))
+      runRequestError(what, "operator answers carries the run id and step key of one pause, an optional amend: true and no outer run id");
+    answers = { runId: t.runId as string, stepKey: t.stepKey, ...(t.amend === true ? { amend: true as const } : {}) };
+  }
+  if (!servedOk(op.served) || (op.served !== undefined && answers === undefined))
+    runRequestError(what, "operator served is the run-answer subject, and only an answering operator carries one");
+  return { v: 1, kind: "manager-run-attempt", ...registered, operator: { id: op.id, takeoverId: op.takeoverId, ...(op.runId !== undefined ? { runId: op.runId as string } : {}), ...(answers ? { answers } : {}), ...(op.served !== undefined ? { served: op.served as string } : {}) } };
+}
+
+/** What a served resume or answer asks the host to issue for: a resume names its run, an answer
+ *  the endpoint it answers on, the run and step whose pause it answers, and whether it amends
+ *  (SPEC 14.8). */
+export type RunRequestOperation =
+  | { command: "run-resume"; runId: string }
+  | { command: "run-answer"; endpoint: string; runId: string; stepKey: string; amend: boolean };
+
+/** A served run-start, resume or answer as its caller published it: the operation, and the class,
+ *  pinned contract and `bind` of its envelope. A manager registered with another class or contract,
+ *  or serving at another incarnation than the bound one, refuses it unrun (SPEC 13.2, 13.7). */
+export interface ObservedRunRequest {
+  operation: RunRequestOperation | { command: "run-start" | "run-start-keyed" } | { command: "run-submission-status"; submissionId: string };
+  envelope: Pick<EndpointRequest, "class" | "op" | "bind">;
+  /** `requestEndsAt` is on this issuing process's monotonic clock, from its own observation; it
+   *  never leaves this process. */
+  submission?: { id: string; fingerprint: string; requestEndsAt: number };
+}
+
+/** The run-start, resume or answer request its caller published on `subject`, or undefined for a
+ *  request no manager serves. */
+export function observedRunRequest(subject: string, data: Uint8Array): ObservedRunRequest | undefined {
+  const parsed = parseEpSubject(subject);
+  if (parsed === null || parsed.plane !== "request") return undefined;
+  let env: EndpointRequest;
+  try {
+    env = parseEndpointRequest(JSON.parse(new TextDecoder().decode(data)));
+    checkRequestSubjectAgreement(env, parsed);
+  } catch {
+    return undefined;
+  }
+  const envelope = { class: env.class, op: env.op, bind: env.bind };
+  if (parsed.command === "run-start") return { operation: { command: "run-start" }, envelope };
+  if (parsed.command === "run-start-keyed" || parsed.command === "run-submission-status") {
+    if (!Number.isSafeInteger(env.deadlineMs) || env.deadlineMs! <= 0 || env.deadlineMs! > KEYED_SUBMISSION_MAX_DEADLINE_MS) return undefined;
+    // This runs in the shared observation callback: carried content that cannot be canonicalized
+    // (a lone surrogate, nesting past the stack) leaves the request unobserved, never a throw.
+    let fingerprint: string;
+    try { fingerprint = submissionFingerprint(env, parsed).fingerprint; } catch { return undefined; }
+    const submission = { id: env.id, fingerprint, requestEndsAt: performance.now() + env.deadlineMs! };
+    if (parsed.command === "run-start-keyed") return { operation: { command: "run-start-keyed" }, envelope, submission };
+    if (typeof env.args?.submissionId !== "string") return undefined;
+    return { operation: { command: "run-submission-status", submissionId: env.args.submissionId }, envelope, submission };
+  }
+  const args = env.args;
+  if (args === null || args === undefined || typeof args.runId !== "string") return undefined;
+  if (parsed.command === "run-resume") return { operation: { command: "run-resume", runId: args.runId }, envelope };
+  if (parsed.command !== "run-answer") return undefined;
+  const endpoint = args.endpoint ?? parsed.endpoint;
+  if (typeof endpoint !== "string" || typeof args.stepKey !== "string" || (args.amend !== undefined && typeof args.amend !== "boolean")) return undefined;
+  return { operation: { command: "run-answer", endpoint, runId: args.runId, stepKey: args.stepKey, amend: args.amend === true }, envelope };
+}
+
+/** The served caller of a resume or an answer, checked against the run's owner (SPEC 14.8). The
+ *  subject is re-parsed as {@link admitRemoteRun} parses a run-start, except that the `self` target
+ *  a `run-answer` rides is accepted, and must be a request this host observed and has not yet
+ *  accepted a forward of, asking for `operation`, bound to no other manager incarnation than
+ *  `instanceId` at `processEpoch`, and declaring the class and pinning the contract the manager
+ *  registered at `registrationRevision` declares for it. A derived user owner must be
+ *  `runOwner`; a v1 caller's issuance must resolve live and permit the subject; a legacy caller is
+ *  accepted only for `run-answer` from a live managed row of that owner, the seat relay path. */
+async function authorizeServedRunCaller(args: {
+  served: string;
+  operation: RunRequestOperation;
+  /** The admission's owner for a resume; the manager's registered owner for an answer. */
+  runOwner: string;
+  space: string;
+  endpoint: string;
+  instanceId: string;
+  /** The registered manager's process epoch, the epoch it serves at. */
+  processEpoch: number;
+  registrationRevision: number;
+  issued: IssuedStore;
+  sourceIsLive: (source: IssuedSourceRef) => Promise<boolean>;
+  isLiveManagedActor: (owner: string, actor: string, lifecycleUid: string) => boolean;
+  takeObserved: (subject: string) => Promise<ObservedRunRequest | undefined>;
+  registeredCommand: RegisteredRunCommand;
+}): Promise<void> {
+  const command = args.operation.command;
+  const parsed = parseEpSubject(args.served);
+  if (!args.served.startsWith(`cotal.${args.space}.`) || parsed === null || parsed.plane !== "request" ||
+      parsed.endpoint !== args.endpoint || parsed.command !== command || (parsed.target !== null && parsed.target.mode !== "self") ||
+      (parsed.route === "inst" && parsed.instanceId !== args.instanceId))
+    throw new EpEnvelopeError("permission-denied", `a served ${command} must name this space, endpoint and instance, untargeted or self-targeted`);
+  // The subject's caller is the broker's word only if the broker carried it: a manager can name any
+  // live issuance in a subject it never received.
+  const observation = await args.takeObserved(args.served);
+  if (observation === undefined)
+    throw new EpEnvelopeError("permission-denied", `the issuing host did not observe this ${command} request, or already accepted a forward of it (SPEC 14.8)`);
+  // The forward's coordinates are the manager's word; the observed request's are the caller's.
+  const forwarded = args.operation, observed = observation.operation;
+  if (observed.command === "run-resume"
+    ? forwarded.command !== "run-resume" || forwarded.runId !== observed.runId
+    : observed.command !== "run-answer" || forwarded.command !== "run-answer" || forwarded.endpoint !== observed.endpoint || forwarded.runId !== observed.runId ||
+      forwarded.stepKey !== observed.stepKey || forwarded.amend !== observed.amend)
+    throw new EpEnvelopeError("permission-denied", `the forwarded ${command} names another run, step, endpoint or amendment than the request the issuing host observed (SPEC 14.8)`);
+  // The manager serving at another incarnation than the bound one refuses the request unrun, so a
+  // forward of it must not turn into authority for the incarnation registered now.
+  const { bind, class: declaredClass, op } = observation.envelope;
+  if (bind !== undefined && (bind.instanceId !== args.instanceId || bind.epoch !== args.processEpoch))
+    throw new EpEnvelopeError("permission-denied", `the observed ${command} request is bound to another manager instance or epoch than the registered one, which refuses it unrun (SPEC 13.2, 14.8)`);
+  // It also refuses unrun a request whose class or pinned contract is not the one it registered.
+  const registered = await args.registeredCommand(args.instanceId, args.registrationRevision, command);
+  if (declaredClass !== registered.class || op.inputDigest !== registered.inputDigest || op.outputDigest !== registered.outputDigest)
+    throw new EpEnvelopeError("permission-denied", `the observed ${command} request declares another class or pins another contract than the registered manager serves, which refuses it unrun (SPEC 13.7, 14.8)`);
+  const caller = parsed.caller;
+  if (isDerivedOwner(caller.owner) && caller.owner !== args.runOwner)
+    throw new EpEnvelopeError("permission-denied", "a user resumes only a run admitted for that user and answers only on the participant manager that user registered");
+  if (parsed.rail === EP_RAIL_V1 && isIssuedCaller(caller)) {
+    const ref = { space: args.space, owner: caller.owner, actor: caller.actor, uid: caller.uid, generation: caller.generation };
+    const resolved = await args.issued.resolve(ref, args.sourceIsLive);
+    if (!issuedPermitsSubject(resolved.evidence.permissions.publish, args.served))
+      throw new EpEnvelopeError("permission-denied", `the caller's issued ceiling does not permit this ${command} subject`);
+    return;
+  }
+  if (command === "run-answer" && caller.owner === args.runOwner && args.isLiveManagedActor(caller.owner, caller.actor, caller.uid)) return;
+  throw new EpEnvelopeError("permission-denied", `${command} on a participant manager rides the versioned rail with an issued caller; only a live managed seat of the run's owner answers on the legacy rail (SPEC 14.8)`,
+    [{ kind: EP_UNBOUND_CALLER_AUTHORITY, owner: caller.owner, actor: caller.actor, uid: caller.uid }]);
+}
+
+/** The registered manager's declaration of a served command at a registration revision: the class
+ *  and contract its serving endpoint admits. */
+export type RegisteredRunCommand = (
+  instanceId: string,
+  registrationRevision: number,
+  command: RunRequestOperation["command"],
+) => Promise<Pick<EpCommandAuthority, "class" | "inputDigest" | "outputDigest">>;
+
+/** What the host then signs, and nothing else: one fixed profile per caller-held nkey. */
+export type RemoteRunAttemptGrant =
+  | { kind: "attempt"; driver: { id: string; profile: "run-driver"; runDriver: RunDriverGrantArgs }; mediator: { id: string; profile: "run-mediator"; runMediator: RunDriverGrantArgs } }
+  | { kind: "operator"; operator: { id: string; profile: "run-operator"; runOperator: RunOperatorGrantArgs } };
+
+/**
+ * Host-only authorization for {@link RemoteRunAttemptRequest}. Every coordinate the returned grant
+ * pins is derived from host stores: the admission must exist on this instance and be unrevoked
+ * for an attempt or answer. A read-only operator can inspect a revoked run. The
+ * attempt must be exactly the next epoch/fencing token the run record implies (1/1 for a first
+ * attempt with no record, as stock `start` launches), and an answer pins the pause the named run's
+ * journal records at the named step, which must be waiting. Refuses before the host signs anything.
+ */
+export async function authorizeRemoteRunAttempt(args: {
+  request: unknown;
+  owner: string;
+  space: string;
+  accountPublicKey: string;
+  proofSecret: string | Uint8Array;
+  endpoint: string;
+  observeManagerGate: ObserveManagerGate;
+  readAdmission: (runId: string) => Promise<RunAdmissionView>;
+  readRunStatus: (runId: string) => Promise<RunStatusValue | undefined>;
+  /** The named run's journal step entries, in append order: what an answer's pause is read off. */
+  readJournal: (runId: string) => Promise<readonly JournalEntry[]>;
+  checkpointWaiting: (token: string) => Promise<boolean>;
+  /** Whether the pause settled `resumed` naming an accepted answer: what an amendment amends. */
+  checkpointSettled: (token: string) => Promise<boolean>;
+  /** The issued store, the source and ledger checks, the observed requests and the registered
+   *  declarations a request carrying `served` is checked with. `takeObserved` consumes the one
+   *  observation of a subject and returns what its request asked for. */
+  issued?: IssuedStore;
+  sourceIsLive?: (source: IssuedSourceRef) => Promise<boolean>;
+  isLiveManagedActor?: (owner: string, actor: string, lifecycleUid: string) => boolean;
+  takeObserved?: (subject: string) => Promise<ObservedRunRequest | undefined>;
+  registeredCommand?: RegisteredRunCommand;
+}): Promise<RemoteRunAttemptGrant> {
+  const r = parseRemoteRunAttemptRequest(args.request);
+  const gate = await authenticateRegisteredManager(r, args, "run attempt");
+  const admitted = async (runId: string) => {
+    const view = await args.readAdmission(runId);
+    if (view.revoked !== undefined && (r.attempt !== undefined || r.operator?.answers !== undefined))
+      throw new EpEnvelopeError("permission-denied", `run ${runId} was revoked; no attempt or answering authority is issued (SPEC 14.8)`);
+    if (view.admission.instanceId !== r.instanceId || view.admission.endpoint !== args.endpoint || view.admission.space !== r.space)
+      throw new EpEnvelopeError("permission-denied", `run ${runId} was admitted on another manager instance or endpoint`);
+    return view.admission;
+  };
+  const served = (subject: string, operation: RunRequestOperation, runOwner: string) => {
+    if (args.issued === undefined || args.sourceIsLive === undefined || args.isLiveManagedActor === undefined || args.takeObserved === undefined ||
+        args.registeredCommand === undefined)
+      throw new EpEnvelopeError("internal", "a served run request needs the issued store, the actor ledger, the observed requests and the registered declarations on the issuing host");
+    return authorizeServedRunCaller({
+      served: subject, operation, runOwner, space: r.space, endpoint: args.endpoint, instanceId: r.instanceId, processEpoch: r.processEpoch,
+      registrationRevision: gate.registrationRevision,
+      issued: args.issued, sourceIsLive: args.sourceIsLive, isLiveManagedActor: args.isLiveManagedActor, takeObserved: args.takeObserved,
+      registeredCommand: args.registeredCommand,
+    });
+  };
+  if (r.attempt) {
+    const a = r.attempt;
+    const admission = await admitted(a.runId);
+    if (a.served !== undefined) await served(a.served, { command: "run-resume", runId: a.runId }, admission.caller.owner);
+    const status = await args.readRunStatus(a.runId);
+    if (status?.state === "completed" || status?.state === "failed")
+      throw new EpEnvelopeError("failed-precondition", `run ${a.runId} is ${status.state}; a terminal run gets no new attempt`);
+    if (a.epoch !== (status?.epoch ?? 0) + 1 || a.fencingToken !== (status?.fencingToken ?? 0) + 1)
+      throw new EpEnvelopeError("conflict", `run ${a.runId} attempt must be the next recorded epoch/fencing token`);
+    const pin: RunDriverGrantArgs = { endpoint: args.endpoint, runId: a.runId, owner: admission.caller.owner, takeoverId: a.takeoverId, instanceId: r.instanceId, epoch: a.epoch };
+    // The host never sees the program, and the only instance a signerless manager places a spawn on
+    // is its own, so the mediator is pinned there; that row reaches no manager the class row does not.
+    return { kind: "attempt", driver: { id: a.driverId, profile: "run-driver", runDriver: pin }, mediator: { id: a.mediatorId, profile: "run-mediator", runMediator: { ...pin, placement: { instanceId: r.instanceId } } } };
+  }
+  const op = r.operator!;
+  if (op.runId !== undefined) await admitted(op.runId);
+  let token: string | undefined;
+  if (op.answers !== undefined) {
+    const { runId, stepKey } = op.answers, amend = op.answers.amend === true;
+    await admitted(runId);
+    // The token is read off the run's own journal, never taken from the manager: every manager
+    // instance's pauses share one token namespace, so a named token could be another run's.
+    token = pauseToken(await args.readJournal(runId), runId, stepKey, amend);
+    // The pause is checked first, then the caller. An answer needs a waiting pause; an amendment
+    // needs the pause whose answer was accepted, and nothing else.
+    if (amend ? !(await args.checkpointSettled(token)) : !(await args.checkpointWaiting(token)))
+      throw new EpEnvelopeError("failed-precondition", amend
+        ? "run operator amends only a checkpoint whose answer was accepted"
+        : "run operator answers only a checkpoint that is still waiting");
+    // Every answer and amendment names the caller it serves; the host never answers for the manager.
+    if (op.served === undefined)
+      throw new EpEnvelopeError("permission-denied", "an answering run operator carries the served run-answer subject of the caller it answers for (SPEC 14.8)");
+    await served(op.served, { command: "run-answer", endpoint: args.endpoint, runId, stepKey, amend }, args.owner);
+  }
+  const runOperator: RunOperatorGrantArgs = { endpoint: args.endpoint, takeoverId: op.takeoverId, ...(op.runId !== undefined ? { runId: op.runId } : {}), ...(token !== undefined ? { answers: { token } } : {}) };
+  return { kind: "operator", operator: { id: op.id, profile: "run-operator", runOperator } };
+}
+
+/** The token of the pause at `stepKey`: the open one for an answer, the settled one for an amendment. */
+function pauseToken(entries: readonly JournalEntry[], runId: string, stepKey: string, amend: boolean): string {
+  try {
+    if (!amend) return openCheckpointToken(entries, runId, stepKey);
+    const token = settledPauseToken(entries, runId, stepKey);
+    if (token === undefined) throw new CheckpointNotAmendable(runId, stepKey, "unanswered");
+    return token;
+  } catch (e) {
+    if (e instanceof CheckpointNotOpen || e instanceof CheckpointNotAmendable) throw new EpEnvelopeError("failed-precondition", e.message);
+    throw e;
+  }
+}

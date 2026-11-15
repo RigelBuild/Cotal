@@ -1,0 +1,110 @@
+{
+  "suite": [
+    "extensions/connector-core/smoke/connection-status.smoke.ts"
+  ],
+  "guard": "cotal_connection_status reports MeshAgent's live state, and its five states stay distinct",
+  "command": "pnpm smoke:connection-status",
+  "progressPattern": "  ✓ ",
+  "completionMarker": "SUITE COMPLETE:",
+  "proveWith": "node scripts/mutation-proof.mjs --config extensions/connector-core/smoke/fixtures/connection-status.mutations.json",
+  "why": [
+    "The state a caller acts on is derived from three facts, so each collapse of that derivation gets its own mutation rather than one mutation standing in for the whole getter. A single mutation on connectionState would be killed by whichever cell ran first and would leave the other states ungraded.",
+    "M1 and M6 mutate the two liveness getters, which proves the tool reports live MeshAgent state rather than deriving or assuming it. M2 to M4 collapse one state into another, which proves each state is separately observable. M5 mutates the issue scoping, which is the only thing keeping a stopped session's post-mortem from being read as a current fault.",
+    "The full predicted kill set, including every exclusion, is recorded in the suite header before this config is run.",
+    "The suite imports connector-core source relatively, so mutation-proof executes the changed source directly and needs no build or afterRestore command.",
+    "The completion marker carries no cell count on purpose. Each of these suites prints `SUITE COMPLETE: ${ran} cells` and separately refuses a run whose `ran` is not its EXPECTED_CELLS, so a count in the marker duplicates a check the suite already makes and rots the moment a cell is added. It did: a cell landed in the suite, the marker still said 15, and every mutant here graded INCONCLUSIVE for a week because a finished run printed a line the marker could never match."
+  ],
+  "mutations": [
+    {
+      "name": "MeshAgent connected state is replaced by a constant false",
+      "file": "extensions/connector-core/src/agent.ts",
+      "find": "  get connected(): boolean {\n    return this._connected;\n  }",
+      "replace": "  get connected(): boolean {\n    return false;\n  }",
+      "expectRed": "the real MCP route reports the MeshAgent's live connected=true state",
+      "cell": "the real MCP route reports the MeshAgent's live connected=true state",
+      "note": "This proves the tool reports the live MeshAgent getter. It deliberately does not mutate the tool's renderer, which could only prove formatting while leaving the state source ungraded."
+    },
+    {
+      "name": "the derived state stops distinguishing a deliberate stop from a lost connection",
+      "file": "extensions/connector-core/src/agent.ts",
+      "find": "    if (this._stopping) return \"stopped\";",
+      "replace": "",
+      "expectRed": "a deliberately stopped session reports stopped rather than disconnected",
+      "cell": "a deliberately stopped session reports stopped rather than disconnected",
+      "note": "stop() clears both liveness flags, so without this line a stopped session falls through to disconnected. This is the defect the tool was redesigned to remove, so it is pinned rather than left to a comment. The post-mortem cell also reds under this mutant, because the issue key is chosen from the state."
+    },
+    {
+      "name": "degraded collapses into ready, so a dead socket under a live bind reads as healthy",
+      "file": "extensions/connector-core/src/agent.ts",
+      "find": "      if (!this._transportConnected) return \"degraded\";",
+      "replace": "      if (false) return \"degraded\";",
+      "expectRed": "bound with the transport down reports degraded, not connected and not disconnected",
+      "cell": "bound with the transport down reports degraded, not connected and not disconnected",
+      "note": "This is the row the previous single boolean got wrong: it reported not-degraded on the one state that needs attention. The derivation became a block when #1233 added `stalled` below it, so this mutation now collapses the degraded GUARD rather than a one-line ternary. Same property, same cell: a dead socket under a live bind must not read as healthy."
+    },
+    {
+      "name": "connecting collapses into disconnected, erasing the pre-bind window",
+      "file": "extensions/connector-core/src/agent.ts",
+      "find": "    return this._transportConnected ? \"connecting\" : \"disconnected\";",
+      "replace": "    return \"disconnected\";",
+      "expectRed": "a live transport whose bind has not finished reports connecting",
+      "cell": "a live transport whose bind has not finished reports connecting",
+      "note": "The endpoint emits transport=true when connect() returns while the bind is still in progress, so this window is reachable and a caller polling during a slow bind lands in it."
+    },
+    {
+      "name": "a stopped session's retained failure is reported as a current issue",
+      "file": "extensions/connector-core/src/tool-specs.ts",
+      "find": "          issue === undefined ? {} : state === \"stopped\" ? { lastConnectionIssue: issue } : { connectionIssue: issue };",
+      "replace": "          issue === undefined ? {} : { connectionIssue: issue };",
+      "expectRed": "a stopped session reports its retained failure as a post-mortem, not as a current issue",
+      "cell": "a stopped session reports its retained failure as a post-mortem, not as a current issue",
+      "note": "The issue deliberately survives stop(). Without the scoping, a cleanly stopped session reports an old failure under the key a reader takes to mean what is wrong right now."
+    },
+    {
+      "name": "the reported transport fact is a constant rather than the live getter",
+      "file": "extensions/connector-core/src/agent.ts",
+      "find": "  get transportConnected(): boolean {\n    return this._transportConnected;\n  }",
+      "replace": "  get transportConnected(): boolean {\n    return true;\n  }",
+      "expectRed": "bound with the transport down reports degraded, not connected and not disconnected",
+      "cell": "bound with the transport down reports degraded, not connected and not disconnected",
+      "note": "connectionState reads the private field, so this mutant leaves the derived state correct and corrupts only the reported fact. That is the point: it proves the raw facts are reported from live getters rather than back-derived from the state, which would make them useless for a caller that wants to check our derivation."
+    },
+    {
+      "name": "the reported stopping fact is a constant, so stopped and disconnected become identical",
+      "file": "extensions/connector-core/src/tool-specs.ts",
+      "find": "              stopping: agent.stopping,",
+      "replace": "              stopping: false,",
+      "expectRed": "the reported facts distinguish stopped from disconnected, which agree on both other facts",
+      "cell": "the reported facts distinguish stopped from disconnected, which agree on both other facts",
+      "note": "connectionState reads the private field, so this leaves `state` correct and breaks only the reported facts. Without it the three reported facts cannot reproduce the state, because stopped and disconnected agree on the other two, and the caller has to take the derivation on trust."
+    },
+    {
+      "name": "the stall clock resets on ANY automatic commit rather than on the queue head (#1526)",
+      "file": "extensions/connector-core/src/agent.ts",
+      "find": "    const since = Math.max(oldest, this._lastAutomaticHeadDrainedAt ?? 0);",
+      "replace": "    const since = Math.max(oldest, this._lastAutomaticDrainedAt ?? 0);",
+      "expectRed": "committing fresh arrivals over an undelivered head is NOT progress, so the session still refuses ready",
+      "cell": "committing fresh arrivals over an undelivered head is NOT progress, so the session still refuses ready",
+      "note": "This restores the exact pre-fix measure. A seat that commits the traffic arriving on top of a head it cannot deliver resets its own clock every turn and reports `ready` indefinitely, which is the reported incident: 96 deliveries owed, the oldest over two hours old, every health field green. The cells above it stage no automatic queue at all and stay green under this mutant, so the red is located on the behaviour rather than on a collapse of the suite."
+    },
+    {
+      "name": "head progress is recorded for any automatic entry in the batch, not the head itself",
+      "file": "extensions/connector-core/src/agent.ts",
+      "find": "    if (selected.some((p) => !p.pullOnly && p.item.recvKey === head)) this._lastAutomaticHeadDrainedAt = Date.now();",
+      "replace": "    if (selected.some((p) => !p.pullOnly)) this._lastAutomaticHeadDrainedAt = Date.now();",
+      "expectRed": "committing fresh arrivals over an undelivered head is NOT progress, so the session still refuses ready",
+      "cell": "committing fresh arrivals over an undelivered head is NOT progress, so the session still refuses ready",
+      "note": "The second half of the fix, mutated separately from the measure it feeds. Keying the new mark on any automatic entry makes it a slower-spelled copy of the old one, so the fix could be half-reverted here and still look present at the call site. The accepting cell below it pins the other direction, so a mutant that simply never records progress is not mistaken for a pass."
+    },
+    {
+      "name": "durable delivery health collapses back to the lease-only conjunct, certifying a killed daemon's residue (#445)",
+      "file": "extensions/connector-core/src/agent.ts",
+      "find": "    const held = (channel: string): \"active\" | \"degraded\" | \"unknown\" =>\n      !leaseReadable\n        ? \"unknown\"\n        : daemonMemberships !== undefined && leaseLive && daemonMemberships.some((m) => m.channel === channel || (isChannelFamily(m.channel) && subjectMatches(m.channel, channel)))\n          ? \"active\"\n          : \"degraded\";",
+      "replace": "    const held = (channel: string): \"active\" | \"degraded\" | \"unknown\" =>\n      leaseLive\n        ? \"active\"\n        : \"degraded\";",
+      "expectRed": "daemon gone + lease residue still ready ⇒ deliveryHealth degraded, NEVER active (#445)",
+      "cell": "daemon gone + lease residue still ready ⇒ deliveryHealth degraded, NEVER active (#445)",
+      "command": "pnpm --filter @cotal-ai/core build && pnpm smoke:channel-attention:auth",
+      "note": "This restores the exact pre-#445 measure: health from the lease and the session-local membership map alone, the two conjuncts a SIGKILLed daemon satisfies for a whole lease TTL. The suite stages a daemon that stops without a lease release, so its KV row still reads ready:true, and the FIRST cell this mutant reddens is the daemon-gone one named above — a killed daemon again certifying itself active. The per-mutation command runs the auth suite that stages the daemon; the config-level command still grades this file's own suite. The auth suite runs every cell and prints `SUITE COMPLETE:` on pass and fail alike, so the config-level completionMarker applies to it and a red run is graded by count."
+    }
+  ]
+}

@@ -90,6 +90,10 @@ const shown = (r: ReturnType<typeof run>) => ({ status: r.status, stdout: r.stdo
 const cases: { args: string[]; message: RegExp }[] = [
   { args: ["-d", "--foreground"], message: /choose --foreground or --detach, not both/ },
   { args: ["--max-sessions", "0"], message: /--max-sessions must be a positive integer/ },
+  { args: ["--seat-mint-cap", "0"], message: /--seat-mint-cap must be a positive integer/ },
+  { args: ["--seat-mint-cap", "abc"], message: /--seat-mint-cap must be a positive integer/ },
+  { args: ["--no-manager", "--seat-mint-cap", "2"], message: /--no-manager cannot be combined with --seat-mint-cap/ },
+  { args: ["--seat-mint-cap", "2", "--file", join(folder, "missing.yaml")], message: /--seat-mint-cap cannot be combined with --file\/-f/ },
   { args: ["--max-sessions", "abc"], message: /--max-sessions must be a positive integer/ },
   { args: ["--max-file-store", "0"], message: /--max-file-store must be a positive integer/ },
   { args: ["--max-payload", "0"], message: /--max-payload must be a positive integer/ },

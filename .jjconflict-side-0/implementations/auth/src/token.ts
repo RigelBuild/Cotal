@@ -1,0 +1,356 @@
+/**
+ * User-token validation — the strict Plane-2 check the auth callout runs on the bearer an agent
+ * presents in `auth_token` (SPEC-normative claim shape; the plan's §"Token shape").
+ *
+ * Claim shape (normative): `sub` = the opaque derived owner · `act` = server-authored
+ * { owner, actor, scope?, parent? } with AT MOST one parent/spawner audit link (nested delegation
+ * chains are cross-account scope, not this plan) · `aud` = the space · `scope` = capability list ·
+ * `ver` = token-shape version (a stale `ver` is rejected — downgrade defense).
+ *
+ * Validation is fail-closed and pinned end-to-end:
+ *  - `alg` pinned to EdDSA (Ed25519) — nothing else verifies;
+ *  - key-smuggling headers (`jku` / `jwk` / `x5u` / `x5c`) are rejected outright — the key is
+ *    resolved ONLY through the caller-pinned resolver (a `createRemoteJWKSet` on a pinned origin,
+ *    or a local key); a `kid` never resolves anywhere else;
+ *  - `iss` / `aud` enforced; `exp`, `iat`, and `nbf` are REQUIRED; the lifetime is capped and
+ *    ANCHORED TO THE VALIDATOR'S CLOCK — future-dated `iat`/`exp` windows are rejected, not just
+ *    long spans (short-lived tokens are the v1 revocation lever — an unbounded or post-dated
+ *    token would quietly disable it).
+ */
+import { decodeProtectedHeader, errors, jwtVerify } from "jose";
+import type { CryptoKey, JWTVerifyGetKey } from "jose";
+import { assertDerivedOwnerToken, assertLifecycleToken, assertValidOwnerToken, credentialLifetime, SERVICE_ACCESS_TTL_SECONDS, parseServiceRegistrationWitness, type ServiceRegistrationWitness } from "@cotal-ai/core";
+
+/** Current normative token-shape version. Bump only with a SPEC change; validators reject
+ *  anything else (older = downgrade, newer = from-the-future misconfig). */
+export const USER_TOKEN_VER = 1;
+
+/** A renewal proof is a distinct JWT class, never a user/connect bearer. */
+export const SERVICE_RENEWAL_TYP = "cotal-service-renewal+jwt";
+
+/** Default cap on `exp - iat`. 15 minutes: long enough for connect + retries, short enough that
+ *  re-mint is the working revocation path. */
+export const MAX_TOKEN_TTL_SEC = 900;
+
+/** Clock skew both verifiers allow on `exp`, `nbf` and `iat`. A constant because a caller-supplied
+ *  `NaN` tolerance made each of those comparisons false and switched expiry off. */
+export const CLOCK_TOLERANCE_SEC = 5;
+
+/** The elevated per-connection profiles a bearer may request at exchange time (the "views"):
+ *  read-only god view, space-history purge, channel delete, channel-registry writes, and the
+ *  manifest-deploy preflight. The narrowing manager-caller view is also available to an actor-secret
+ *  exchange. Views are server-authored after a fresh ledger check against {@link VIEW_REQUIRED_SCOPE};
+ *  the callout mints the matching profile
+ *  instead of `agent`. A closed enum on BOTH the mint and validate side — an unknown view fails
+ *  closed, never falls back to a profile. Deliberately NOT a generic `view=<profile>` passthrough:
+ *  most profiles are daemon/provisioning surfaces that must never become human-requestable. */
+export const USER_TOKEN_VIEWS = ["admin", "purger", "channel-purger", "channel-writer", "deployer", "manager-service", "manager-caller", "session-caller", "transfer-writer", "service-endpoint", "dm-reader"] as const;
+export type UserTokenView = (typeof USER_TOKEN_VIEWS)[number];
+
+/** Views the public exchange face will mint (still ledger-gated). Every other
+ *  {@link USER_TOKEN_VIEWS} value stays loopback-only. An actor-secret exchange may request
+ *  only manager-caller, which narrows its existing command authority to one instance. */
+export const PUBLIC_EXCHANGE_VIEWS = ["channel-writer", "channel-purger", "manager-caller", "session-caller", "transfer-writer"] as const satisfies readonly UserTokenView[];
+
+/** The ONE central view policy table: which ledger capability each view's exchange requires (and
+ *  the callout re-asserts, defense in depth). `admin` = operator authority (god-view read +
+ *  destructive space writes); `deployer` is spawn-grade — deploying YOUR OWN team's manifest rides
+ *  the same owner-domain model as own-agent stop/attach (the manager still enforces owner equality
+ *  at launch, and the view's control grant is the PRIVILEGED tier, never the admin bypass). */
+export const VIEW_REQUIRED_SCOPE: Record<UserTokenView, "admin" | "spawn" | "supervise" | undefined> = {
+  admin: "admin",
+  purger: "admin",
+  "channel-purger": "admin",
+  "channel-writer": "admin",
+  deployer: "spawn",
+  "manager-service": "supervise",
+  "manager-caller": undefined, // baseline self calls are allowed; command grants still derive from scope
+  // #2312: no ledger scope. The grant itself is the authority: the auth plane verifies the redeemed
+  // `session.<id>` row names THIS principal as holder, at the exchange and again at the callout mint.
+  "session-caller": undefined,
+  // #1499: the bytes a carried resume uploads are announced by `transcript-receive`, a
+  // `manager.admin` row, so writing them needs the same scope.
+  "transfer-writer": "admin",
+  "service-endpoint": undefined, // dedicated service authority only, never ordinary exchange
+  // #4189: no ledger scope. The authority is the purpose-bound IdP proof the exchange requires, and
+  // the profile reads only the principal's own DM durable. Loopback-only (not public).
+  "dm-reader": undefined,
+};
+
+/** The longest a bearer of `view` may live. A transfer-writer bearer is the user-mode form of the
+ *  one-shot `transfer-writer` credential, so it carries that profile's five minutes, and so does the
+ *  broker credential the callout binds to the bearer's expiry. */
+export function viewTtlCapSec(view: UserTokenView | undefined): number {
+  if (view === "service-endpoint") return SERVICE_ACCESS_TTL_SECONDS;
+  return view === "transfer-writer" ? credentialLifetime("transfer-writer").defaultTtlSeconds! : MAX_TOKEN_TTL_SEC;
+}
+
+/** The ONE object a `transfer-writer` bearer may upload (docs/design/resume-transfer.md section 6):
+ *  the manager instance whose transfer bucket holds it and the transcript's hex digest. */
+export interface UserTokenTransferWriter {
+  instanceId: string;
+  hex: string;
+}
+
+/** The ONE §13.6 session a `session-caller` bearer may open: the rail coordinates plus the grant
+ *  expiry (unix seconds) the minted connection is bound to, exactly what the static arm mints. */
+export interface UserTokenSession {
+  endpoint: string;
+  sessionId: string;
+  epoch: number;
+  exp: number;
+}
+
+/** Exact service registration carried by a serve-only access bearer. */
+export interface UserTokenService {
+  duty: "serve";
+  witness: ServiceRegistrationWitness;
+}
+
+/** The server-authored actor claim. `owner` restates `sub` (cross-checked); `actor` is the
+ *  ledger-derived agent-instance id; `parent` is at most ONE spawner audit link; `view` is the
+ *  exchange-authorized elevated profile request (absent = the agent profile). */
+export interface UserTokenActor {
+  owner: string;
+  actor: string;
+  scope?: string[];
+  /** The spawning principal (`<owner>.<actor>` dot-form), when this agent was spawned by another. */
+  parent?: string;
+  /** The ledger row's lifecycle UID this bearer was minted against (SPEC 13.1). The callout's
+   *  connect authorization requires exact equality with the CURRENT row; a bearer minted for a
+   *  retired incarnation is refused, never resolved to the successor. */
+  lifecycleUid?: string;
+  /** The credential-ledger row id this bearer was issued under (SPEC 13.1: `cred.<uid>.<credid>`).
+   *  The connect boundary leader-reads that row and refuses a bearer whose credential row is
+   *  revoked or absent (the deny-new lever) — and for a root credential, whose credid is not the
+   *  lifecycle head's `currentCredentialId`. Grammar-asserted here (well-formed only); the STATE
+   *  match is the connect boundary's job, exactly like {@link lifecycleUid}. */
+  credentialId?: string;
+  /** Exchange-authorized elevated view ({@link USER_TOKEN_VIEWS}); absent = agent profile. */
+  view?: UserTokenView;
+  /** The one manager instance a manager-caller bearer may address. */
+  managerInstanceId?: string;
+  /** The one session a session-caller bearer may open (#2312). */
+  session?: UserTokenSession;
+  /** The one object a transfer-writer bearer may upload (#1499). */
+  transferWriter?: UserTokenTransferWriter;
+  /** Service-only registration binding, never an ordinary agent profile. */
+  service?: UserTokenService;
+}
+
+/** A fully validated user token, reduced to what the callout needs. */
+export interface ValidatedUserToken {
+  /** The opaque derived owner (== `sub`, format-asserted). */
+  owner: string;
+  /** The space this token is scoped to (== `aud`). */
+  space: string;
+  /** Capability scope (`scope` claim; empty when absent). */
+  scope: string[];
+  /** The validated actor claim. */
+  act: UserTokenActor;
+  /** The credential-ledger row id this bearer was minted under (== `act.credentialId`, hoisted for
+   *  the connect boundary's leader-served revocation read). Absent on a pre-cut bearer. */
+  credentialId?: string;
+  /** Token-shape version (== {@link USER_TOKEN_VER}). */
+  ver: number;
+  /** Bearer expiry (unix seconds) — the callout binds the minted NATS user JWT's lifetime to it,
+   *  so broker access dies with the bearer (the v1 revocation lever, enforced server-side). */
+  exp: number;
+}
+
+/** A KV-safe key segment: the ledger's `cred.` key alphabet. Kept local to the validator (not
+ *  imported from the credential ledger) so the trust boundary carries no KV dependency. */
+const CREDENTIAL_ID_SEGMENT = /^[A-Za-z0-9_-]+$/;
+
+/** Assert a `credentialId` claim is a bounded dotted KV-safe id (mirrors the ledger's
+ *  `cred.<uid>.<credid>` tail grammar; the STATE match is the connect boundary's job). Shared by
+ *  the mint side (the issuer, so the mint ↔ validate inverse holds) and this validator. THROWS. */
+export function assertCredentialIdClaim(v: unknown): asserts v is string {
+  if (typeof v !== "string" || v.length === 0 || v.length > 256 || !v.split(".").every((s) => CREDENTIAL_ID_SEGMENT.test(s)))
+    throw new Error(`user token: act.credentialId ${JSON.stringify(v)} is not a bounded dotted KV-safe credential id`);
+}
+
+/** Assert a `session` claim is the closed `{endpoint, sessionId, epoch, exp}` shape. Shared by the
+ *  issuer (mint side) and the validator so the inverse holds. THROWS. */
+export function assertSessionClaim(v: unknown): asserts v is UserTokenSession {
+  const o = v as Record<string, unknown>;
+  if (!o || typeof o !== "object" || Array.isArray(o)) throw new Error("user token: act.session must be an object");
+  for (const k of Object.keys(o)) if (!["endpoint", "sessionId", "epoch", "exp"].includes(k)) throw new Error(`user token: act.session carries the unknown field "${k}"`);
+  if (typeof o.endpoint !== "string" || !/^[A-Za-z0-9_-]{1,64}$/.test(o.endpoint)) throw new Error("user token: act.session.endpoint is not an endpoint token");
+  if (typeof o.sessionId !== "string" || !/^[A-Za-z0-9_-]{22,128}$/.test(o.sessionId)) throw new Error("user token: act.session.sessionId is not a session id");
+  for (const k of ["epoch", "exp"] as const)
+    if (typeof o[k] !== "number" || !Number.isSafeInteger(o[k]) || (o[k] as number) < 0) throw new Error(`user token: act.session.${k} is not an unsigned integer`);
+}
+
+export function assertTransferWriterClaim(v: unknown): asserts v is UserTokenTransferWriter {
+  const o = v as Record<string, unknown>;
+  if (!o || typeof o !== "object" || Array.isArray(o)) throw new Error("user token: act.transferWriter must be an object");
+  for (const k of Object.keys(o)) if (!["instanceId", "hex"].includes(k)) throw new Error(`user token: act.transferWriter carries the unknown field "${k}"`);
+  if (typeof o.instanceId !== "string") throw new Error("user token: act.transferWriter.instanceId must be a string token");
+  assertLifecycleToken(o.instanceId, "user token act.transferWriter.instanceId");
+  if (typeof o.hex !== "string" || !/^[0-9a-f]{64}$/.test(o.hex)) throw new Error("user token: act.transferWriter.hex is not a sha256 hex digest");
+}
+
+export interface ValidateUserTokenOpts {
+  /** The pinned verification key path: a `createRemoteJWKSet(new URL(<pinned origin>))` resolver
+   *  or a local public key. The token itself NEVER influences where the key comes from. */
+  key: JWTVerifyGetKey | CryptoKey;
+  /** Exact expected issuer (the IdP bridge). */
+  issuer: string;
+  /** Exact expected audience — the space name. */
+  audience: string;
+}
+
+/** Validate a user bearer token. Returns the reduced, validated claims or THROWS — there is no
+ *  partially-valid result and no fallback (a validation failure at the callout is a denied
+ *  connection). */
+export async function validateUserToken(token: string, opts: ValidateUserTokenOpts): Promise<ValidatedUserToken> {
+  const header = decodeProtectedHeader(token);
+  if (header.typ === SERVICE_RENEWAL_TYP) throw new Error("user token: a service renewal proof is not a connect bearer");
+  if (header.jku !== undefined || header.jwk !== undefined || header.x5u !== undefined || header.x5c !== undefined)
+    throw new Error("user token: embedded key material (jku/jwk/x5u/x5c) is rejected - keys resolve only via the pinned JWKS");
+  if (header.alg !== "EdDSA") throw new Error(`user token: alg must be EdDSA (got ${String(header.alg)})`);
+
+  const { payload } = await jwtVerify(token, opts.key as JWTVerifyGetKey, {
+    algorithms: ["EdDSA"],
+    issuer: opts.issuer,
+    audience: opts.audience,
+    clockTolerance: CLOCK_TOLERANCE_SEC,
+  });
+
+  // jose's `audience` option is SET-MEMBERSHIP (an aud array containing the space passes) — the
+  // bearer must be scoped to EXACTLY this space: the plain string, or a singleton array of it. A
+  // multi-audience bearer would be replayable across spaces.
+  if (payload.aud !== opts.audience && !(Array.isArray(payload.aud) && payload.aud.length === 1 && payload.aud[0] === opts.audience))
+    throw new Error("user token: aud must be exactly the space - a multi-audience bearer is rejected");
+  if (typeof payload.exp !== "number") throw new Error("user token: exp is required (tokens must be short-lived)");
+  if (typeof payload.iat !== "number") throw new Error("user token: iat is required");
+  if (typeof payload.nbf !== "number") throw new Error("user token: nbf is required");
+  // The lifetime cap must hold from the VALIDATOR's clock, not the token's own claims — a signed
+  // token post-dated a year out (iat/exp both in the future) satisfies `exp - iat ≤ cap` and
+  // sails through exp/nbf checks, giving it an effective validity far beyond the cap and quietly
+  // defeating the short-lived-token revocation lever. So: iat may not be in the future, and exp
+  // may not sit further than the cap from now.
+  const maxTtl = viewTtlCapSec((payload.act as UserTokenActor | undefined)?.view);
+  const now = Math.floor(Date.now() / 1000);
+  if (payload.iat > now + CLOCK_TOLERANCE_SEC) throw new Error("user token: iat is in the future");
+  if (payload.exp > now + maxTtl + CLOCK_TOLERANCE_SEC)
+    throw new Error(`user token: exp is more than the ${maxTtl}s cap past now - short-lived tokens are the revocation lever`);
+  if (payload.exp - payload.iat > maxTtl)
+    throw new Error(`user token: lifetime ${payload.exp - payload.iat}s exceeds the ${maxTtl}s cap - short-lived tokens are the revocation lever`);
+
+  if (payload.ver !== USER_TOKEN_VER)
+    throw new Error(`user token: ver ${String(payload.ver)} != ${USER_TOKEN_VER} - stale or unknown token shape (downgrade defense)`);
+
+  if (typeof payload.sub !== "string") throw new Error("user token: sub must be a string token - no coercion at a trust boundary");
+  const owner = assertDerivedOwnerToken(payload.sub);
+
+  const act = payload.act as UserTokenActor | undefined;
+  if (!act || typeof act !== "object") throw new Error("user token: act claim is required (server-authored owner/actor)");
+  if (act.owner !== owner) throw new Error(`user token: act.owner "${String(act.owner)}" != sub "${owner}" - inconsistent principal`);
+  if (typeof act.actor !== "string") throw new Error("user token: act.actor must be a string token - no coercion at a trust boundary");
+  assertValidOwnerToken(act.actor);
+  if (act.scope !== undefined && !(Array.isArray(act.scope) && act.scope.every((s) => typeof s === "string")))
+    throw new Error("user token: act.scope must be a string list when present");
+  if (act.parent !== undefined) {
+    // At most ONE parent audit link, and it must BE a principal (dot-form <owner>.<actor> with a
+    // derived owner) — an arbitrary string here would flow into mint/audit trails unchecked.
+    if (typeof act.parent !== "string")
+      throw new Error("user token: act.parent must be a single principal string when present (no delegation chains)");
+    const parts = act.parent.split(".");
+    if (parts.length !== 2)
+      throw new Error(`user token: act.parent "${act.parent}" is not a principal (<owner>.<actor> dot-form)`);
+    assertDerivedOwnerToken(parts[0]);
+    assertValidOwnerToken(parts[1]);
+  }
+  if (act.view !== undefined && !USER_TOKEN_VIEWS.includes(act.view))
+    throw new Error(
+      `user token: act.view "${String(act.view)}" is not a known view (${USER_TOKEN_VIEWS.join(", ")}) - unknown views fail closed`,
+    );
+  if (act.managerInstanceId !== undefined) {
+    if (typeof act.managerInstanceId !== "string")
+      throw new Error("user token: act.managerInstanceId must be a string token when present");
+    assertLifecycleToken(act.managerInstanceId, "user token act.managerInstanceId");
+  }
+  if (act.view === "manager-caller" && act.managerInstanceId === undefined)
+    throw new Error('user token: view "manager-caller" requires act.managerInstanceId');
+  if (act.managerInstanceId !== undefined && act.view !== "manager-caller")
+    throw new Error('user token: act.managerInstanceId is valid only with view "manager-caller"');
+  if (act.view === "session-caller" && act.session === undefined)
+    throw new Error('user token: view "session-caller" requires act.session');
+  if (act.session !== undefined) {
+    if (act.view !== "session-caller") throw new Error('user token: act.session is valid only with view "session-caller"');
+    assertSessionClaim(act.session);
+  }
+  if ((act.view === "transfer-writer") !== (act.transferWriter !== undefined))
+    throw new Error('user token: view "transfer-writer" and act.transferWriter come together or not at all');
+  if (act.transferWriter !== undefined) assertTransferWriterClaim(act.transferWriter);
+  // Lifecycle claim (SPEC 13.1): grammar-asserted when present. Presence/absence POLICY lives at the
+  // connect boundary (ledgerAuthorizeConnect requires it on EVERY bearer, views included) and the
+  // mint boundary (the idp bridge and the agent exchange stamp it from the grant row); the validator
+  // only guarantees a present claim is well-formed, so no garbled uid reaches an equality check.
+  if (act.lifecycleUid !== undefined) {
+    if (typeof act.lifecycleUid !== "string")
+      throw new Error("user token: act.lifecycleUid must be a string token when present");
+    assertLifecycleToken(act.lifecycleUid, "user token act.lifecycleUid");
+  }
+  // Credential claim (SPEC 13.1): grammar-asserted when present, same posture as lifecycleUid. The
+  // grammar mirrors the ledger's `cred.<uid>.<credid>` tail (bounded dotted KV-safe segments) but
+  // is checked LOCALLY on purpose — the trust-boundary validator must not depend on the KV
+  // credential ledger. The connect boundary matches this credid against the real leader-served
+  // row (active + principal-bound; root also head-current); the validator only guarantees a
+  // present claim is a well-formed, KV-safe id, so no garbled id reaches that read.
+  if (act.credentialId !== undefined) assertCredentialIdClaim(act.credentialId);
+
+  if ((act.view === "service-endpoint") !== (act.service !== undefined))
+    throw new Error("user token: service-endpoint view and service claim must occur together");
+  let service: UserTokenService | undefined;
+  if (act.view === "service-endpoint") {
+    const closed = (value: unknown, fields: string[]): value is Record<string, unknown> =>
+      value !== null && typeof value === "object" && !Array.isArray(value)
+      && fields.every((k) => Object.hasOwn(value, k)) && Object.keys(value).every((k) => fields.includes(k));
+    if (!closed(header, ["alg", "kid"]) || typeof header.kid !== "string" || !header.kid || header.kid.length > 256
+      || !closed(payload, ["iss", "aud", "sub", "iat", "nbf", "exp", "scope", "ver", "act"])
+      || !closed(act, ["owner", "actor", "scope", "lifecycleUid", "credentialId", "view", "service"])
+      || !closed(act.service, ["duty", "witness"]) || act.service.duty !== "serve"
+      || !Array.isArray(payload.scope) || payload.scope.length !== 0 || !Array.isArray(act.scope) || act.scope.length !== 0
+      || payload.aud !== opts.audience || !Number.isSafeInteger(payload.iat) || !Number.isSafeInteger(payload.exp)
+      || payload.iat < 0 || payload.nbf !== payload.iat || payload.exp <= payload.iat
+      || payload.exp <= Math.floor(Date.now() / 1000))
+      throw new Error("user token: invalid closed service access claims");
+    const witness = parseServiceRegistrationWitness(act.service.witness);
+    if (witness.space !== opts.audience || witness.principal.owner !== owner || witness.principal.actor !== act.actor
+      || witness.principal.lifecycleUid !== act.lifecycleUid || witness.rootCredentialId !== act.credentialId)
+      throw new Error("user token: service witness does not bind the bearer principal and root");
+    service = { duty: "serve", witness };
+  }
+
+  const scope = payload.scope === undefined ? [] : payload.scope;
+  if (!(Array.isArray(scope) && scope.every((s) => typeof s === "string")))
+    throw new Error("user token: scope must be a string list when present");
+
+  return {
+    owner,
+    space: opts.audience,
+    scope,
+    act: { owner: act.owner, actor: act.actor, scope: act.scope, parent: act.parent, lifecycleUid: act.lifecycleUid, credentialId: act.credentialId, view: act.view, managerInstanceId: act.managerInstanceId, ...(act.session ? { session: act.session } : {}), ...(act.transferWriter ? { transferWriter: act.transferWriter } : {}), ...(service ? { service } : {}) },
+    credentialId: act.credentialId,
+    ver: USER_TOKEN_VER,
+    exp: payload.exp,
+  };
+}
+
+/** The owner and actor of a bearer that {@link validateUserToken} refused only for its expiry. jose
+ *  checks expiry after the signature, the issuer and the audience, so these claims are the issuer's
+ *  word; the issuer is checked again here so that order is not load-bearing. Undefined for any other
+ *  refusal. The callout charges an expired bearer's reconnects to this principal. */
+export function expiredBearerPrincipal(refusal: unknown, issuer: string): { owner: string; actor: string } | undefined {
+  if (!(refusal instanceof errors.JWTExpired)) return undefined;
+  const { iss, sub, act } = refusal.payload as { iss?: unknown; sub?: unknown; act?: { owner?: unknown; actor?: unknown } };
+  if (iss !== issuer || typeof sub !== "string" || act?.owner !== sub || typeof act.actor !== "string") return undefined;
+  try {
+    return { owner: assertDerivedOwnerToken(sub), actor: assertValidOwnerToken(act.actor) };
+  } catch {
+    return undefined;
+  }
+}

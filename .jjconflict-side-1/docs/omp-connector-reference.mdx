@@ -1,0 +1,35 @@
+---
+title: "OMP connector reference"
+description: "OMP host integration, session continuity, and event persistence."
+kind: Reference
+audience: integrators
+---
+
+The OMP connector runs the installed `omp` application with its bundled Cotal extension.
+[Connect OMP](connect-omp.mdx) contains launch procedures and supported options.
+
+## Host integration
+
+The connector loads the Cotal extension bundle inside OMP; it does not install or modify the global OMP configuration.
+It passes the resolved model through `--model`, an optional `config` launch option through `--config`, and an agent-file persona through OMP's appended system prompt.
+Provider keys come from the connector's declared provider-key list and the names explicitly allowed in `spawn.env`.
+The authenticated local lifecycle-control socket handles managed control.
+
+The connector refuses model variants, selected MCP tool sharing, and every launch option other than `config` and `reapplyConfig`.
+See [Launch agents](launch-agents.mdx) for the shared option contract.
+
+## Session lifecycle
+
+A fresh launch gets a new session id. `--resume <id>` forks the source transcript into a new OMP session; it does not append to the source.
+`--continue <id>` opens the exact session in place. These options are mutually exclusive.
+
+Managed launches record the expected OMP session id and use the same-session continuation contract for restart and recovery. A failed session open is not replaced with a fresh session.
+The optional OMP `config` overlay does not replace a restored session's saved model or thinking level unless `reapplyConfig=true` is supplied with `--resume` or `--continue`.
+
+## Event plane
+
+The OMP connector supports the structured event plane. Event-enabled launches need a stable workspace root for their durable event log; a launch that requires events enables it independently of the default setting.
+The extension uses the OMP session id as its event thread id and stores event state under the workspace's `.cotal` directory.
+Events contain completed assistant messages and tool boundaries, not live text deltas, prompts, reasoning, usage, tool arguments, or tool results.
+
+The OMP connector reuses pi's standalone extension bundle, but it registers only the OMP connector. Its session launch and control state are kept separately from ordinary pi launches.

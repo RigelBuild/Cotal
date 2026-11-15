@@ -1,0 +1,40 @@
+{
+  "suite": [
+    "implementations/delivery/smoke/injected-tenancy-admission.smoke.ts",
+    "implementations/delivery/smoke/reload-store-identity.smoke.ts"
+  ],
+  "guard": "an injected delivery composition validates observer tenancy and names its real credential authority without a silent local-root fallback",
+  "command": "pnpm --filter @cotal-ai/core build && pnpm --filter @cotal-ai/workspace build && pnpm --filter @cotal-ai/delivery build && pnpm smoke:delivery-injected-tenancy-admission && pnpm smoke:reload-store-identity",
+  "progressPattern": "✓",
+  "minTicks": 8,
+  "proveWith": "node scripts/mutation-proof.mjs --config implementations/delivery/smoke/mutations/injected-tenancy-admission.json",
+  "mutations": [
+    {
+      "name": "injected startup skips scan-credential admission",
+      "file": "implementations/delivery/src/delivery.ts",
+      "find": "  await validateScanTargetAdmission(scanTarget);",
+      "replace": "  void scanTarget;",
+      "expectRed": "INJECTED ADMISSION: foreign observer refuses before endpoint construction and lease.0 acquisition",
+      "cell": "INJECTED ADMISSION: foreign observer refuses before endpoint construction and lease.0 acquisition",
+      "afterRestore": "pnpm --filter @cotal-ai/delivery build"
+    },
+    {
+      "name": "an unidentified injected adapter silently falls back instead of refusing",
+      "file": "implementations/delivery/src/delivery.ts",
+      "find": "  return src.injected ? injectedSecretStoreIdentity(src.store) : src.identity;",
+      "replace": "  return src.injected ? (src.store.identity !== undefined || process.env.COTAL_SECRET_STORE ? injectedSecretStoreIdentity(src.store) : { kind: \"fs\", root: process.cwd(), id: \"\" }) : src.identity;",
+      "expectRed": "injected identity refuses a silent local-root fallback",
+      "cell": "injected identity refuses a silent local-root fallback",
+      "afterRestore": "pnpm --filter @cotal-ai/delivery build"
+    },
+    {
+      "name": "workspaceSecretStore drops the operator workspace identity",
+      "file": "packages/workspace/src/secret-store-fs.ts",
+      "find": "  return new FsSecretStore(join(workspaceRoot, \".cotal\"), workspaceRoot);",
+      "replace": "  return new FsSecretStore(join(workspaceRoot, \".cotal\"));",
+      "expectRed": "an explicitly passed workspace store names its real filesystem authority without an ambient coordinate",
+      "cell": "an explicitly passed workspace store names its real filesystem authority without an ambient coordinate",
+      "afterRestore": "pnpm --filter @cotal-ai/workspace build && pnpm --filter @cotal-ai/delivery build"
+    }
+  ]
+}

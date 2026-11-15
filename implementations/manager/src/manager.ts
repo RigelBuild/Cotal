@@ -96,6 +96,7 @@ import {
   withIssuerSession,
   renderOnceTask,
 } from "@cotal-ai/core";
+import { IdentityStore, type IdentityRecord, type IdentityIssuance } from "./identity-store.js";
 import { loadLaunchPersonaFile, PersonaSourceError } from "@cotal-ai/workspace";
 import { agentAuthState, agentCredsDir, agentLifecycleSecretFilePaths, agentSecretFilePaths, agentSecretKeyForFile, authDir, claimIdentityRecord, claimManagerSiblingIdentities, connectorInstallHint, DEFAULT_SEAT_CAP, DELIVERY_CREDS_KIND, extensionConnectors, findCotalRoot, getSpaceAuth, hasUserAuthState, loadExtensionsManifest, loadManagerInstanceIdentity, loadMeshes, localTrustOfSpace, manifestExtensionNames, materializeFromManifest, materializeSecretToFile, MEMBERSHIP_RW_CREDS_KIND, mergeLaunchOptions, probeLiveness, remintDaemonCreds, resolveAgentType, resolveOnPath, runtimeInstallHint, createManagerInstanceIdentity, SEAT_CAP_UNLIMITED, spaceKey, spaceMaterialKey, SYSTEM_CREDS_FILES, userAuthStateDir, workspaceSecretStore, writeRenewalRecord, type ManagerInstanceIdentity, type MeshEntry, type RenewalRecord, type SeatCap, type UserAuthInfo } from "@cotal-ai/workspace";
 import type { ActionContext, AgentDef, RunAdmission, RunRevocation, AttachSession, Connector, ConnectorModelCatalog, ControlReply, CredHealth, DaemonStoreAnswer, DelegatedGrant, DeliveryLeaseInfo, EpCaller, EpErrorCode, EpErrorDetail, GrantOverreach, InlinePersona, IssuedSubjectPermissions, LaunchOpts, LaunchSpec, ManagedLifecycleHandoff, ManagerLeaseInfo, MeshLaunchAgent, Presence, RuntimeProvider, RuntimeReference, SecretStore, SecretStoreIdentity, SpaceAuth, StartupOutcome, UserAuthLaunch } from "@cotal-ai/core";
@@ -590,6 +591,7 @@ export interface ManagerOptions {
    *  `cotal up --max-sessions` (recorded on the mesh so a repair does not silently drop to 64).
    *  {@link ManagerSessionPlaneDeps.maxSessions} carries the per-caller-scoping residual. */
   maxSessions?: number;
+  seatMintCap?: number;
   /** Optional JSON file containing the exact admitted spawn names. */
   spawnAllowlist?: string;
   /** The ceiling on live seats this manager supervises for ONE owner. Defaults to
@@ -1640,6 +1642,7 @@ export class Manager {
   private readonly eventsRequired: boolean;
   /** The operator-set global live-session ceiling (see {@link ManagerOptions.maxSessions}). */
   private readonly maxSessions?: number;
+  private readonly seatMintCap: number;
   /** The operator-set per-owner seat ceiling (see {@link ManagerOptions.seatCap}). */
   private readonly seatCap: SeatCap;
   /** The ONE secret store for every kind this manager touches (daemon-cred remint + agent kinds).
@@ -1997,6 +2000,8 @@ export class Manager {
   /** Space trust material when the mesh runs in auth mode (`.cotal/auth` present);
    *  the manager mints per-agent creds from it at spawn. Undefined when the mesh is open. */
   private auth?: SpaceAuth;
+  /** Durable reservation and issuance state for identities this static manager mints. */
+  private identityStore?: IdentityStore;
   /** Readiness-race backstop (#159 B1) — the {@link READINESS_TIMEOUT_MS} constant, held as an instance
    *  field so a test can shorten it (the join/exit signals are event-driven; only the backstop is timed).
    *  Production leaves it at the constant. */
@@ -2112,6 +2117,7 @@ export class Manager {
       }
     }
     this.maxSessions = opts.maxSessions;
+    this.seatMintCap = opts.seatMintCap ?? 32;
     this.seatCap = opts.seatCap ?? DEFAULT_SEAT_CAP;
     this.remoteAuthority = opts.remoteAuthority;
     this.remoteExecutorCreds = opts.remoteAuthority?.executorCreds;
@@ -2532,6 +2538,7 @@ export class Manager {
         if (!claimed) throw new Error("manager start has no admitted local identity");
         this.admittedLocalIdentity = undefined;
         this.managerInstanceId = claimed.instanceId;
+        this.identityStore = new IdentityStore(this.workspaceRoot, this.space, this.managerInstanceId);
         this.managerServeIdentity = claimed.serveIdentity;
       }
     }
@@ -5025,6 +5032,11 @@ export class Manager {
           throw new EpEnvelopeError("failed-precondition", "transcript-receive: this manager does not receive carried transcripts (its remote authority issues no transfer reader)");
         return this.transcripts.receive(args(ctx) as unknown as TranscriptReceiveInput);
       })),
+      identityReserve: (ctx) => this.serveGated(ctx, () => this.identityReserve(ctx)),
+      identityMint: (ctx) => this.serveGated(ctx, () => this.identityMint(ctx)),
+      identityRenew: (ctx) => this.serveGated(ctx, () => this.identityRenew(ctx)),
+      identityRetire: (ctx) => this.serveGated(ctx, () => this.identityRetire(ctx)),
+      identityRetireAdmin: (ctx) => this.serveGated(ctx, () => adminGated(ctx, () => this.identityRetireAdmin(ctx))),
     });
   }
 

@@ -1,0 +1,452 @@
+/**
+ * v0.4 endpoint grant-grammar smoke (broker-free) — the capability → allow-list contract of
+ * SPEC §13.9's caller and serve rows, checked two ways:
+ *   1. the row BUILDERS against the matrix's literal forms (request publish, journal append,
+ *      reply rails, queue-qualified class serve, egress pins);
+ *   2. the MINTED CREDENTIAL: an agent JWT minted with `endpointCapabilities` carries exactly
+ *      those rows (decoded and compared), none without them (default-deny), and the mint
+ *      fails loud without a lifecycle UID.
+ *
+ * Run: pnpm smoke:ep-grants   (no broker; part of smoke:ci)
+ */
+import {
+  createSpaceAuth, mintCreds, mintPublicUserJwt, newIdentity, mintLifecycleUid,
+  epRequestGrantRows, epJournalGrantRow, epCallerReplyGrantRow, epGoalProgressGrantRow,
+  epCallerGrantRows, epServeSubscribeRows, epServePublishRows, epServeGrantRows,
+  epBaselineGrantRows, spawnCallerCapabilities, runCallerCapabilities, operatorInstrumentCapabilities, instancePinnedInstrumentCapabilities, baselineCallerCapabilities, permissionsFor,
+  presenceBucket, presenceKeySubject,
+  SPAWN_CREATE_COMMANDS,
+  minterIdentityCapabilities, MINTER_IDENTITY_COMMANDS,
+  MAX_CONTROL_LINE_BYTES, CONNECT_ENVELOPE_OVERHEAD_BYTES, MAX_MINTED_JWT_BYTES,
+  subjectMatches,
+  type EpCapability, type EpCaller,
+} from "../src/index.js";
+import { AUTH_ENDPOINT, EP_CMD_VERIFY_PLACEMENT_ENROLLMENT, EP_CMD_ENROLLMENT_EFFECT_STATUS,
+  EP_CMD_CLOSE_ENROLLMENT_EFFECT, EP_CMD_RETIRE_PLACEMENT_ENROLLMENT, epRequestSubject,
+  epCallerReplyFilter } from "../src/endpoint-subjects.js";
+
+let ok = 0, fail = 0;
+const c = (n: string, v: boolean, extra?: unknown) => { if (v) { ok++; } else { fail++; console.log("  ✗ FAIL:", n, extra ?? ""); } };
+const throws = (n: string, fn: () => unknown) => { try { fn(); c(n, false); } catch { c(n, true); } };
+
+const UID = "u".repeat(26);
+const IID = "i".repeat(26);
+const caller: EpCaller = { owner: "u_abc", actor: "cli", uid: UID };
+// ── caller rows against the §13.9 matrix forms ──
+const spawnCap: EpCapability = { endpoint: "manager", command: "spawn", target: { mode: "owner", tOwner: "u_abc" }, journal: true };
+c("request row: class one, owner mode, caller-pinned, nonce-only wildcard",
+  epRequestGrantRows("demo", spawnCap, caller).join("|")
+  === `cotal.demo.ep.one.manager.spawn.owner.u_abc.u_abc.cli.${UID}.*`);
+c("request rows: routes + instance pin",
+  epRequestGrantRows("demo", { endpoint: "manager", command: "status", routes: ["one", "all"], instanceId: IID }, caller).join("|")
+  === `cotal.demo.ep.one.manager.status.u_abc.cli.${UID}.*|cotal.demo.ep.all.manager.status.u_abc.cli.${UID}.*|cotal.demo.ep.inst.manager.${IID}.status.u_abc.cli.${UID}.*`);
+c("request row: instance-only omits every class/scatter row",
+  epRequestGrantRows("demo", { endpoint: "manager", command: "status", instanceId: IID, instanceOnly: true }, caller).join("|")
+  === `cotal.demo.ep.inst.manager.${IID}.status.u_abc.cli.${UID}.*`);
+throws("instance-only refuses without an exact instance id",
+  () => epRequestGrantRows("demo", { endpoint: "manager", command: "status", instanceOnly: true }, caller));
+c("journal row: same authz block, no nonce",
+  epJournalGrantRow("demo", spawnCap, caller) === `cotal.demo.epj.manager.spawn.owner.u_abc.u_abc.cli.${UID}`);
+c("reply-rail read row: own rail, exact arity",
+  epCallerReplyGrantRow("demo", caller) === `cotal.demo.ep.reply.*.*.*.u_abc.cli.${UID}.*`);
+c("per-goal progress row: caller identity in-subject",
+  epGoalProgressGrantRow("demo", "manager", caller) === `cotal.demo.epe.manager.*.*.goal.u_abc.cli.${UID}.>`);
+const handleCap: EpCapability = { endpoint: "manager", command: "attach", target: { mode: "handle", tOwner: "u_t", tActor: "svc", tUid: "h".repeat(26) } };
+c("handle row builds through epRequestGrantRows (the redemption path) with the full triple pinned",
+  epRequestGrantRows("demo", handleCap, caller)[0]
+  === `cotal.demo.ep.one.manager.attach.handle.u_t.svc.${"h".repeat(26)}.u_abc.cli.${UID}.*`);
+const exactCap: EpCapability = { endpoint: "manager", command: "attach", target: { mode: "exact", tOwner: "u_t", tActor: "svc", tUid: "h".repeat(26) } };
+c("exact row builds through epRequestGrantRows as a literal one triple, never a wildcard",
+  epRequestGrantRows("demo", exactCap, caller)[0]
+  === `cotal.demo.ep.one.manager.attach.exact.u_t.svc.${"h".repeat(26)}.u_abc.cli.${UID}.*`);
+c("any mode accepts a wildcard target owner (operator/admin mint policy)",
+  epRequestGrantRows("demo", { endpoint: "manager", command: "stop", target: { mode: "any", tOwner: "*" } }, caller)[0]
+  === `cotal.demo.ep.one.manager.stop.any.*.u_abc.cli.${UID}.*`);
+throws("owner mode never mints a wildcard target owner",
+  () => epRequestGrantRows("demo", { endpoint: "manager", command: "stop", target: { mode: "owner", tOwner: "*" } }, caller));
+throws("owner mode never mints a foreign target owner (pinned to the caller's own owner)",
+  () => epRequestGrantRows("demo", { endpoint: "manager", command: "stop", target: { mode: "owner", tOwner: "u_victim" } }, caller));
+throws("child mode has the same caller-owner ceiling",
+  () => epRequestGrantRows("demo", { endpoint: "manager", command: "stop", target: { mode: "child", tOwner: "u_victim" } }, caller));
+throws("grant rows reject grammar-breaking target owners (a smuggled '>' must not widen the row)",
+  () => epRequestGrantRows("demo", { endpoint: "manager", command: "stop", target: { mode: "ledger", tOwner: "u_evil.>" } }, caller));
+throws("caller owner/actor tokens are grammar-validated in grant rows too",
+  () => epRequestGrantRows("demo", spawnCap, { owner: "u_abc", actor: "c.li", uid: UID }));
+throws("standing caller bundle refuses a handle-mode capability (redemption-minted only)",
+  () => epCallerGrantRows("demo", [handleCap], caller));
+throws("standing caller bundle refuses an exact-mode capability (minted only through its owning profile)",
+  () => epCallerGrantRows("demo", [exactCap], caller));
+const bundle = epCallerGrantRows("demo", [spawnCap], caller);
+c("caller bundle: request + journal pub, reply-rail + own-goal-progress sub (spawn is goal-bearing, P2 item 2)",
+  bundle.pub.length === 2 && bundle.sub.length === 2
+  && bundle.sub[0] === epCallerReplyGrantRow("demo", caller)
+  && bundle.sub[1] === epGoalProgressGrantRow("demo", "manager", caller));
+c("empty capability set mints nothing", JSON.stringify(epCallerGrantRows("demo", [], caller)) === '{"pub":[],"sub":[]}');
+
+// ── standing reconciler profile: exact untargeted placement requests and caller pinning ──
+const reconcilerCaller: EpCaller = { owner: "u_reconciler", actor: "reconciler", uid: UID };
+const reconciler = permissionsFor("reconciler", "demo", { ...reconcilerCaller, connId: "conn1234567890" }, {
+  reconciler: reconcilerCaller,
+}) as { pub: { allow: string[] }; sub: { allow: string[] } };
+const placementCommands = [
+  EP_CMD_VERIFY_PLACEMENT_ENROLLMENT,
+  EP_CMD_ENROLLMENT_EFFECT_STATUS,
+  EP_CMD_CLOSE_ENROLLMENT_EFFECT,
+  EP_CMD_RETIRE_PLACEMENT_ENROLLMENT,
+];
+const reconcilerPublishRows = [
+  ...placementCommands.map((command) => `cotal.demo.ep.one.auth.${command}.u_reconciler.reconciler.${UID}.*`),
+  `cotal.demo.ep.one.*.describe.u_reconciler.reconciler.${UID}.*`,
+  "$JS.API.DIRECT.GET.EPC_demo.cotal.demo.epc.>",
+];
+c("reconciler publishes exactly four placement requests, describe and EPC fetch",
+  JSON.stringify(reconciler.pub.allow) === JSON.stringify(reconcilerPublishRows), reconciler.pub.allow);
+c("reconciler subscribes only to its caller reply rail and own inbox",
+  JSON.stringify(reconciler.sub.allow) === JSON.stringify([
+    epCallerReplyFilter("demo", reconcilerCaller), "_INBOX_conn1234567890.>",
+  ]), reconciler.sub.allow);
+const reconcilerCallerVariants: EpCaller[] = [
+  { ...reconcilerCaller, owner: "u_other" },
+  { ...reconcilerCaller, actor: "other" },
+  { ...reconcilerCaller, uid: "v".repeat(26) },
+];
+c("reconciler request grants match only the pinned caller triple",
+  placementCommands.every((command) => {
+    const request = epRequestSubject("demo", {
+      route: { mode: "one" }, endpoint: AUTH_ENDPOINT, command, caller: reconcilerCaller, nonce: "n".repeat(22),
+    });
+    return reconciler.pub.allow.some((row) => subjectMatches(row, request))
+      && reconcilerCallerVariants.every((caller) => {
+        const foreign = epRequestSubject("demo", {
+          route: { mode: "one" }, endpoint: AUTH_ENDPOINT, command, caller, nonce: "n".repeat(22),
+        });
+        return !reconciler.pub.allow.some((row) => subjectMatches(row, foreign));
+      });
+  }));
+throws("reconciler profile requires the reconciler caller triple", () =>
+  permissionsFor("reconciler", "demo", { ...reconcilerCaller, connId: "conn1234567890" }, {}));
+for (const field of ["owner", "actor", "uid"] as const) {
+  throws(`reconciler profile rejects an empty caller ${field}`, () => permissionsFor("reconciler", "demo",
+    { ...reconcilerCaller, connId: "conn1234567890" }, { reconciler: { ...reconcilerCaller, [field]: "" } }));
+}
+throws("reconciler profile rejects a mismatched principal owner", () => permissionsFor("reconciler", "demo",
+  { ...reconcilerCaller, owner: "u_other", connId: "conn1234567890" }, { reconciler: reconcilerCaller }));
+throws("reconciler profile rejects a mismatched principal actor", () => permissionsFor("reconciler", "demo",
+  { ...reconcilerCaller, actor: "other", connId: "conn1234567890" }, { reconciler: reconcilerCaller }));
+
+// ── an ISSUED caller (SPEC 13.15): the generation rides the request and reply rails and NOTHING else ──
+// The endpoint publishes a goal's progress under the goal's caller TRIPLE and a client submits journal
+// work under the same triple; a generation minted into those rows names subjects nothing emits, so
+// an issued caller would hold a journal row it cannot use and never hear its own goal's terminal.
+const GEN = "a".repeat(32);
+const issued: EpCaller = { ...caller, generation: GEN } as EpCaller;
+c("issued request row rides ep.v1 with the generation before the nonce",
+  epRequestGrantRows("demo", spawnCap, issued).join("|")
+  === `cotal.demo.ep.v1.one.manager.spawn.owner.u_abc.u_abc.cli.${UID}.${GEN}.*`);
+c("issued reply-rail read row carries the generation",
+  epCallerReplyGrantRow("demo", issued) === `cotal.demo.ep.v1.reply.*.*.*.u_abc.cli.${UID}.${GEN}.*`);
+c("issued journal row is the plain triple: the same subject a legacy caller submits on",
+  epJournalGrantRow("demo", spawnCap, issued) === epJournalGrantRow("demo", spawnCap, caller));
+c("issued per-goal progress row is the plain triple: the subject the endpoint publishes progress on",
+  epGoalProgressGrantRow("demo", "manager", issued) === epGoalProgressGrantRow("demo", "manager", caller));
+
+// ── the Appendix-B baseline set ──
+const baseline = epBaselineGrantRows("demo", caller);
+c("baseline: the ONE wildcard-endpoint form is describe-only, caller pinned, nonce-tailed",
+  baseline.pub[0] === `cotal.demo.ep.one.*.describe.u_abc.cli.${UID}.*`);
+c("baseline: delivery commands, manager self commands, both roster commands and the epc store fetch",
+  baseline.pub.length === 13
+  && baseline.pub.includes(`cotal.demo.ep.one.delivery.join.u_abc.cli.${UID}.*`)
+  && baseline.pub.includes(`cotal.demo.ep.one.delivery.leave.u_abc.cli.${UID}.*`)
+  && baseline.pub.includes(`cotal.demo.ep.one.delivery.list.u_abc.cli.${UID}.*`)
+  && baseline.pub.includes(`cotal.demo.ep.one.auth.roster.u_abc.cli.${UID}.*`)
+  && baseline.pub.includes(`cotal.demo.ep.one.manager.roster.u_abc.cli.${UID}.*`)
+  && baseline.pub.includes(`cotal.demo.ep.one.manager.stop.self.u_abc.cli.${UID}.*`)
+  && baseline.pub.includes(`cotal.demo.ep.one.manager.turn-participate.self.u_abc.cli.${UID}.*`)
+  // The turn relay's seat half rides self mode too: a seat that cannot pull its own turns has no
+  // relay at all, and the manager pushes nothing.
+  && baseline.pub.includes(`cotal.demo.ep.one.manager.turn-pending.self.u_abc.cli.${UID}.*`)
+  && baseline.pub.includes(`cotal.demo.ep.one.manager.turn-yield.self.u_abc.cli.${UID}.*`)
+  && baseline.pub.includes(`cotal.demo.ep.one.manager.turn-unconfirmed.self.u_abc.cli.${UID}.*`)
+  && baseline.pub.includes(`cotal.demo.ep.one.manager.run-answer.self.u_abc.cli.${UID}.*`)
+  // §13.7 store fetch rides the baseline (describe answers digests; a caller that may describe
+  // may fetch the schemas those digests name) — EXACTLY the epc-subject-scoped Direct Get form,
+  // never the bare/stream-wide row, and no epc PUBLISH row.
+  && baseline.pub.includes("$JS.API.DIRECT.GET.EPC_demo.cotal.demo.epc.>")
+  && baseline.pub.every((r) => !r.startsWith("cotal.demo.epc.")),
+  JSON.stringify(baseline.pub));
+c("baseline: the reply rail is ALWAYS granted (no capability required)",
+  baseline.sub.length === 1 && baseline.sub[0] === epCallerReplyGrantRow("demo", caller));
+c("baseline: no journal rows (the baseline is ephemeral request forms only)",
+  baseline.pub.every((r) => !r.includes(".epj.")));
+c("the spawn set: spawn and resolve-agent are UNTARGETED (virgin child); despawn/attach ride owner-mode (no owner-stop synonym of despawn); define/remove persona + inspect + list-personas + show-persona + goal-result ride untargeted (the 1c table's connector reads)",
+  spawnCallerCapabilities("u_abc").length === 10
+  && epCallerGrantRows("demo", spawnCallerCapabilities("u_abc"), caller).pub.join("|")
+  === `cotal.demo.ep.one.manager.spawn.u_abc.cli.${UID}.*|cotal.demo.ep.one.manager.resolve-agent.u_abc.cli.${UID}.*|cotal.demo.ep.one.manager.despawn.owner.u_abc.u_abc.cli.${UID}.*|cotal.demo.ep.one.manager.attach.owner.u_abc.u_abc.cli.${UID}.*|cotal.demo.ep.one.manager.define-persona.u_abc.cli.${UID}.*|cotal.demo.ep.one.manager.remove-persona.u_abc.cli.${UID}.*|cotal.demo.ep.one.manager.inspect.u_abc.cli.${UID}.*|cotal.demo.ep.one.manager.list-personas.u_abc.cli.${UID}.*|cotal.demo.ep.one.manager.show-persona.u_abc.cli.${UID}.*|cotal.demo.ep.one.manager.goal-result.u_abc.cli.${UID}.*`);
+// THE REGRESSION GUARD FOR THE `input` PLACEMENT, and it is a cell rather than a comment because
+// the mistake it stops is a ONE-WORD edit that reads as tidying: adding "input" to
+// SPAWN_OWNER_LIFECYCLE_COMMANDS beside its two obvious siblings. That edit hands every
+// spawn-capable agent blind WRITE into any seat under its owner (the owner-domain arm of
+// authorizeNamedControl admits siblings it never spawned), which is control of a peer rather than
+// the denial it already had through despawn. Measured, not assumed: a spawn-capability credential
+// holds the owner-mode `attach` REQUEST row and zero `eps.` session rails, so it cannot complete an
+// attach write today and this really would be new authority.
+c("the spawn capability grants NO `input` row in either mode: seat input is operator-only",
+  !epCallerGrantRows("demo", spawnCallerCapabilities("u_abc"), caller).pub.some((r) => r.includes(".manager.input.")));
+// The operator INSTRUMENT rollups (the 1c grant-migration table's admin row): the privileged
+// instrument is read + create + persona only (structurally barred from cross-agent reach, like its
+// ctl row); the admin instrument adds ANY-mode despawn/attach (tOwner "*": operator-policy-mintable
+// only, §13.2 - the broker grant IS the tier boundary), BOTH modes of `input` and `turn` (the two
+// seat writes, granted nowhere else; the run driver submits its turns under this instrument), and
+// the untargeted `manager.admin` family.
+c("the privileged instrument set: reads + spawn + resolve-agent + resolve-cwd + persona writes + the chat-session pair + the run family with the keyed pair, with run-answer self-targeted",
+  operatorInstrumentCapabilities("privileged").length === 23
+  && operatorInstrumentCapabilities("privileged").filter((cap) => cap.target !== undefined).every((cap) => cap.command === "run-answer" && cap.target?.mode === "self")
+  && operatorInstrumentCapabilities("privileged").map((cap) => cap.command).join(",") === "status,ps,slots,inspect,models,list-personas,show-persona,goal-result,spawn,resolve-agent,resolve-cwd,define-persona,remove-persona,chat-session-open,chat-session-retire,run-status,run-ps,run-start,run-resume,run-start-keyed,run-submission-status,run-cancel,run-answer");
+// `resolve-cwd` is the placement read the folder question of a managed launch calls, and on a static
+// mesh the instrument IS that caller: without this row the question offers typing and every typed
+// folder is refused at the broker. It stays out of the standing agent `spawn` set, which reaches
+// every manager in the space on the class rail, and it is minted untargeted on the `one` route like
+// the `spawn` row of its own `manager.spawn` capability class.
+c("both instrument tiers carry resolve-cwd untargeted and off the scatter rail, and the standing spawn set does not",
+  ["privileged", "admin"].every((tier) => {
+    const row = operatorInstrumentCapabilities(tier as "privileged" | "admin").find((cap) => cap.command === "resolve-cwd");
+    return row !== undefined && row.endpoint === "manager" && row.target === undefined && row.routes === undefined;
+  })
+  && !spawnCallerCapabilities("u_abc").some((cap) => cap.command === "resolve-cwd")
+  && !runCallerCapabilities("u_abc").some((cap) => cap.command === "resolve-cwd")
+  && !baselineCallerCapabilities().some((cap) => cap.command === "resolve-cwd"));
+// The pin is what makes the row usable: the instrument is minted per control call, so the typed
+// folder's check reaches exactly the manager `--on` named and no other instance.
+c("a pinned instrument's resolve-cwd row names that one instance and no class rail",
+  epCallerGrantRows("demo", instancePinnedInstrumentCapabilities("privileged", IID), caller).pub
+    .filter((r) => r.includes(".resolve-cwd."))
+    .join("|") === `cotal.demo.ep.one.manager.resolve-cwd.u_abc.cli.${UID}.*|cotal.demo.ep.inst.manager.${IID}.resolve-cwd.u_abc.cli.${UID}.*`);
+// The chat-session pair mints or ends a credential for a fresh session principal, so it rides the
+// operator instruments only. A spawn-capable or run-capable agent must never carry it.
+c("chat-session-open/retire are untargeted operator rows and absent from the spawn and run capability sets",
+  operatorInstrumentCapabilities("privileged").filter((cap) => cap.command.startsWith("chat-session-")).every((cap) => cap.target === undefined && cap.routes === undefined)
+  && ![...spawnCallerCapabilities("u_abc"), ...runCallerCapabilities("u_abc"), ...baselineCallerCapabilities()].some((cap) => cap.command.startsWith("chat-session-"))
+  && !(SPAWN_CREATE_COMMANDS as readonly string[]).some((cmd) => cmd.startsWith("chat-session-")));
+// The two class-scatter reads (`cotal ps` and `cotal ps --slots`) carry the `all` route beside
+// `one`; every other read is anycast-only. A `slots` row without `all` is exactly the #1274 hand
+// test's broker refusal on a static mesh: the CLI scatters it like `ps`.
+c("the instrument's `ps` and `slots` rows are the only reads minted on the scatter rail",
+  operatorInstrumentCapabilities("privileged").filter((cap) => cap.routes?.includes("all")).map((cap) => cap.command).join(",") === "ps,slots");
+// The `run` capability (SPEC 14.3): seven untargeted run-* rows (the keyed pair and run-cancel
+// included), self-targeted run-answer, PLUS the whole spawn set, and
+// nothing targeted beyond what spawn already carries. The implication is one-way: a spawn-only
+// caller gains no run row.
+c("the run capability set: run-start/run-resume/run-start-keyed/run-submission-status/run-cancel/run-status/run-ps untargeted, run-answer self-targeted + the spawn set",
+  runCallerCapabilities("u_abc").length === 18
+  && runCallerCapabilities("u_abc").slice(0, 8).map((cap) => cap.command).join(",") === "run-start,run-resume,run-start-keyed,run-submission-status,run-cancel,run-answer,run-status,run-ps"
+  && runCallerCapabilities("u_abc").slice(0, 8).every((cap) => cap.command === "run-answer" ? cap.target?.mode === "self" : cap.target === undefined)
+  && JSON.stringify(runCallerCapabilities("u_abc").slice(8)) === JSON.stringify(spawnCallerCapabilities("u_abc"))
+  && !spawnCallerCapabilities("u_abc").some((cap) => cap.command.startsWith("run-")));
+const adminCaps = operatorInstrumentCapabilities("admin", "u_abc");
+// Upstream's 38 plus the fork's release-seat, attest-gone and allowlist-set.
+c("the admin instrument set adds any-mode despawn/attach + BOTH modes of input and turn + the manager.admin family",
+  adminCaps.length === 41
+  && adminCaps.filter((cap) => cap.target?.mode === "any").map((cap) => cap.command).join(",") === "despawn,attach,input,turn"
+  && adminCaps.filter((cap) => cap.target?.mode === "owner").map((cap) => cap.command).join(",") === "input,turn"
+  && adminCaps.filter((cap) => cap.target?.mode === "owner").every((cap) => (cap.target as { tOwner?: string }).tOwner === "u_abc")
+  && adminCaps.filter((cap) => cap.target?.mode === "any").every((cap) => (cap.target as { tOwner?: string }).tOwner === "*")
+  && ["purge", "launch", "resume-preserved", "commit-resume", "finalize-resume", "prepare-preservation", "commit-preservation", "abort-preservation", "transcript-receive", "release-seat", "attest-gone", "allowlist-set"].every((cmd) => adminCaps.some((cap) => cap.command === cmd && cap.target === undefined)));
+// The owner-mode `input` row is minted ONLY where the mint site can name the caller's own owner.
+// Without it the capability is omitted rather than emitted with a wildcard owner, because §13.2
+// forbids an owner-mode standing mint naming a foreign owner and a `*` there would be exactly that.
+c("with no caller owner supplied, the admin set omits the owner-mode input row rather than wildcarding it",
+  operatorInstrumentCapabilities("admin").filter((cap) => cap.target?.mode === "owner").length === 0);
+c("an any-mode instrument row spans the target owner (grant `*`), pinned to the caller triple",
+  epCallerGrantRows("demo", adminCaps.filter((cap) => cap.target?.mode === "any" && cap.command === "despawn"), caller).pub.join("|")
+  === `cotal.demo.ep.one.manager.despawn.any.*.u_abc.cli.${UID}.*`);
+
+// ── serve rows against the §13.9 matrix forms ──
+// Both rails are served (SPEC 13.15): the legacy `ep.` shapes first, then the same three on
+// `ep.v1.`, whose request tail carries the issued generation before the nonce.
+c("serve subscribe: queue-qualified class rail + plain scatter + exact instance, per command, on both rails",
+  epServeSubscribeRows("demo", "com.acme.deploy", IID, "run").join("|")
+  === `cotal.demo.ep.one.com_acme_deploy.run.> com_acme_deploy|cotal.demo.ep.all.com_acme_deploy.run.>|cotal.demo.ep.inst.com_acme_deploy.${IID}.run.>`
+  + `|cotal.demo.ep.v1.one.com_acme_deploy.run.> com_acme_deploy|cotal.demo.ep.v1.all.com_acme_deploy.run.>|cotal.demo.ep.v1.inst.com_acme_deploy.${IID}.run.>`);
+c("serve publish: reply attribution pin on both rails + events + timer schedule-only + record ingress, all epoch-pinned",
+  epServePublishRows("demo", "manager", IID, 5).join("|")
+  === `cotal.demo.ep.reply.manager.${IID}.5.*.*.*.*|cotal.demo.ep.v1.reply.manager.${IID}.5.*.*.*.*.*|cotal.demo.epe.manager.${IID}.5.>|cotal.demo.ept.manager.${IID}.5.*.schedule|cotal.demo.epr.manager.${IID}.5.>`);
+c("the issued reply pin is one token wider than the legacy one (generation slot), nothing else differs",
+  epServePublishRows("demo", "manager", IID, 5)[1]!.split(".").length === epServePublishRows("demo", "manager", IID, 5)[0]!.split(".").length + 2);
+const serve = epServeGrantRows("demo", { endpoint: "manager", instanceId: IID, epoch: 5, ephemeralCommands: ["spawn"] });
+c("serve bundle: 6 sub rows per ephemeral command (both rails) incl. the DERIVED describe, plus the own timer-fire read; 5 pub rows",
+  serve.sub.length === 13 && serve.pub.length === 5);
+c("the timer-fire read row is the own instance's, epoch-pinned (§13.9 Timer fire consume)",
+  serve.sub.includes(`cotal.demo.ept.manager.${IID}.5.*.fire`));
+// A journal-only endpoint has no ephemeral (rail-served) commands, but still serves mandatory
+// describe (§13.7): the bundle is describe rails + the own timer-fire read only.
+const journalOnly = epServeGrantRows("demo", { endpoint: "manager", instanceId: IID, epoch: 5, ephemeralCommands: [] });
+c("a journal-only serve bundle (no ephemeral commands) still grants the DERIVED describe rails + timer-fire",
+  journalOnly.sub.length === 7 && journalOnly.sub.some((r) => r.includes(".describe.")) && journalOnly.sub.includes(`cotal.demo.ept.manager.${IID}.5.*.fire`) && journalOnly.pub.length === 5);
+throws("serve bundle refuses an EXPLICIT describe (reserved, derived in this one seam)",
+  () => epServeGrantRows("demo", { endpoint: "manager", instanceId: IID, epoch: 5, ephemeralCommands: ["spawn", "describe"] }));
+c("no serve rail row crosses commands (no bare cross-command tail)",
+  serve.sub.filter((r) => !r.endsWith(".fire")).every((r) => r.includes(".spawn.") || r.includes(".describe.")));
+
+// ── the minted credential carries exactly these rows (permissionsFor wiring) ──
+const auth = await createSpaceAuth("epg");
+let reconcilerMintError: string | undefined;
+try {
+  await mintPublicUserJwt(auth, newIdentity().id, "reconciler", {
+    principal: { owner: reconcilerCaller.owner, actor: reconcilerCaller.actor },
+    reconciler: reconcilerCaller,
+    expiresAt: Math.floor(Date.now() / 1000) + 300,
+  });
+} catch (error) {
+  reconcilerMintError = error instanceof Error ? error.message : String(error);
+}
+c("public reconciler JWT mint rejects the closed remote manager protocol",
+  reconcilerMintError?.includes("closed remote manager protocol") === true, reconcilerMintError);
+const decode = (creds: string): { pub: { allow: string[] }; sub: { allow: string[] } } => {
+  const jwt = /BEGIN NATS USER JWT-+\s+(\S+)/.exec(creds)![1];
+  const payload = jwt.split(".")[1].replace(/-/g, "+").replace(/_/g, "/");
+  return (JSON.parse(Buffer.from(payload, "base64").toString()) as { nats: { pub: { allow: string[] }; sub: { allow: string[] } } }).nats;
+};
+
+// ── mint-time bound on the COMPOSED credential (issue #375's review finding): every individual
+// channel can pass assertValidChannel and the composed JWT still exceed the CONNECT line, because
+// nothing bounded the COUNT of channels one agent's allowSubscribe may carry. Broker-free: this
+// exercises the byte-size refusal in mintCreds directly, no live connect. ──
+function sixDistinctChannels(): string[] {
+  return [0, 1, 2, 3, 4, 5].map((i) => { const tag = `-ch${i}`; return "a".repeat(4096 - tag.length) + tag; });
+}
+{
+  const channels = sixDistinctChannels();
+  let refusedMessage: string | undefined;
+  try {
+    await mintCreds(auth, newIdentity(), "agent", { principal: { owner: "u_abc", actor: "cli" }, lifecycleUid: mintLifecycleUid(), allowSubscribe: channels });
+  } catch (e) { refusedMessage = (e as Error).message; }
+  c("six 4096-char allowSubscribe channels (each individually valid) are refused at the mint, naming the size and the bound",
+    refusedMessage !== undefined && refusedMessage.includes("bytes") && refusedMessage.includes(String(MAX_MINTED_JWT_BYTES)) && refusedMessage.includes("6 allowSubscribe"),
+    refusedMessage);
+}
+{
+  const channels = sixDistinctChannels().slice(0, 5); // the reviewer's fitting shape
+  const creds = await mintCreds(auth, newIdentity(), "agent", { principal: { owner: "u_abc", actor: "cli" }, lifecycleUid: mintLifecycleUid(), allowSubscribe: channels });
+  const jwt = /BEGIN NATS USER JWT-+\s+(\S+)/.exec(creds)![1];
+  const decoded = decode(creds);
+  c("a mint that fits (five 4096-char allowSubscribe channels) succeeds and its decoded JWT is under the bound",
+    decoded.pub.allow.length > 0 && Buffer.byteLength(jwt, "utf8") < MAX_MINTED_JWT_BYTES);
+}
+c("the mint bound equals the control line minus the documented CONNECT envelope overhead (both read from source, so a drift is a red cell)",
+  MAX_MINTED_JWT_BYTES === MAX_CONTROL_LINE_BYTES - CONNECT_ENVELOPE_OVERHEAD_BYTES);
+
+const withCaps = decode(await mintCreds(auth, newIdentity(), "agent", {
+  principal: { owner: "u_abc", actor: "cli" },
+  endpointCapabilities: [spawnCap],
+  lifecycleUid: UID,
+}));
+c("minted JWT carries the request row", withCaps.pub.allow.includes(`cotal.epg.ep.one.manager.spawn.owner.u_abc.u_abc.cli.${UID}.*`));
+c("minted JWT carries the journal row", withCaps.pub.allow.includes(`cotal.epg.epj.manager.spawn.owner.u_abc.u_abc.cli.${UID}`));
+c("minted JWT carries the reply-rail read", withCaps.sub.allow.includes(`cotal.epg.ep.reply.*.*.*.u_abc.cli.${UID}.*`));
+const minterCaps = minterIdentityCapabilities();
+const minterJwt = decode(await mintCreds(auth, newIdentity(), "agent", {
+  principal: { owner: "u_abc", actor: "cli" }, lifecycleUid: UID, endpointCapabilities: minterCaps,
+}));
+const expectedIdentityRows = minterCaps.flatMap((cap) => epRequestGrantRows("epg", cap, caller));
+const actualIdentityRows = minterJwt.pub.allow.filter((row: string) => MINTER_IDENTITY_COMMANDS.some((command) => row.includes(`.manager.${command}.`)));
+c("minter JWT carries exactly the four identity capability rows", JSON.stringify(actualIdentityRows) === JSON.stringify(expectedIdentityRows));
+const adminIdentity = { endpoint: "manager", command: "identity-retire-admin" } satisfies EpCapability;
+const adminIdentityJwt = decode(await mintCreds(auth, newIdentity(), "control-caller-admin", { endpointCapabilities: [adminIdentity] }));
+const expectedAdminIdentityRows = epRequestGrantRows("epg", adminIdentity, caller);
+c("admin instrument carries the exact operator identity-retirement row", expectedAdminIdentityRows.every((row) => adminIdentityJwt.pub.allow.includes(row)) && adminIdentityJwt.pub.allow.filter((row: string) => row.includes(".identity-retire-admin.")).length === expectedAdminIdentityRows.length);
+for (const name of ["identity-reserve", "identity-mint", "identity-renew", "identity-retire"]) {
+  const capability = { endpoint: "manager", command: name } satisfies EpCapability;
+  const control = decode(await mintCreds(auth, newIdentity(), "control-caller-privileged", { endpointCapabilities: [capability] }));
+  const expected = epRequestGrantRows("epg", capability, caller);
+  c(`privileged manager instrument carries exact ${name} row`, expected.every((row) => control.pub.allow.includes(row)) && control.pub.allow.filter((row: string) => row.includes(`.${name}.`)).length === expected.length);
+}
+const seatJwt = decode(await mintCreds(auth, newIdentity(), "agent", {
+  principal: { owner: "u_abc", actor: "cli" }, lifecycleUid: UID, dmOnly: true,
+}));
+c("DM-only seat has exactly one DM send and three own durable publish rows", seatJwt.pub.allow.length === 4 && seatJwt.pub.allow.some((row: string) => row.includes(".inst.*.*.u_abc.cli")) && seatJwt.pub.allow.filter((row: string) => row.startsWith("$JS.")).length === 3);
+c("DM-only seat has only its inbox subscription", seatJwt.sub.allow.length === 1 && seatJwt.sub.allow[0].startsWith("_INBOX_"));
+throws("DM-only refuses endpoint capabilities", () => permissionsFor("agent", "epg", { owner: "u_abc", actor: "cli", connId: "seat", lifecycleUid: UID }, { dmOnly: true, endpointCapabilities: minterCaps }));
+for (const forbidden of [{ capabilities: ["spawn"] }, { role: "worker" }, { allowPublish: ["team"] }, { allowSubscribe: ["team"] }]) {
+  throws("DM-only refuses additional agent permissions", () => permissionsFor("agent", "epg", { owner: "u_abc", actor: "cli", connId: "seat", lifecycleUid: UID }, { dmOnly: true, ...forbidden }));
+}
+const without = decode(await mintCreds(auth, newIdentity(), "agent", { principal: { owner: "u_abc", actor: "cli" }, lifecycleUid: UID }));
+const BASELINE_PUB = [
+  `cotal.epg.ep.one.*.describe.u_abc.cli.${UID}.*`,
+  `cotal.epg.ep.one.delivery.join.u_abc.cli.${UID}.*`,
+  `cotal.epg.ep.one.delivery.leave.u_abc.cli.${UID}.*`,
+  `cotal.epg.ep.one.delivery.list.u_abc.cli.${UID}.*`,
+  `cotal.epg.ep.one.auth.roster.u_abc.cli.${UID}.*`,
+  `cotal.epg.ep.one.manager.roster.u_abc.cli.${UID}.*`,
+  `cotal.epg.ep.one.manager.stop.self.u_abc.cli.${UID}.*`,
+  `cotal.epg.ep.one.manager.turn-participate.self.u_abc.cli.${UID}.*`,
+  `cotal.epg.ep.one.manager.turn-pending.self.u_abc.cli.${UID}.*`,
+  `cotal.epg.ep.one.manager.turn-yield.self.u_abc.cli.${UID}.*`,
+  `cotal.epg.ep.one.manager.turn-unconfirmed.self.u_abc.cli.${UID}.*`,
+  `cotal.epg.ep.one.manager.run-answer.self.u_abc.cli.${UID}.*`,
+];
+c("no-capability mint carries EXACTLY the Appendix-B baseline ep rows (describe-all + delivery join/leave/list + auth and manager roster + self stop/turn-participate/turn-pending/turn-yield/turn-unconfirmed/run-answer), nothing wider",
+  JSON.stringify(without.pub.allow.filter((r) => r.includes(".ep.") || r.includes(".epj.")).sort())
+  === JSON.stringify([...BASELINE_PUB].sort()),
+  JSON.stringify(without.pub.allow.filter((r) => r.includes(".ep."))));
+c("no-capability mint carries the baseline reply-rail read (and only that ep sub row)",
+  without.sub.allow.filter((r) => r.includes(".ep.")).join("|") === `cotal.epg.ep.reply.*.*.*.u_abc.cli.${UID}.*`);
+c("no-capability mint carries NO journal rows and NO owner/child/ledger-mode rows",
+  ![...without.pub.allow].some((r) => r.includes(".epj.") || r.includes(".owner.") || r.includes(".child.") || r.includes(".ledger.")));
+const withSpawn = decode(await mintCreds(auth, newIdentity(), "agent", { principal: { owner: "u_abc", actor: "cli" }, lifecycleUid: UID, capabilities: ["spawn"] }));
+c("the spawn capability adds UNTARGETED manager.spawn + owner-mode despawn/attach to the minted JWT (no owner-stop synonym, and NO input in either mode)",
+  withSpawn.pub.allow.includes(`cotal.epg.ep.one.manager.spawn.u_abc.cli.${UID}.*`)
+  && ["despawn", "attach"].every((cmd) => withSpawn.pub.allow.includes(`cotal.epg.ep.one.manager.${cmd}.owner.u_abc.u_abc.cli.${UID}.*`))
+  && !withSpawn.pub.allow.includes(`cotal.epg.ep.one.manager.stop.owner.u_abc.u_abc.cli.${UID}.*`)
+  // The MINTED-JWT half of the placement guard: the capability-list cell above proves the builder
+  // omits it, this proves the credential a real agent actually connects with carries no such row.
+  && !withSpawn.pub.allow.some((r: string) => r.includes(".manager.input.")));
+c("without the spawn capability none of the owner-mode lifecycle rows appear",
+  !without.pub.allow.some((r) => r.includes(".owner.")));
+// C7 (critic/distsys/engineer-5): one credential names ONE incarnation on the caller rail. Through
+// mintCreds, principalOf collapses opts.lifecycleUid INTO pr.lifecycleUid, so they cannot diverge;
+// the risk lives on the PUBLIC permissionsFor seam (the IdP-adapter path), where pr and opts are
+// separate. A divergent opts.lifecycleUid must FAIL LOUD there, never mint two reply rails.
+const OTHER_UID = "z".repeat(26);
+const prC7 = { owner: "u_abc", actor: "cli", connId: "connid01234567", lifecycleUid: UID };
+throws("permissionsFor fails loud when opts.lifecycleUid disagrees with the principal's (no dual-uid caller rail, C7)",
+  () => permissionsFor("agent", "demo", prC7 as never, { endpointCapabilities: [spawnCap], lifecycleUid: OTHER_UID }));
+const agreed = permissionsFor("agent", "demo", prC7 as never, { endpointCapabilities: [spawnCap], lifecycleUid: UID }) as
+  { pub: { allow: string[] }; sub: { allow: string[] } };
+c("permissionsFor with an AGREEING opts.lifecycleUid mints, and every caller-rail row carries the ONE uid",
+  agreed.pub.allow.concat(agreed.sub.allow).filter((r: string) => r.includes(".ep.")).every((r: string) => r.includes(`.${UID}.`) || r.includes(`.${UID}`))
+  && !agreed.pub.allow.some((r: string) => r.includes(OTHER_UID)));
+const presencePermissions = permissionsFor("agent", "demo", prC7 as never, { lifecycleUid: UID }) as
+  { pub: { allow: string[] }; sub: { allow: string[] } };
+const presenceStream = `KV_${presenceBucket("demo")}`;
+c("agent permissions omit bare and keyed presence Direct Get grants",
+  !presencePermissions.pub.allow.some((r) => r === "$JS.API.DIRECT.GET" || r.startsWith(`$JS.API.DIRECT.GET.${presenceStream}`)));
+c("agent permissions omit presence consumer-create and consumer-info grants",
+  !presencePermissions.pub.allow.some((r) => r.startsWith(`$JS.API.CONSUMER.CREATE.${presenceStream}`)
+    || r.startsWith(`$JS.API.CONSUMER.INFO.${presenceStream}`)));
+c("agent permissions retain presence STREAM.INFO and only the principal's exact own-key write",
+  presencePermissions.pub.allow.includes(`$JS.API.STREAM.INFO.${presenceStream}`)
+  && presencePermissions.pub.allow.includes(presenceKeySubject("demo", prC7.owner, prC7.actor))
+  && !presencePermissions.pub.allow.some((r) => r.startsWith(`$KV.${presenceBucket("demo")}.`)
+    && r !== presenceKeySubject("demo", prC7.owner, prC7.actor)));
+let threw = false;
+try {
+  await mintCreds(auth, newIdentity(), "agent", { principal: { owner: "u_abc", actor: "cli" }, endpointCapabilities: [spawnCap] });
+} catch (e) {
+  threw = (e as Error).message.includes("lifecycleUid");
+}
+c("mint without a lifecycleUid fails loud", threw);
+let threwHandle = false;
+try {
+  await mintCreds(auth, newIdentity(), "agent", {
+    principal: { owner: "u_abc", actor: "cli" },
+    endpointCapabilities: [handleCap],
+    lifecycleUid: UID,
+  });
+} catch (e) {
+  threwHandle = (e as Error).message.includes("redemption-minted");
+}
+c("mint refuses a standing handle capability end-to-end", threwHandle);
+
+console.log(`\nENDPOINT GRANTS SMOKE ${fail === 0 ? "OK ✅" : "FAILED ❌"}  (${ok} passed, ${fail} failed)`);
+if (fail > 0) process.exit(1);

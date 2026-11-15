@@ -1,0 +1,507 @@
+import { readFileSync } from "node:fs";
+import { type CompletionResult, type FlagSpec, type FlagValues, type ParsedArgs } from "@cotal-ai/core";
+import {
+  authDir,
+  checkDiscoveryDocument,
+  clearCurrent,
+  discoveryDocumentUrl,
+  getCurrent,
+  keepsRegistration,
+  loadMeshes,
+  pinnedFetch,
+  PinnedFetchRefused,
+  removeMeshes,
+  renderReport,
+  type MeshEntry,
+} from "@cotal-ai/workspace";
+import { c, stderrLine } from "../ui.js";
+import { pruneStaleMeshes } from "../lib/meshes.js";
+import { completingFlagValue } from "../lib/completion.js";
+import { liveMeshOwner } from "./clean.js";
+import { readStackJournal } from "../lib/stack-journal.js";
+import {
+  candidateTarget,
+  checkDialPolicy,
+  checkEnforcement,
+  checkEnforcementAt,
+  checkMode,
+  checkRoot,
+  checkServer,
+  checkSpaceName,
+  checkTrust,
+  checkUserBundle,
+  persistRemoteUserEntry,
+  probeEnforcement,
+  spacesAtRoot,
+  tlsIntent,
+  userExchangeIssuer,
+  verifyUserExchange,
+  verifyTarget,
+  writeRecord,
+  type Check,
+  type UserBundle,
+} from "./meshes-add.js";
+import { addWizard, canPrompt, clackIO } from "./meshes-wizard.js";
+import { handAddedRegistration } from "./space-registration.js";
+
+/**
+ * `cotal meshes` — the registry of meshes this machine can reach, and the two verbs that maintain
+ * it by hand.
+ *
+ *   cotal meshes [--json]              list (the kubectl `get-contexts` analogue)
+ *   cotal meshes add <space> --server  register a mesh this machine did NOT start
+ *   cotal meshes rm <space> …          drop records (never stops anything)
+ *
+ * `up` and `down` still write and clear their own records; `add`/`rm` exist for the meshes they
+ * cannot speak for — one running on another machine, a shared broker, a hosted space. Those records
+ * are marked `manual`. A liveness miss never auto-prunes any origin (see `pruneMesh`): a dead
+ * broker is reported `offline`, not deleted. `cotal down` still drops an `up` record for this root.
+ */
+
+const SUBCOMMANDS = ["list", "add", "rm", "remove"] as const;
+
+export const meshesFlags = [
+  { name: "json", type: "boolean", description: "list: machine-readable, one JSON object per mesh per line (notes go to stderr)" },
+  { name: "server", type: "string", value: "<url>", description: "add: the mesh's broker URL (required)" },
+  { name: "root", type: "string", value: "<dir>", description: "add: folder holding this mesh's .cotal/auth + .cotal/agents (default: this project)" },
+  { name: "mode", type: "string", value: "<auth|open|user>", description: "add: how the broker authenticates (default: inferred from --root; user needs --user-auth-file or --from)" },
+  { name: "user-auth-file", type: "string", value: "<bundle.json>", description: "add --mode user: the pinned-trust bundle exported where the mesh runs" },
+  { name: "from", type: "string", value: "<https url>", description: "add --mode user: fetch the mesh's /.well-known/cotal-mesh discovery document (pins are shown and confirmed)" },
+  { name: "force", type: "boolean", description: "add: record without verifying the broker, replacing a record added by hand; the address rules still apply · rm: drop a record when its folder cannot be checked for a running mesh" },
+  { name: "tls", type: "boolean", description: "add: require TLS on every connection resolved through this record (a tls:// --server implies it)" },
+  { name: "allow-unencrypted-overlay", type: "boolean", description: "add: accept that an overlay address is protected only while its tunnel is up (recorded on the entry)" },
+] as const satisfies readonly FlagSpec[];
+
+type Values = FlagValues<typeof meshesFlags>;
+
+export async function meshes(args: ParsedArgs): Promise<void> {
+  const sub = args.positionals[0];
+  const v = args.values as Values;
+  if (v.json && (sub === "add" || sub === "rm" || sub === "remove")) {
+    stderrLine("✗ ", `meshes ${sub}: --json is taken by the list only`, c.red);
+    process.exit(1);
+  }
+  if (sub === "add") return addMesh(args.positionals.slice(1), v);
+  if (sub === "rm" || sub === "remove") return rmMeshes(args.positionals.slice(1), v);
+  if (sub !== undefined && sub !== "list") {
+    stderrLine("✗ ", `unknown subcommand "${sub}" - usage: cotal meshes [list | add <space> --server <url> | rm <space> …]`, c.red);
+    process.exit(1);
+  }
+  return listMeshes(v.json === true);
+}
+
+// ---- list -----------------------------------------------------------------------------------
+
+/** The registered meshes, one row each, with the `current` default marked `(default)`. This is how
+ *  you see what a bare `cotal spawn` would join and which `--space` names exist. The sweep runs first so a
+ *  dead broker is tagged `offline` rather than deleted: an `up` record is the restart authority for
+ *  that root, and a hand-registered one is still the mesh you meant, just not up. `--json` prints
+ *  one {@link meshRow} per line instead, and only rows reach stdout. */
+async function listMeshes(json: boolean): Promise<void> {
+  const sweep = await pruneStaleMeshes();
+  const all = loadMeshes();
+  if (all.length === 0) {
+    // Zero meshes under --json is zero lines, not a prose line a JSONL reader would choke on.
+    if (!json) console.log(c.dim("no meshes registered - `cotal up` starts one here, `cotal meshes add <space> --server <url>` registers one running elsewhere"));
+    return;
+  }
+  const current = getCurrent();
+  const offline = new Set(sweep.offline);
+  // A `current` that no longer matches any recorded mesh (its broker went down) marks no row — say
+  // why, so a bare `cotal spawn` still reporting "multiple meshes" isn't a mystery.
+  const dangling = current && !all.some((m) => m.space === current)
+    ? `note: default "${current}" is not running - \`cotal use <name>\` to set a live one`
+    : undefined;
+  if (json) {
+    for (const m of all) console.log(JSON.stringify(meshRow(m, m.space === current, offline.has(m.space))));
+    if (dangling) console.error(c.dim(dangling));
+    return;
+  }
+  const rows = all.map((m) => {
+    const notes = [
+      ...(m.policy?.events === "required" ? ["events: required"] : []),
+      ...(m.origin === "manual" ? ["registered"] : []),
+      ...(m.origin === "catalog" ? ["discovered"] : []),
+      ...(m.origin === "catalog" && m.catalogName && m.catalogName !== m.space ? [m.catalogName] : []),
+      ...(m.origin !== "catalog" && offline.has(m.space) ? ["offline"] : []),
+    ];
+    const warn = notes.includes("offline") || notes.includes("events: required");
+    return {
+      space: m.space === current ? { text: `${m.space} (default)`, tone: "selected" as const } : m.space,
+      server: { text: m.server, tone: "hint" as const },
+      mode: { text: m.mode, tone: "hint" as const },
+      root: { text: m.root, tone: "hint" as const },
+      // An empty styled cell would still draw color codes, which keep the padding before it trailing.
+      notes: notes.length ? { text: notes.join(" · "), tone: warn ? "waiting" as const : "hint" as const } : "",
+    };
+  });
+  // The shared table: a terminal too narrow for its columns gets one labeled record per mesh.
+  const columns = [{ key: "space", label: "SPACE" }, { key: "server", label: "SERVER" }, { key: "mode", label: "MODE" }, { key: "root", label: "ROOT" }];
+  const sections = [
+    { blocks: [{ kind: "table" as const, columns: rows.some((row) => row.notes) ? [...columns, { key: "notes", label: "NOTES" }] : columns, rows }] },
+    ...(dangling ? [{ blocks: [{ kind: "lines" as const, lines: [{ text: dangling, tone: "hint" as const }] }] }] : []),
+  ];
+  console.log(renderReport({ sections }, "rich", process.stdout));
+}
+
+/** One `cotal meshes --json` row: what the table shows, as named fields. Origin and liveness stay
+ *  separate, as the record keeps them. A discovered (`catalog`) entry is never probed by the sweep,
+ *  so it carries no `offline` rather than a guessed `false`. Record internals (catalog owner keys,
+ *  user-auth pins, timestamps) are not part of the row. */
+function meshRow(m: MeshEntry, isDefault: boolean, isOffline: boolean) {
+  return {
+    space: m.space,
+    server: m.server,
+    mode: m.mode,
+    root: m.root,
+    default: isDefault,
+    origin: m.origin ?? "up",
+    ...(m.origin === "catalog" ? {} : { offline: isOffline }),
+    ...(m.tlsRequired ? { tlsRequired: true } : {}),
+    ...(m.policy?.events === "required" ? { events: "required" } : {}),
+    ...(m.origin === "catalog" && m.catalogName ? { catalogName: m.catalogName } : {}),
+  };
+}
+
+// ---- add ------------------------------------------------------------------------------------
+
+/** `cotal meshes add <space> --server <url>` — register a mesh this machine did not start, so
+ *  `--space`, `cotal use` and a bare `cotal spawn` can reach it from any directory. The record
+ *  holds a broker URL, a local root and a mode; trust material itself stays in that root's
+ *  `.cotal/auth`, exactly as it does for a mesh started here. */
+async function addMesh(positionals: string[], v: Values): Promise<void> {
+  const space = positionals[0];
+  if (positionals.length > 1) {
+    console.error(c.red("usage: cotal meshes add <space> --server <url> [--root <dir>] [--mode auth|open|user]"));
+    process.exit(1);
+  }
+  if (space !== undefined) take(checkSpaceName(space));
+  // THE USER ARM — its own path because everything about it inverts the static flow: the server
+  // comes from the supplied bundle rather than --server, trust composes against a pinned exchange
+  // rather than on-disk material, and the enforcement PASS is the broker's refusal.
+  if (v.mode === "user" || v["user-auth-file"] || v.from) return addUserMesh(space, v);
+  // GUIDED FORM. A registration needs four facts, three of which the machine can find out — so a
+  // command missing either irreducible one, on a real terminal, is an operator who would rather be
+  // asked than read a usage line. Scripts and agents are unaffected: without a TTY (or with
+  // COTAL_NO_PROMPT=1) the flag form's fail-loud sentences stand, which is what every smoke asserts.
+  if ((!space || !v.server) && canPrompt()) {
+    const done = await addWizard(
+      { ...(space ? { space } : {}), ...(v.server ? { server: v.server } : {}), ...(v.root ? { root: v.root } : {}),
+        ...(v.mode ? { mode: v.mode } : {}), ...(v.force ? { force: true } : {}), ...(v.tls ? { tls: true } : {}),
+        ...(v["allow-unencrypted-overlay"] ? { allowUnencryptedOverlay: true } : {}) },
+      process.cwd(),
+    );
+    if (!done) process.exitCode = 0; // backing out of a wizard is not a failure
+    return;
+  }
+  if (!space) {
+    console.error(c.red("usage: cotal meshes add <space> --server <url> [--root <dir>] [--mode auth|open]"));
+    process.exit(1);
+  }
+  if (!v.server) {
+    stderrLine("✗ ", "--server <url> is required - a mesh you did not start here has no address to infer (e.g. --server nats://100.90.12.34:4222, its address on your private overlay)", c.red);
+    process.exit(1);
+  }
+  const server = take(checkServer(v.server, "--server"));
+  // The strictness this registration RECORDS — from --tls or a tls:// scheme — and therefore what
+  // every dial through the record will enforce. Sourced once, so the dial policy, the candidate
+  // probe and the written entry cannot disagree.
+  const tlsRequired = tlsIntent(server, Boolean(v.tls));
+  // Above the `--force` branch on purpose: this decides whether credentials may cross the network
+  // to that address at all, which `--force` ("the mesh is down right now") must never waive.
+  const dial = take(checkDialPolicy(server, { tlsRequired, allowUnencryptedOverlay: Boolean(v["allow-unencrypted-overlay"]) }));
+  // A permitted-but-not-guaranteed target is SAID OUT LOUD, never recorded quietly. Today that is
+  // the overlay literal whose protection depends on a tunnel we cannot verify from here; the
+  // operator is the only one who can know whether it is up, so the operator is told.
+  if (dial.residual) console.error(c.yellow(`! ${dial.residual}`));
+  const root = take(checkRoot(v.root, process.cwd()));
+  const accounts = take(spacesAtRoot(root));
+  const mode = take(checkMode(space, root, accounts, v.mode, false));
+  if (mode === "open" && accounts.includes(space))
+    console.log(c.dim(`note: ${authDir(root)} holds trust for "${space}", but --mode open records a credless connect`));
+  const auth = take(checkTrust(mode, root, space));
+
+  // A prepared space, or one this machine started or a catalog lists, is refused here as `space add`
+  // refuses it: replacing that registration leaves its running stack with nothing to stop it by.
+  const existing = handAddedRegistration(space, Boolean(v.force), { space });
+  if (existing && !v.force) {
+    stderrLine("✗ ", `"${space}" is already registered at ${existing.server} (${existing.root}) - \`cotal meshes rm ${space}\` first, or --force to replace it`, c.red);
+    process.exit(1);
+  }
+
+  // VERIFY BEFORE RECORDING. A wrong address, a broker that wants auth, creds that don't open this
+  // space, an expired cred — all one probe away here, and every one of them would otherwise surface
+  // as a confusing failure at the first `cotal spawn` against a record that looks fine. `--force`
+  // is the explicit escape (registering a mesh that is currently down), and it says so on the
+  // success line rather than pretending the mesh was checked.
+  if (!v.force) {
+    take(checkEnforcement(mode, await probeEnforcement(server), server, space, root));
+    const verified = await verifyTarget(candidateTarget(space, server, root, mode, auth, tlsRequired));
+    if (!verified.ok) {
+      console.error(c.red(verified.message));
+      console.error(c.dim("nothing was registered - fix the above, or `--force` to record it without verifying (e.g. the mesh is down right now)"));
+      process.exit(1);
+    }
+  }
+
+  const result = writeRecord({ space, server, root, mode, origin: "manual", ...(tlsRequired ? { tlsRequired: true } : {}), ...(dial.residual ? { unencryptedOverlay: true } : {}), ts: new Date().toISOString() });
+  console.log(
+    c.green(`✓ registered "${space}"`),
+    // "recorded without verifying" describes THIS registration, not a durable property of the
+    // record: verification is point-in-time — a verified record loses it the moment a port is
+    // reused — so it is reported as what just happened rather than persisted as a stored claim
+    // that would quietly decay into a false one.
+    c.dim(`${server}  ${mode}  ${root}${v.force ? "  (recorded without verifying)" : ""}`),
+  );
+  if (result.adoptedCurrent) {
+    console.log(c.dim(`it is now the default mesh - \`cotal spawn\` from any directory joins it`));
+    return;
+  }
+  if (result.keptCurrent) console.log(c.dim(`current is still "${result.keptCurrent}" - \`cotal use ${space}\` to switch`));
+}
+
+/** `cotal meshes add <space> --mode user` — register a REMOTE user-auth mesh from supplied pinned
+ *  trust. The pins are never guessed: they arrive in a bundle exported where the mesh runs
+ *  (`--user-auth-file`), or in its HTTPS discovery document (`--from`), which is fetched, shown,
+ *  and explicitly confirmed. Verification is the user arm's own: the pinned exchange must answer
+ *  `/health` + `/jwks` as the pinned issuer, and the broker's auth-required refusal of a credless
+ *  probe is the PASS. The registration still goes THROUGH the dial-policy fence — never around
+ *  it — with the bundle's recorded strictness as the policy input. */
+async function addUserMesh(spaceArg: string | undefined, v: Values): Promise<void> {
+  if (v.mode !== undefined && v.mode !== "user") {
+    stderrLine("✗ ", `--user-auth-file/--from register a user-auth mesh - they cannot be combined with --mode ${v.mode}`, c.red);
+    process.exit(1);
+  }
+  if (v["user-auth-file"] && v.from) {
+    stderrLine("✗ ", "pass either --user-auth-file or --from, not both - they are two sources for the same pinned trust", c.red);
+    process.exit(1);
+  }
+  // No source supplied at all: this is the old blanket refusal's successor, and it must carry the
+  // way through. checkMode owns the sentence so both front ends refuse identically.
+  if (!v["user-auth-file"] && !v.from) {
+    const refusal = checkMode(spaceArg ?? "", "", [], "user", false);
+    console.error(c.red(refusal.ok ? "✗ --mode user needs --user-auth-file <bundle.json> or --from <https url>" : refusal.message));
+    process.exit(1);
+  }
+
+  // ── the pins ────────────────────────────────────────────────────────────────────────────────
+  let bundle: UserBundle;
+  if (v["user-auth-file"]) {
+    let raw: string;
+    try {
+      raw = readFileSync(v["user-auth-file"], "utf8");
+    } catch (e) {
+      stderrLine("✗ ", `cannot read --user-auth-file ${v["user-auth-file"]} (${(e as Error).message})`, c.red);
+      process.exit(1);
+    }
+    bundle = take(checkUserBundle(raw));
+  } else {
+    // HTTPS ONLY. The document IS the trust being adopted; fetching it in plaintext would let the
+    // network choose the pins, which is the exact failure pinning exists to prevent.
+    let disco: URL;
+    try {
+      const from = new URL(v.from as string);
+      // `--from` also takes the document URL itself, the form the `--mode user` refusal names.
+      disco = from.pathname.endsWith("/.well-known/cotal-mesh") ? from : discoveryDocumentUrl(from);
+    } catch {
+      stderrLine("✗ ", `--from is not a URL`, c.red);
+      process.exit(1);
+    }
+    if (disco.protocol !== "https:") {
+      stderrLine("✗ ", `--from must be an https:// URL - the discovery document carries the trust pins this registration adopts, and a plaintext fetch lets the network choose them`, c.red);
+      process.exit(1);
+    }
+    // CONSENT BEFORE THE NETWORK. Fetching first meant a bare `--from <url>` reached out to a
+    // host the operator had not yet agreed to talk to, and on a pipe it did so with no way to
+    // agree at all. Ask for the address itself first; the pins fetched from it are confirmed
+    // separately below.
+    if (!canPrompt()) {
+      stderrLine("✗ ", "--from needs a terminal to display and confirm the fetched pins - in a script, export the bundle where the mesh runs and pass it with --user-auth-file", c.red);
+      process.exit(1);
+    }
+    const goFetch = await clackIO().confirm({ message: `Fetch trust pins from ${disco}?`, initialValue: false });
+    if (!goFetch) {
+      console.error(c.dim("nothing was fetched, nothing was registered"));
+      process.exit(1);
+    }
+    try {
+      // The policy refresh re-fetches this document through `pinnedFetch`, so registration must
+      // judge it by the same redirect and timeout rule.
+      const res = await pinnedFetch(disco.toString(), `--from ${disco}`);
+      if (!res.ok) {
+        stderrLine("✗ ", `${disco} answered ${res.status} - no discovery document there`, c.red);
+        process.exit(1);
+      }
+      bundle = take(await checkDiscoveryDocument(res));
+    } catch (e) {
+      const m = e instanceof PinnedFetchRefused ? `✗ ${e.message}` : `✗ could not fetch ${disco} (${(e as Error).message})`;
+      console.error(c.red(m));
+      process.exit(1);
+    }
+  }
+  const space = spaceArg ?? bundle.space;
+  if (spaceArg && bundle.space !== spaceArg) {
+    stderrLine("✗ ", `the bundle is for space "${bundle.space}" but the command names "${spaceArg}" - a bundle registers the space it was exported for`, c.red);
+    process.exit(1);
+  }
+  take(checkSpaceName(space));
+
+  // A FETCHED document is displayed and explicitly confirmed before anything trusts it: the
+  // operator, not the network, adopts the pins. A file the operator already holds needs no
+  // confirmation — supplying it is the consent. The fetch already required a terminal.
+  if (v.from) {
+    const io = clackIO();
+    io.note(
+      [
+        `space     ${bundle.space}`,
+        `broker    ${bundle.server}${bundle.tlsRequired ? "  (TLS required)" : ""}`,
+        `IdP       ${bundle.userAuth.idp.url}`,
+        `issuer    ${bundle.userAuth.idp.issuer}`,
+        `audience  ${bundle.userAuth.idp.audience}`,
+        `exchange  ${bundle.userAuth.endpoints.url}`,
+      ].join("\n"),
+      "Pins fetched - trust them only if they match what the mesh's operator published",
+    );
+    const goOn = await io.confirm({ message: "Adopt these pins and register the mesh?", initialValue: false });
+    if (!goOn) {
+      console.error(c.dim("nothing was registered"));
+      return;
+    }
+  }
+
+  // ── the same fences as every other registration ──────────────────────────────────────────
+  const server = take(v.server === undefined ? checkServer(bundle.server, "the bundle's server") : checkServer(v.server, "--server"));
+  // The bundle's recorded strictness is a TLS-intent source of its own, alongside --tls and the
+  // scheme: the export states what the mesh's transport requires, and the record must carry it.
+  const tlsRequired = bundle.tlsRequired || tlsIntent(server, Boolean(v.tls));
+  const dial = take(checkDialPolicy(server, { tlsRequired, allowUnencryptedOverlay: Boolean(v["allow-unencrypted-overlay"]) }));
+  if (dial.residual) console.error(c.yellow(`! ${dial.residual}`));
+  const root = take(checkRoot(v.root, process.cwd()));
+  take(checkMode(space, root, [], "user", true));
+
+  const existing = handAddedRegistration(space, Boolean(v.force), { space });
+  if (existing && !v.force) {
+    stderrLine("✗ ", `"${space}" is already registered at ${existing.server} (${existing.root}) - \`cotal meshes rm ${space}\` first, or --force to replace it`, c.red);
+    process.exit(1);
+  }
+
+  // ── the user arm's verification ────────────────────────────────────────────────────────────────
+  // Trust: the pinned exchange must answer as itself. Enforcement: the broker must REFUSE a bare
+  // connect — auth-required is the pass, because a user-mode target has no probe credential by
+  // design (preflightTarget refuses user targets outright for exactly that reason). Both run even
+  // under --force: unlike a static mesh, there is no "register it while it is down" story here —
+  // an unverifiable pin set is not a record worth writing.
+  take(await verifyUserExchange(bundle.userAuth.endpoints.url, userExchangeIssuer(bundle.space)));
+  take(await checkEnforcementAt("user", server, space, root, v.server === undefined ? "the bundle's server" : "--server"));
+
+  const result = persistRemoteUserEntry(space, server, root, bundle, tlsRequired, Boolean(dial.residual));
+  console.log(c.green(`✓ registered "${space}"`), c.dim(`${server}  user  ${root}`));
+  console.log(c.dim(`  pinned issuer ${bundle.userAuth.idp.issuer} · exchange ${bundle.userAuth.endpoints.url}`));
+  if (result.adoptedCurrent) console.log(c.dim(`it is now the default mesh - \`cotal spawn\` from any directory joins it`));
+  else if (result.keptCurrent) console.log(c.dim(`current is still "${result.keptCurrent}" - \`cotal use ${space}\` to switch`));
+}
+
+/** Take a rule's value, or print its sentence and exit — the flag form's whole error posture. */
+function take<T>(r: Check<T>): T {
+  if (r.ok) return r.value;
+  console.error(c.red(r.message));
+  if (r.remedy) console.error(c.dim(r.remedy));
+  process.exit(1);
+}
+
+// ---- rm -------------------------------------------------------------------------------------
+
+/** `cotal meshes rm <space> …` — drop records. This never stops a mesh: it removes what THIS
+ *  machine remembers about one. For a mesh running here that distinction is a footgun (the broker
+ *  keeps running with nothing pointing at it), so those are refused in favour of `cotal down`. */
+async function rmMeshes(names: string[], v: Values): Promise<void> {
+  if (names.length === 0) {
+    console.error(c.red("usage: cotal meshes rm <space> [<space> …]"));
+    process.exit(1);
+  }
+  const byName = new Map(loadMeshes().map((m) => [m.space, m]));
+  const removed: MeshEntry[] = [];
+  let failed = false;
+  for (const space of names) {
+    const m = byName.get(space);
+    if (!m) {
+      stderrLine("✗ ", `no mesh named "${space}" is registered - see \`cotal meshes\``, c.red);
+      failed = true;
+      continue;
+    }
+    // Refuse only when THIS MACHINE demonstrably runs the mesh — a live recorded pid under its
+    // root. Reachability was the wrong test: any broker on that address answers, including a
+    // reused port or a foreign NATS, which produced a refusal plus a `cotal down` instruction that
+    // would stop nothing. Local process ownership is the fact the refusal actually claims.
+    //
+    // It is asked only of records this machine started. Pidfiles are ROOT-scoped, and a root is
+    // shared on purpose here: `add` defaults `--root` to the project you run it in, so a local mesh
+    // and a registration for a remote one routinely live under one root. A pid there belongs to
+    // whichever mesh owns the root — never to the remote broker — so asking this of a hand-registered
+    // record can only produce a false "it is running here". That is safe to skip precisely because
+    // provenance is now decided at the call site that started the broker: anything this machine
+    // actually runs is stamped `up` and does reach the check.
+    //
+    // `--force` does not drop the record of a mesh this machine is shown to run: `cotal down` finds
+    // the mesh by that record, so dropping it left a running stack nothing could stop. It overrides
+    // only a probe that throws, as it does on a multi-tenant or unreadable root. Keyed on the
+    // entry's OWN space rather than one re-resolved from the root, which on a multi-tenant root can
+    // name another tenant.
+    let running: string | undefined, stack = false;
+    if (m.origin !== "manual" && m.origin !== "catalog") {
+      try {
+        running = liveMeshOwner(m.root, m.space);
+        stack = running !== undefined && readStackJournal(m.root)?.journal.space === m.space;
+      } catch (e) {
+        if (!v.force) throw e;
+      }
+    }
+    if (running) {
+      // A stack's down keeps the space prepared at its root, which `space forget` removes and `rm` cannot.
+      const after = stack ? `keeps it as a prepared space there, which \`cotal space forget ${space}\` then removes` : keepsRegistration(m) ? `keeps its record, which \`cotal space forget ${space}\` then removes` : "drops the record";
+      stderrLine("✗ ", `"${space}" is running from ${m.root} (${running}) - \`cotal down\` there stops it and ${after}${v.force ? "; --force does not drop it while the mesh runs, because `cotal down` finds the mesh by it" : ""}`, c.red);
+      failed = true;
+      continue;
+    }
+    byName.delete(space);
+    removed.push(m);
+  }
+  if (removed.length > 0) {
+    const current = getCurrent();
+    let clearedCurrent = false;
+    try {
+      // The batch removes each yielded space before requesting the next. Report that completed
+      // removal now: a later native filesystem failure must not hide it or leave its selection.
+      removeMeshes((function* () {
+        for (const m of removed) {
+          yield m.space;
+          if (current === m.space) {
+            clearCurrent();
+            clearedCurrent = true;
+          }
+          console.log(c.green(`✓ unregistered "${m.space}"`), c.dim(m.server));
+        }
+      })());
+    } finally {
+      if (clearedCurrent) console.log(c.dim("there is no default mesh now - `cotal use <name>` to set one"));
+    }
+  }
+  if (failed) process.exit(1);
+}
+
+// ---- completion -----------------------------------------------------------------------------
+
+export function meshesComplete(argv: string[]): CompletionResult {
+  const flag = completingFlagValue(argv, meshesFlags);
+  if (flag?.name === "mode") return { items: [{ value: "auth" }, { value: "open" }, { value: "user" }], directive: "nofiles" };
+  if (flag?.name === "user-auth-file") return { items: [], directive: "default" }; // a file
+  if (flag?.name === "from") return { items: [], directive: "nofiles" };
+  if (flag?.name === "root") return { items: [], directive: "default" }; // a directory
+  if (flag?.name === "server") return { items: [], directive: "nofiles" };
+  const sub = argv[0];
+  if (argv.length <= 1) return { items: SUBCOMMANDS.map((value) => ({ value })), directive: "nofiles" };
+  // `rm` completes on what's registered; `add` names a mesh that by definition isn't.
+  if (sub === "rm" || sub === "remove")
+    return { items: loadMeshes().map((m) => ({ value: m.space })), directive: "nofiles" };
+  return { items: [], directive: "nofiles" };
+}

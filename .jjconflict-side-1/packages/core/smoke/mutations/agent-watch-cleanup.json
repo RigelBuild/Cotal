@@ -1,0 +1,26 @@
+{
+  "suite": [
+    "packages/core/smoke/manager-split-auth.smoke.ts"
+  ],
+  "guard": "a minted agent credential cannot delete ordered watch consumers on the public presence and channel-registry KV streams, so it cannot remove a peer's watch cursor (#691)",
+  "command": "pnpm smoke:manager-split",
+  "proveWith": "node scripts/mutation-proof.mjs --config packages/core/smoke/mutations/agent-watch-cleanup.json",
+  "mutations": [
+    {
+      "name": "restore the agent's stream-wide presence-watch consumer delete",
+      "file": "packages/core/src/provision.ts",
+      "find": "\n    \"$JS.FC.>\",\n",
+      "replace": "\n    `$JS.API.CONSUMER.DELETE.${KV}.>`,\n    \"$JS.FC.>\",\n",
+      "expectRed": "delete an ordered presence-watch consumer DENIED (a peer's watch cursor is not the agent's to remove)",
+      "cell": "delete an ordered presence-watch consumer DENIED (a peer's watch cursor is not the agent's to remove)"
+    },
+    {
+      "name": "restore the agent's stream-wide channel-registry-watch consumer delete",
+      "file": "packages/core/src/provision.ts",
+      "find": "\n    `$JS.API.CONSUMER.INFO.${CHKV}.>`,\n",
+      "replace": "\n    `$JS.API.CONSUMER.INFO.${CHKV}.>`,\n    `$JS.API.CONSUMER.DELETE.${CHKV}.>`,\n",
+      "expectRed": "delete an ordered channel-registry-watch consumer DENIED",
+      "cell": "delete an ordered channel-registry-watch consumer DENIED"
+    }
+  ]
+}

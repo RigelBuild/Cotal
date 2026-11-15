@@ -1,0 +1,336 @@
+/**
+ * GENERIC DESCRIBE/INVOKE smoke (control-surface P2 item 1, item 5 substrate) — the caller path
+ * every migrated control consumer rides, proven against a REAL Manager + JWT broker WITHOUT the
+ * caller importing the manager's contract module. The whole point: a caller learns the manager's
+ * command surface at runtime (describe → fetch the registered contracts from the §13.7 store →
+ * recompile the digest-matching validators) and invokes by name.
+ *
+ * Deliberately imports the endpoint NAME and the shipped cluster document's surface, never
+ * MANAGER_CONTRACTS. If this compiled and ran while secretly depending on the hand-written
+ * contracts, that would defeat the test; it does not. The command-count pin is derived from
+ * `managerShippedSurface()`, not restated, so a later served command cannot silently desync.
+ *
+ *  1. resolveService(manager) describes + fetches + recompiles the FULL visible surface (the
+ *     shipped cluster document's command set), each with a recompiled input/output contract whose
+ *     closureDigest MATCHES the registered declaration.
+ *  2. invoke "status" (untargeted, void) returns the typed ManagerStatus.
+ *  3. invoke "spawn" (the 17-field launch) boots a REAL agent; the recompiled input contract
+ *     gates a bad field pre-publish (the caller's own closed schema, fetched not hand-written).
+ *  4. invoke targeted "despawn" (owner mode) tears the agent down; a targeted command invoked
+ *     without a target, and an untargeted one WITH a target, both refuse at the generic layer.
+ *  5. a command OUTSIDE the caller's describe VIEW is not in the resolved surface (not-found).
+ *
+ * Run: pnpm smoke:manager-service-invoke   (needs nats-server + node on PATH; boots its own broker)
+ */
+import { randomUUID } from "node:crypto";
+import { spawn } from "node:child_process";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { connect, PermissionViolationError, type NatsConnection } from "@nats-io/transport-node";
+import {
+  isReachable, createSpaceAuth, serverConfig, setupSpaceStreams, mintCreds, newIdentity,
+  mintLifecycleUid, standaloneConnectOpts, DEV_OWNER, EpEnvelopeError,
+  MANAGER_VITALS_SCOPE,
+  resolveService, invokeCommand, registry, parseGoalResultFact, goalResultSubject, epfStreamName,
+  parseEpSubject, deriveReplySubject, epCallerReplyFilter, epRequestSubject,
+  type Connector, type ControlReply, type EpCaller, type EpAttributedReply, type LaunchOpts, type LaunchSpec,
+} from "@cotal-ai/core";
+import { authDir, saveSpaceAuth } from "@cotal-ai/workspace";
+import { Manager } from "../src/manager.js";
+// Endpoint name + shipped surface pin. Never MANAGER_CONTRACTS: a generic caller does not
+// hand-import schemas. The count comes from the cluster document, not a restated literal.
+import { MANAGER_ENDPOINT, managerShippedSurface } from "../src/manager-service-contract.js";
+import { SMOKE_BROKER_TOKEN, freePort, teardownOnSignal, killAndAwaitExit, emitSentinel } from "@cotal-ai/smoke-kit";
+const shipped = managerShippedSurface();
+
+const here = dirname(fileURLToPath(import.meta.url));
+const repoRoot = resolve(here, "../../..");
+const STUB = join(here, "e2e-stub.mjs");
+const PORT = await freePort();
+const SERVERS = `nats://127.0.0.1:${PORT}`;
+const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
+let pass = 0, fail = 0;
+const check = (name: string, cond: boolean, extra?: unknown) => {
+  if (cond) { pass++; console.log(`  ✓ ${name}`); }
+  else { fail++; console.log(`  ✗ FAIL: ${name}`, extra ?? ""); }
+};
+
+const space = `mgrinv-${randomUUID().slice(0, 8)}`;
+const auth = await createSpaceAuth(space);
+const dir = mkdtempSync(join(tmpdir(), SMOKE_BROKER_TOKEN));
+const workspaceRoot = join(dir, "ws");
+mkdirSync(join(workspaceRoot, ".cotal", "agents"), { recursive: true });
+saveSpaceAuth(authDir(workspaceRoot), auth);
+// No role: the suite's caller holds no issued evidence, so it hands on no role (SPEC 13.15).
+for (const n of ["w1"]) writeFileSync(join(workspaceRoot, ".cotal", "agents", `${n}.md`), `---\nname: ${n}\n---\n`);
+writeFileSync(join(dir, "server.conf"), serverConfig(auth, [auth], { transport: { kind: "plaintext" }, port: PORT, storeDir: join(dir, "js") }));
+const srv = spawn("nats-server", ["-c", join(dir, "server.conf")], { stdio: "ignore" });
+const releaseBroker = teardownOnSignal(srv, dir);
+
+const envFor = (o: LaunchOpts): Record<string, string> => ({
+  COTAL_SPACE: o.space, COTAL_SERVERS: String(o.servers ?? SERVERS), COTAL_CREDS: String(o.creds),
+  COTAL_ID: String(o.id), COTAL_NAME: o.name, PATH: process.env.PATH ?? "",
+  ...(o.lifecycleUid ? { COTAL_LIFECYCLE_UID: o.lifecycleUid } : {}),
+});
+const CONNECTOR_READINESS_MS = 45_000;
+registry.register({ kind: "connector", name: "e2e-stub", requires: ["node"], readinessTimeoutMs: CONNECTOR_READINESS_MS, buildLaunch: (o): LaunchSpec => ({ command: "node", args: [STUB], env: envFor(o) }) } as Connector);
+
+const mgr = new Manager({ space, servers: SERVERS, runtime: "pty", workspaceRoot });
+const connections: NatsConnection[] = [];
+// The §13.2 one-rail currency reader for a static mesh: the manager's processEpoch is 0 (no
+// takeover advances it). A production generic caller reads this from the registered svc record.
+const currentEpoch = async () => 0;
+
+try {
+  let up = false;
+  for (let i = 0; i < 50; i++) { if (await isReachable(SERVERS)) { up = true; break; } await wait(200); }
+  if (!up) throw new Error(`auth nats-server did not come up on ${PORT}`);
+  await setupSpaceStreams({ servers: SERVERS, space, creds: await mintCreds(auth, newIdentity(), "provisioner") });
+  await mgr.start();
+
+  // A caller cred with the ep BASELINE (describe + reply rail + the epc fetch grant) plus the
+  // invoke capabilities for the commands it will call. spawn-cap gives spawn + owner despawn/attach.
+  const id = newIdentity();
+  const uid = mintLifecycleUid();
+  const caller: EpCaller = { owner: DEV_OWNER, actor: id.id, uid };
+  const creds = await mintCreds(auth, id, "agent", {
+    lifecycleUid: uid, capabilities: ["spawn"],
+    endpointCapabilities: [
+      { endpoint: MANAGER_ENDPOINT, command: "status" },
+      { endpoint: MANAGER_ENDPOINT, command: "goal-result" },
+      { endpoint: MANAGER_ENDPOINT, command: "spawn" },
+      { endpoint: MANAGER_ENDPOINT, command: "despawn", target: { mode: "owner", tOwner: DEV_OWNER } },
+    ],
+  });
+  const nc = await connect({ servers: SERVERS, ...standaloneConnectOpts({ creds, tls: false }), maxReconnectAttempts: 0 });
+  connections.push(nc);
+
+  console.log("1. resolveService: describe + fetch + recompile the full surface (no hand-imported schemas)");
+  const service = await resolveService(nc, space, MANAGER_ENDPOINT, caller, { deadlineMs: 10_000 });
+  check("roster advances the manager cluster revision and retains existing commands", shipped.revision === 52 && service.commands.has("roster") && service.commands.has("turn-unconfirmed") && service.commands.has("turn-participate") && service.commands.has("remove-persona") && service.commands.has("vitals") && service.commands.has("run-cancel") && service.commands.has("run-start-keyed") && service.commands.has("run-submission-status") && service.commands.has("chat-session-open") && service.commands.has("chat-session-retire") && service.commands.has("attest-gone") && service.commands.has("allowlist-set") && service.commands.has("release-seat") && service.commands.has("cancel") && service.commands.has("transcript-receive") && service.commands.has("goal-result") && service.commands.has("resolve-cwd"), shipped);
+  check("the resolved surface matches the shipped cluster document", service.commands.size === shipped.commandCount && shipped.names.every((n) => service.commands.has(n)) && service.commands.has("status") && service.commands.has("spawn") && service.commands.has("despawn"), [...service.commands.keys()].sort());
+  const personaInput = service.commands.get("define-persona")!.contract.input;
+  for (const field of ["model", "role", "agent"] as const) {
+    for (const value of ["", "   ", "\t\n", "  "])
+      check(`the resolved persona ${field} contract refuses ${JSON.stringify(value)}`,
+        personaInput.validate({ name: "probe", persona: "Body.", [field]: value }) === false);
+    check(`the resolved persona ${field} contract preserves nonblank input`,
+      personaInput.validate({ name: "probe", persona: "Body.", [field]: "valid-pin" }) === true);
+  }
+  const statusCmd = service.commands.get("status")!;
+  check("status resolved: untargeted, read capability, recompiled contracts carry closure digests",
+    statusCmd.targeted === false && statusCmd.capability === "manager.read"
+    && statusCmd.contract.input.closureDigest.startsWith("sha256:") && statusCmd.contract.output.closureDigest.startsWith("sha256:"), statusCmd);
+  const despawnCmd = service.commands.get("despawn")!;
+  check("despawn resolved: targeted, owner mode (from the verified cluster document, not asserted)",
+    despawnCmd.targeted === true && despawnCmd.modes.includes("owner"), despawnCmd);
+  const removePersonaCmd = service.commands.get("remove-persona")!;
+  check("remove-persona resolved under the define-persona capability and is untargeted",
+    removePersonaCmd.capability === "manager.persona" && removePersonaCmd.targeted === false, removePersonaCmd);
+
+  console.log("2. invoke status (generic, by name)");
+  const rStatus = await invokeCommand(nc, space, service, "status", undefined, { currentEpoch });
+  const status = rStatus.reply.data as { instanceId: string; runtime: string; agentCount: number; connectors: unknown[] };
+  check("invoke status returns the typed ManagerStatus", rStatus.reply.ok === true && status.runtime === "pty" && typeof status.agentCount === "number" && Array.isArray(status.connectors), rStatus.reply);
+
+  console.log("2b. invoke vitals through an exact-instance machine-vitals view");
+  const instanceId = (mgr as unknown as { managerInstanceId: string }).managerInstanceId;
+  const vitalsId = newIdentity();
+  const vitalsUid = mintLifecycleUid();
+  const vitalsCaller: EpCaller = { owner: DEV_OWNER, actor: vitalsId.id, uid: vitalsUid };
+  const vitalsCreds = await mintCreds(auth, vitalsId, "manager-caller", {
+    lifecycleUid: vitalsUid,
+    capabilities: [MANAGER_VITALS_SCOPE],
+    managerInstanceId: instanceId,
+  });
+  const vitalsNc = await connect({ servers: SERVERS, ...standaloneConnectOpts({ creds: vitalsCreds, tls: false }), maxReconnectAttempts: 0 });
+  connections.push(vitalsNc);
+  const vitalsService = await resolveService(vitalsNc, space, MANAGER_ENDPOINT, vitalsCaller, { instanceId, deadlineMs: 10_000 });
+  const vitalsCmd = vitalsService.commands.get("vitals")!;
+  check("the described exact-instance surface exposes vitals as untargeted manager.vitals with fetched contracts",
+    vitalsCmd?.targeted === false && vitalsCmd?.capability === "manager.vitals"
+    && vitalsCmd.contract.input.closureDigest.startsWith("sha256:") && vitalsCmd.contract.output.closureDigest.startsWith("sha256:"), vitalsCmd);
+  const rVitals = await invokeCommand(vitalsNc, space, vitalsService, "vitals", undefined, { currentEpoch });
+  const vitals = rVitals.reply.data as {
+    sampledAt: string;
+    cpu: { logicalCount: number; load1: number; load5: number; load15: number };
+    memory: { totalBytes: number; availableBytes: number };
+    filesystems: Array<{ mount: string; totalBytes: number; freeBytes: number }>;
+  };
+  check("invoke vitals returns a complete live host sample over the public Manager endpoint",
+    rVitals.reply.ok === true && Number.isFinite(Date.parse(vitals.sampledAt))
+    && vitals.cpu.logicalCount > 0 && [vitals.cpu.load1, vitals.cpu.load5, vitals.cpu.load15].every(Number.isFinite)
+    && vitals.memory.totalBytes > 0 && vitals.memory.availableBytes >= 0 && vitals.memory.availableBytes <= vitals.memory.totalBytes
+    && vitals.filesystems.length > 0 && vitals.filesystems.every((row) => row.mount.startsWith("/") && row.totalBytes > 0 && row.freeBytes >= 0 && row.freeBytes <= row.totalBytes), vitals);
+
+  const deniedId = newIdentity();
+  const deniedUid = mintLifecycleUid();
+  const deniedCaller: EpCaller = { owner: DEV_OWNER, actor: deniedId.id, uid: deniedUid };
+  const deniedCreds = await mintCreds(auth, deniedId, "manager-caller", {
+    lifecycleUid: deniedUid,
+    capabilities: [],
+    managerInstanceId: instanceId,
+  });
+  const deniedNc = await connect({ servers: SERVERS, ...standaloneConnectOpts({ creds: deniedCreds, tls: false }), maxReconnectAttempts: 0 });
+  connections.push(deniedNc);
+  const deniedService = await resolveService(deniedNc, space, MANAGER_ENDPOINT, deniedCaller, { instanceId, deadlineMs: 10_000 });
+  let vitalsRefusal = "";
+  try { await invokeCommand(deniedNc, space, deniedService, "vitals", undefined, { currentEpoch }); }
+  catch (e) { vitalsRefusal = `${(e as { code?: string }).code ?? ""}: ${(e as Error).message}`; }
+  check("an exact-instance manager-caller without machine-vitals is broker-denied before execution",
+    vitalsRefusal.includes("permission-denied") && vitalsRefusal.includes("vitals"), vitalsRefusal);
+
+  console.log("3. invoke spawn (the recompiled input contract gates args)");
+  let badCode: string | undefined;
+  try { await invokeCommand(nc, space, service, "spawn", { name: "w1", bogus: 1 }, { currentEpoch }); }
+  catch (e) { badCode = e instanceof EpEnvelopeError ? e.code : (e as Error).message; }
+  check("a bad spawn field is bad-request at the FETCHED-then-recompiled input contract (not a hand-written schema)", badCode === "bad-request", badCode);
+  // P2 item 2: spawn is an ACTION - invoke returns the acceptance floor (before the agent is live).
+  const rSpawn = await invokeCommand(nc, space, service, "spawn", { name: "w1", agent: "e2e-stub", cwd: repoRoot, events: false }, { currentEpoch, deadlineMs: 30_000 });
+  const acc = (rSpawn.reply.data ?? {}) as { name?: string; goalId?: string; fingerprint?: string; readinessDeadlineMs?: number };
+  check("invoke spawn accepts the goal with the exact connector readiness budget a follower must outlive",
+    rSpawn.reply.ok === true && acc.name === "w1" && typeof acc.goalId === "string" && acc.readinessDeadlineMs === CONNECTOR_READINESS_MS, rSpawn.reply);
+  // Poll the managed set until the agent joins - its id + lifecycleUid are the targeting coordinates.
+  const M = mgr as unknown as { agents: Map<string, { id: string; lifecycleUid: string }> };
+  let live: { id: string; lifecycleUid: string } | undefined;
+  for (let i = 0; i < 80 && !live; i++) { live = M.agents.get("w1"); if (!live) await wait(250); }
+  const w1 = live!;
+  check("invoke spawn boots a REAL agent that joins + is managed", !!w1 && w1.lifecycleUid.length >= 26, w1);
+
+  console.log("3b. mediated canonical goal results stay on the caller's own rail");
+  const goalId = acc.goalId!;
+  const ref = { endpoint: MANAGER_ENDPOINT, caller, goalId };
+  const absent = await invokeCommand(nc, space, service, "goal-result", { goalId: mintLifecycleUid() }, { currentEpoch });
+  check("an absent goal result reports no recorded terminal without inventing a state", absent.reply.ok === true && typeof (absent.reply.data as { goalId?: unknown }).goalId === "string" && !Object.hasOwn(absent.reply.data as object, "result"), absent.reply);
+  let badGoalArgs: string | undefined;
+  try { await invokeCommand(nc, space, service, "goal-result", { goalId, owner: "foreign" }, { currentEpoch }); }
+  catch (e) { badGoalArgs = e instanceof EpEnvelopeError ? e.code : (e as Error).message; }
+  check("goal-result refuses caller-supplied identity fields", badGoalArgs === "bad-request", badGoalArgs);
+
+  let terminal: unknown;
+  const terminalDeadline = Date.now() + 20_000;
+  while (terminal === undefined && Date.now() < terminalDeadline) {
+    const reply = await invokeCommand(nc, space, service, "goal-result", { goalId }, { currentEpoch, deadlineMs: 2_000 });
+    if (!reply.reply.ok) throw new Error(`goal-result read refused: ${JSON.stringify(reply.reply.error)}`);
+    terminal = (reply.reply.data as { result?: unknown }).result;
+    if (terminal === undefined) await wait(100);
+  }
+  check("goal-result reads the real manager's committed terminal for its authenticated caller", terminal !== undefined, terminal);
+  const fact = terminal === undefined ? undefined : parseGoalResultFact(terminal, goalResultSubject(space, ref), ref);
+  check("the mediated terminal matches the accepted goal and fingerprint", fact?.state === "succeeded" && fact.fingerprint === acc.fingerprint && (fact.data as { name?: string })?.name === "w1", fact);
+
+  const otherCallers = [
+    { label: "actor", caller: { ...caller, actor: newIdentity().id } },
+    { label: "lifecycle", caller: { ...caller, uid: mintLifecycleUid() } },
+    { label: "owner", caller: { ...caller, owner: `u_${"b".repeat(26)}` } },
+  ];
+  const readers = [];
+  for (const other of otherCallers) {
+    const otherCreds = await mintCreds(auth, newIdentity(), "agent", {
+      principal: { owner: other.caller.owner, actor: other.caller.actor }, lifecycleUid: other.caller.uid,
+      endpointCapabilities: [{ endpoint: MANAGER_ENDPOINT, command: "goal-result" }],
+    });
+    const otherNc = await connect({ servers: SERVERS, ...standaloneConnectOpts({ creds: otherCreds, tls: false }), maxReconnectAttempts: 0 });
+    connections.push(otherNc);
+    const otherService = await resolveService(otherNc, space, MANAGER_ENDPOINT, other.caller, { deadlineMs: 5_000 });
+    const reply = await invokeCommand(otherNc, space, otherService, "goal-result", { goalId }, { currentEpoch });
+    check(`goal-result does not disclose a terminal to another ${other.label}`, reply.reply.ok === true && !Object.hasOwn(reply.reply.data as object, "result"), reply.reply);
+    readers.push({ nc: otherNc, caller: other.caller, service: otherService });
+  }
+  // Use the native inbox here: a generic invocation first subscribes to the forged caller's
+  // reply rail and is refused there, before it can prove denial of the forged PUBLISH.
+  const forgedUidSubject = epRequestSubject(space, {
+    route: { mode: "one" }, endpoint: MANAGER_ENDPOINT, command: "goal-result",
+    caller: otherCallers[1]!.caller, nonce: mintLifecycleUid(),
+  });
+  let forgedUidDenied = false;
+  let forgedUidOutcome: unknown;
+  try {
+    const reply = await nc.request(forgedUidSubject, undefined, { timeout: 1_000 });
+    forgedUidOutcome = { status: reply.headers?.code };
+  } catch (e) {
+    const denial = e instanceof PermissionViolationError ? e : (e as Error).cause;
+    forgedUidDenied = denial instanceof PermissionViolationError && denial.subject === forgedUidSubject;
+    forgedUidOutcome = { name: (e as Error).name, message: (e as Error).message };
+  }
+  check("the broker denies a goal-result request forged with another lifecycle UID", forgedUidDenied, forgedUidOutcome);
+  let rawReadDenied = false;
+  let rawReadOutcome: unknown;
+  try { const reply = await nc.request(`$JS.API.DIRECT.GET.${epfStreamName(space)}.${goalResultSubject(space, ref)}`, undefined, { timeout: 1_000 }); rawReadOutcome = { status: reply.headers?.code }; }
+  catch (e) {
+    rawReadDenied = e instanceof PermissionViolationError || (e as Error).cause instanceof PermissionViolationError;
+    rawReadOutcome = { name: (e as Error).name, message: (e as Error).message, cause: (e as Error).cause instanceof Error ? ((e as Error).cause as Error).name : undefined };
+  }
+  check("the mediated caller receives no raw EPF Direct Get authority", rawReadDenied, rawReadOutcome);
+
+  const victim = readers[0]!;
+  let victimReplies = 0;
+  const victimWatch = victim.nc.subscribe(epCallerReplyFilter(space, victim.caller), {
+    callback: (err) => { if (!err) victimReplies++; },
+  });
+  await victim.nc.flush();
+  await invokeCommand(victim.nc, space, victim.service, "goal-result", { goalId }, { currentEpoch });
+  check("the destination observer receives its own legitimate reply", victimReplies === 1, victimReplies);
+  const before = victimReplies;
+  const publish = nc.publish.bind(nc);
+  let suppliedDestination = false;
+  nc.publish = (subject, data, options) => {
+    const parsed = parseEpSubject(subject);
+    if (parsed?.plane === "request" && parsed.command === "goal-result") {
+      suppliedDestination = true;
+      return publish(subject, data, { ...options, reply: deriveReplySubject(space, { ...parsed, caller: victim.caller }, service.responder) });
+    }
+    return publish(subject, data, options);
+  };
+  try {
+    let reply: EpAttributedReply | undefined;
+    let error: unknown;
+    try { reply = await invokeCommand(nc, space, service, "goal-result", { goalId }, { currentEpoch, deadlineMs: 2_000 }); }
+    catch (e) { error = (e as Error).message; }
+    await victim.nc.flush();
+    check("goal-result ignores a caller-chosen reply destination and returns only to its caller", suppliedDestination && reply?.reply.ok === true && (reply.reply.data as { result?: unknown }).result !== undefined && victimReplies === before, { reply: reply?.reply, error, victimReplies, before });
+  } finally {
+    nc.publish = publish;
+    victimWatch.unsubscribe();
+  }
+
+  console.log("4. invoke targeted despawn + the generic target guards");
+  let noTarget: string | undefined;
+  try { await invokeCommand(nc, space, service, "despawn", { graceful: true }, { currentEpoch }); }
+  catch (e) { noTarget = e instanceof EpEnvelopeError ? e.code : (e as Error).message; }
+  check("a targeted command invoked with NO target refuses at the generic layer (bad-request)", noTarget === "bad-request", noTarget);
+  let strayTarget: string | undefined;
+  try { await invokeCommand(nc, space, service, "status", undefined, { currentEpoch, target: { mode: "owner", owner: DEV_OWNER, actor: w1.id, lifecycleUid: w1.lifecycleUid } }); }
+  catch (e) { strayTarget = e instanceof EpEnvelopeError ? e.code : (e as Error).message; }
+  check("an untargeted command invoked WITH a target refuses at the generic layer (bad-request)", strayTarget === "bad-request", strayTarget);
+  const rDespawn = await invokeCommand(nc, space, service, "despawn", { graceful: true }, { currentEpoch, target: { mode: "owner", owner: DEV_OWNER, actor: w1.id, lifecycleUid: w1.lifecycleUid } });
+  check("invoke targeted owner-mode despawn tears the agent down", rDespawn.reply.ok === true && (rDespawn.reply.data as { stopped: boolean }).stopped === true, rDespawn.reply);
+
+  console.log("5. a command outside the caller's describe VIEW is not resolvable");
+  // The caller holds no invoke row for `purge`; describe is PUBLIC in static mode so the surface
+  // still lists it — but a caller invoking one it holds no grant for is broker-refused. The
+  // generic layer's not-found is for a command absent from the RESOLVED surface entirely.
+  let notFound: string | undefined;
+  try { await invokeCommand(nc, space, service, "no-such-command", undefined, { currentEpoch }); }
+  catch (e) { notFound = e instanceof EpEnvelopeError ? e.code : (e as Error).message; }
+  check("invoking a command not in the resolved surface is not-found", notFound === "not-found", notFound);
+
+  await nc.drain().catch(() => nc.close());
+  await mgr.stop({ withAgents: true });
+} finally {
+  try { await mgr.stop({ withAgents: true }); }
+  finally {
+    for (const nc of connections) await nc.close();
+    await killAndAwaitExit(srv);
+    rmSync(dir, { recursive: true, force: true });
+    releaseBroker();
+  }
+}
+
+const EXPECTED = 42;
+check("every declared manager service invoke cell ran", pass + fail === EXPECTED, { ran: pass + fail, expected: EXPECTED });
+console.log(`\n${fail === 0 ? "MANAGER SERVICE INVOKE SMOKE OK ✅" : "MANAGER SERVICE INVOKE SMOKE FAILED"}  (${pass} passed, ${fail} failed)`);
+emitSentinel({ passed: pass, failed: fail });
+process.exit(fail === 0 ? 0 : 1);

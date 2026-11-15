@@ -1,0 +1,262 @@
+/**
+ * Inside the thread: lockdown, one Compartment, and the run.
+ *
+ * THIS FILE IS THE CONFINEMENT. `lockdown()` runs ONCE, here, at module load and before anything of
+ * the run exists - it is irreversible and realm-wide, so it belongs at the top of a realm nobody
+ * else owns. Each run then gets a Compartment with ZERO ENDOWMENTS and the transform's module is
+ * evaluated in it; the context is the CALL ARGUMENT, not a global, so the program's
+ * `globalThis` is empty and the seam is a value it was handed rather than a name it can reach.
+ *
+ * MEASURED HERE, at ses@2.3.0 on node v26.7.0, rather than assumed:
+ *   inside a Compartment      `Date.now()` and `Math.random()` THROW in secure mode; `process` is
+ *                             undefined; `globalThis` has 0 own keys; and
+ *                             `(function(){}).constructor("return typeof process")()` throws
+ *                             "Function.prototype.constructor is not a valid constructor"
+ *   confinement, not hiding   `({}).constructor === Object` is still true, deliberately: the program
+ *                             shares the realm's intrinsics, it just cannot reach out of it
+ *   the START compartment     KEEPS Date.now, Math.random and process - which is what lets the host
+ *                             half of this thread (the journal, the effect path, the handler) work
+ *                             normally around a program that cannot touch any of them
+ *
+ * WHAT IS NOT HERE, on purpose: no wall-clock timeout, no `terminate()` on a deadline. A thread
+ * killed mid-effect leaves a journal saying a step is pending and nothing that can settle it. The
+ * step budget (L4013) and the shared stop flag are the only two things that end a run.
+ */
+
+import { parentPort, workerData, type MessagePort } from "node:worker_threads";
+import "ses";
+import { EffectResultTooLarge, Journal, JournalAppendRejected, type JournalStore } from "../journal.js";
+import { EngineUnavailable, messageOf, nameOf } from "../errors.js";
+import { assertCrossable } from "../values.js";
+import { Cancelled, EffectError, RootCancellation, RunHeld, RunReleased, type EffectHandler } from "../effects.js";
+import { bridgedSeam } from "./bridge.js";
+import { runOnEngine } from "./host.js";
+import { InspectionJournal, inspectionExit } from "./inspection.js";
+import type { EngineCtx } from "./ctx.js";
+import type { WorkerFailure, WorkerRunRequest, WorkerRunResult } from "./worker.js";
+import { PACKAGE_VERSION } from "./package-version.js";
+
+// Refuse before lockdown installs SES's uncaught-exception handler, so Worker reports the cause.
+if (parentPort === null) throw new Error("cotal-lang engine worker: no parent port; this module is a worker entry, not a library");
+const hostPackageVersion = (workerData as { hostPackageVersion?: unknown } | undefined)?.hostPackageVersion;
+if (hostPackageVersion !== PACKAGE_VERSION) {
+  const host = typeof hostPackageVersion === "string" ? hostPackageVersion : "unreported";
+  throw new EngineUnavailable(
+    `worker package ${PACKAGE_VERSION} does not match host package ${host}; ` +
+    `restart the manager using the same Cotal version before starting or resuming workflows`,
+  );
+}
+// Once per admitted thread, before the run exists.
+lockdown();
+
+const port = parentPort;
+const cancellation = new RootCancellation();
+let started = false;
+let start!: () => void;
+const ready = new Promise<void>((resolve) => { start = resolve; });
+port.on("message", (message: unknown) => {
+  if (message === null || typeof message !== "object" || Object.keys(message).length !== 2)
+    throw new Error("cotal-lang engine worker: invalid root control message");
+  const { kind, reason } = message as { kind?: unknown; reason?: unknown };
+  if (kind === "root-start" && !started && (reason === null || typeof reason === "string")) {
+    started = true;
+    if (reason !== null) cancellation.cancel(reason);
+    start();
+  } else if (kind === "root-cancel" && started && typeof reason === "string") {
+    cancellation.cancel(reason);
+  } else {
+    throw new Error("cotal-lang engine worker: invalid root control transition");
+  }
+});
+
+const { request, stop, bridge } = workerData as {
+  request: WorkerRunRequest;
+  stop: SharedArrayBuffer;
+  bridge?: { port: MessagePort; clock: SharedArrayBuffer };
+};
+
+/**
+ * The run's cancellation, read where it has always been read.
+ *
+ * Synchronous by necessity - the effect path asks between effects - which is why it is shared memory
+ * rather than a message. The length is loaded atomically because the writer publishes it last.
+ */
+const stopLength = new Int32Array(stop, 0, 1);
+const stopBytes = new Uint8Array(stop, 4);
+const shouldStop = (): string | undefined => {
+  const n = Atomics.load(stopLength, 0);
+  // `.slice` copies out of shared memory: a decoder is not handed a buffer that can change under it.
+  return n > 0 ? new TextDecoder().decode(stopBytes.slice(0, n)) : undefined;
+};
+
+/**
+ * The confined evaluator: a Compartment per run, with nothing in it.
+ *
+ * `runOnEngine` takes this rather than defaulting to one, and that is the security posture rather
+ * than an inconvenience - turning a module string into a function is exactly where confinement is
+ * applied or lost, so the caller says which it is and a reviewer can see it.
+ */
+const confined = (module: string): ((ctx: EngineCtx) => () => Promise<unknown>) => {
+  const compartment = new Compartment();
+  const factory = compartment.evaluate(module) as unknown;
+  if (typeof factory !== "function") {
+    throw new EngineUnavailable(
+      `the transformed module must evaluate to a function taking the context, and this one evaluated to ${typeof factory}`,
+    );
+  }
+  return factory as (ctx: EngineCtx) => () => Promise<unknown>;
+};
+
+/**
+ * The seam this run performs against, by the route the request chose.
+ *
+ * `"bridged"`: the handler and the durable store live in the HOST, and both halves ride the port
+ * this thread was handed (`bridge.ts`); the journal is built HERE, over the recorded entries and
+ * that store, so every append is durable in the host before the effect it precedes fires. A
+ * module-named handler keeps its whole path in the thread, journal and all, as it always has.
+ */
+async function buildSeam(): Promise<{ handler: EffectHandler; journal?: Journal }> {
+  if (request.handler === "inspection") {
+    const stop = (): never => { throw new Error("read-only inspection attempted to dispatch an effect"); };
+    return {
+      handler: {
+        now: () => request.pins!.startedAt,
+        spawn: stop, participant: stop, turn: stop, ask: stop, checkpoint: stop, sleep: stop,
+        wait: stop, notify: stop, monitor: stop, openConclave: stop, closeConclave: stop,
+      } as unknown as EffectHandler,
+      journal: new InspectionJournal(request.runId, request.entries ?? [], request.cutAt),
+    };
+  }
+  if (request.handler === "bridged") {
+    if (bridge === undefined) {
+      throw new EngineUnavailable(
+        `request ${request.runId} names the bridged handler route but the thread was started without a bridge port; runInWorker is the caller that wires one`,
+      );
+    }
+    const seam = bridgedSeam(bridge.port, bridge.clock);
+    return {
+      handler: seam.handler,
+      journal: new Journal({
+        run: request.runId,
+        entries: request.entries ?? [],
+        store: seam.store,
+        ...(request.resultBytes !== undefined ? { resultBytes: request.resultBytes } : {}),
+      }),
+    };
+  }
+  return {
+    handler: await buildHandler(request.handler.module, request.handler.export, request.handler.config),
+    // Exactly the shape this route always had: a journal only when there are entries to resume,
+    // and the fresh case left to the engine's own default.
+    ...(request.entries !== undefined ? { journal: new Journal({ run: request.runId, entries: request.entries }) } : {}),
+  };
+}
+
+async function buildHandler(module: string, exportName: string | undefined, config: unknown): Promise<EffectHandler> {
+  const mod = (await import(module)) as Record<string, unknown>;
+  const name = exportName ?? "createHandler";
+  const make = mod[name];
+  if (typeof make !== "function") {
+    throw new EngineUnavailable(
+      `${module} has no \`${name}\` export that is a function. A handler is not serialisable - it holds sockets, a client and a clock - so the request names a module and the thread builds it: that export takes the config and answers an EffectHandler.`,
+    );
+  }
+  return (make as (config: unknown) => EffectHandler)(config);
+}
+
+async function run(): Promise<WorkerRunResult> {
+  const seam = await buildSeam();
+  const executing = runOnEngine(request.source, request.module, {
+    runId: request.runId,
+    handler: seam.handler,
+    evaluate: confined,
+    shouldStop,
+    cancellation,
+    ...(request.handler === "inspection" ? { migration: true } : {}),
+    ...(request.file !== undefined ? { file: request.file } : {}),
+    ...(request.pins !== undefined ? { pins: request.pins } : {}),
+    ...(seam.journal !== undefined ? { journal: seam.journal } : {}),
+    ...(request.seed !== undefined ? { seed: request.seed } : {}),
+    ...(request.effectCeiling !== undefined ? { effectCeiling: request.effectCeiling } : {}),
+    ...(request.stepBudget !== undefined ? { stepBudget: request.stepBudget } : {}),
+    onLog: (line) => port.postMessage({ kind: "log", line: { scope: line.scope, values: [...line.values] } }),
+  });
+  let result;
+  try {
+    result = await executing;
+    if (seam.journal instanceof InspectionJournal && seam.journal.stop !== undefined)
+      throw seam.journal.stop;
+  } catch (error) {
+    if (request.handler !== "inspection") throw error;
+    const exit = inspectionExit(seam.journal instanceof InspectionJournal ? seam.journal.stop ?? error : error);
+    return {
+      ok: false,
+      name: nameOf(error),
+      message: messageOf(error),
+      ...failureOf(error),
+      inspection: { orphans: seam.journal!.orphans(), exit },
+    };
+  }
+  // THE RUN'S VALUE CROSSES A BOUNDARY, so it answers to the language's own crossing rule rather
+  // than to the structured-clone algorithm's. A function reaching this line would otherwise fail as
+  // a DataCloneError naming a host algorithm, when what happened is that a run tried to return
+  // something that cannot be recorded.
+  //
+  // ABSENCE IS NOT A VALUE and is not put through a rule about values: a program whose last line is
+  // a statement ends with no value at all, and the walker reports exactly that, so asserting here
+  // would refuse the ordinary case. Measured: the first worker cell written refused its own fixture
+  // with `undefined ... Use null when you mean "no value"` before this line said so.
+  if (result.value !== undefined) assertCrossable(result.value, "the value this run returned");
+  return {
+    ok: true,
+    value: result.value,
+    entries: result.journal.entries(),
+    pins: result.pins,
+    programHash: result.programHash,
+    steps: result.steps,
+    ...(request.handler === "inspection" ? { inspection: { orphans: result.journal.orphans() } } : {}),
+  };
+}
+
+/** The class a run failed as, by `instanceof`: a value the program threw is never a host class by its shape. */
+function failureOf(e: unknown): WorkerFailure {
+  if (e instanceof Cancelled) return { class: "cancelled", reason: e.reason };
+  if (e instanceof RunReleased) return { class: "released", reason: e.reason };
+  if (e instanceof RunHeld) return { class: "held", step: e.step, reason: e.reason, pending: e.pending };
+  if (e instanceof EffectError) return { class: "effect", code: e.code, kind: e.kind, ...(e.detail !== undefined ? { detail: e.detail } : {}) };
+  // Ahead of `JournalAppendRejected`, which it extends.
+  if (e instanceof EffectResultTooLarge) return { class: "too-large", stepKey: e.stepKey, bytes: e.bytes, bound: e.bound };
+  if (e instanceof JournalAppendRejected) return { class: "rejected" };
+  const code = (e as { code?: unknown })?.code;
+  return { class: "error", ...(typeof code === "string" ? { code } : {}) };
+}
+
+/** The answer a thread owes when it cannot give the one it was asked for. */
+const answerWith = (e: unknown): void => {
+  port.postMessage({
+    kind: "result",
+    result: {
+      ok: false,
+      name: nameOf(e),
+      message: messageOf(e),
+      ...failureOf(e),
+    } satisfies WorkerRunResult,
+  });
+};
+
+// `.catch` AFTER `.then(f, g)`, AND THAT IS THE WHOLE POINT: `g` is `f`'s SIBLING, not its handler,
+// so a throw inside `f` was not caught by it. The result post is the throw that matters, because it
+// structured-clones the whole journal, and when it threw, this thread died on an unhandled
+// rejection and exited 0 without answering. The host could then say only "exited before the run
+// answered", which is the wrong cause every time, and MEASURED: a handler binding a function
+// produced exactly that, a DataCloneError naming a host algorithm reported as a silent exit.
+//
+// A BACKSTOP, NOT A DEAD BRANCH. Every value that crosses back is fenced at its own write site:
+// `value` by `assertCrossable` above, `external` and a failure's `detail` by the guards in
+// perform.ts, an effect's `result` at its settle, and a SCOPE's settled value at its own settle.
+// `pins`, `programHash` and `steps` are primitives.
+//
+// THAT LIST IS AN ENUMERATION, so it is true of the fields it names and silent about any other.
+// This line names no known route; it makes the day a new field is added LOUD instead of silent.
+port.postMessage({ kind: "ready" });
+ready.then(run).then((result) => port.postMessage({ kind: "result", result }), answerWith).catch(answerWith);

@@ -45,6 +45,26 @@ export function maxSessionsFromSuperviseArgv(command: string): number | undefine
   return undefined;
 }
 
+/** The `--seat-mint-cap` value a live `cotal supervise` argv is actually serving. */
+export function seatMintCapFromSuperviseArgv(command: string): number | undefined {
+  const tokens = command.trim().split(/\s+/);
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i]!;
+    let raw: string | undefined;
+    if (token === "--seat-mint-cap") raw = tokens[i + 1];
+    else if (token.startsWith("--seat-mint-cap=")) raw = token.slice("--seat-mint-cap=".length);
+    if (raw === undefined) continue;
+    try { return parsePositiveIntegerFlag("--seat-mint-cap", raw); }
+    catch { return undefined; }
+  }
+  return undefined;
+}
+
+/** True only when the live supervisor argv proves it is serving the requested seat-mint cap. */
+export function liveManagerWouldApplySeatMintCap(command: string | undefined, requested: number): boolean {
+  return command !== undefined && seatMintCapFromSuperviseArgv(command) === requested;
+}
+
 /** True only when the live supervisor argv is proven to already be serving `requested`.
  *  An unreadable command line cannot prove that, so it is a refusal — persist would guess. */
 export function liveManagerWouldApplyMaxSessions(command: string | undefined, requested: number): boolean {
@@ -265,6 +285,8 @@ export type ManagerStartOpts = {
   wsPort?: number;
   /** Live-session ceiling forwarded as `supervise --max-sessions`. */
   maxSessions?: number;
+  /** Manager seat-mint ceiling forwarded as `supervise --seat-mint-cap`. */
+  seatMintCap?: number;
 };
 
 export function startManagerDetached(
@@ -311,6 +333,7 @@ export function startManagerDetached(
     // P2 item 6: the broker ws listener port (loopback) for the console session client's wsUrl.
     ...(o.wsPort !== undefined ? ["--ws-port", String(o.wsPort)] : []),
     ...(o.maxSessions !== undefined ? ["--max-sessions", String(o.maxSessions)] : []),
+    ...(o.seatMintCap !== undefined ? ["--seat-mint-cap", String(o.seatMintCap)] : []),
   ];
   // This is an INTERNAL child re-exec: the `up`/`spawn` that reached here already ran the first-run
   // connector seed, so the manager skips it on boot (a direct `cotal supervise` still seeds).

@@ -1,0 +1,45 @@
+{
+  "suite": [
+    "packages/core/smoke/backup-inventory.smoke.ts"
+  ],
+  "guard": "The gated backup inventory check compares the inventory to BROKER TRUTH (its own stream list), not to the inventory's output. A family removed from either side must redden the check by name (#643).",
+  "command": "pnpm smoke:backup-inventory",
+  "completionMarker": "backup inventory vs broker truth:",
+  "proveWith": "pnpm mutation-proof --config packages/core/smoke/mutations/backup-inventory.json   # --config resolves against the repo root, never the cwd",
+  "why": [
+    "The gated suite provisions a real space and compares the broker's own stream enumeration to",
+    "the independently maintained backup inventory. This keeps the check non-circular: removing a",
+    "family from either creation or accounting must fail by name rather than shrinking both sides.",
+    "The mutations cover a backed-up family, a legacy excluded family, and one endpoint-plane family",
+    "whose downstream ownership list also drives teardown and its sole delete credential."
+  ],
+  "mutations": [
+    {
+      "name": "a backed-up family (the ACL registry) is dropped from the inventory",
+      "file": "packages/core/src/backup-config.ts",
+      "find": "    { name: `KV_${aclBucket(space)}`, class: \"authorization\" },\n",
+      "replace": "",
+      "expectRed": "the broker's own stream set equals the backup inventory exactly",
+      "cell": "the broker's own stream set equals the backup inventory exactly",
+      "note": "The broker still creates the stream (driven by streams.ts, not the inventory), so it appears on the broker side only and the validator reports it as unexpected."
+    },
+    {
+      "name": "an excluded family (the presence bucket) is dropped from the inventory",
+      "file": "packages/core/src/backup-config.ts",
+      "find": "    { name: `KV_${presenceBucket(space)}`, class: \"transient\" },\n",
+      "replace": "",
+      "expectRed": "the broker's own stream set equals the backup inventory exactly",
+      "cell": "the broker's own stream set equals the backup inventory exactly",
+      "note": "Excluded streams are part of the validated set too: the space must account for every stream it owns, whether or not it enters the artifact."
+    },
+    {
+      "name": "an endpoint-plane family is dropped from the downstream ownership inventory",
+      "file": "packages/core/src/endpoint-binding.ts",
+      "find": "    eprStreamName(space),\n",
+      "replace": "",
+      "expectRed": "the broker's own stream set equals the backup inventory exactly",
+      "cell": "the broker's own stream set equals the backup inventory exactly",
+      "note": "Creation remains independent and still adds EPR, so the broker reports it as unexpected when the downstream inventory forgets it."
+    }
+  ]
+}

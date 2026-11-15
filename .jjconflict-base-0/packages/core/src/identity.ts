@@ -1,0 +1,280 @@
+import { createHash } from "node:crypto";
+import { decode, fmtCreds, Types } from "@nats-io/jwt";
+import { credsAuthenticator } from "@nats-io/nats-core";
+import { createUser, fromSeed } from "@nats-io/nkeys";
+import { PROFILES } from "./credential-profiles.js";
+import type { Profile } from "./provision.js";
+import { nativeNkeySigner } from "./nkey-signer.js";
+import { presenceBucket, subjectMatches } from "./subjects.js";
+
+/**
+ * A locally-generated agent identity (an nkey user keypair).
+ *
+ * The public key is the **stable id** used identically everywhere — `card.id`, the
+ * subject-encoded sender token, the JWT subject, and the DM durable name — so the
+ * server's ACLs and the wire layout stay in lockstep. The seed is the private half:
+ * it never goes on the wire and (from the provisioning step on) is signed into a
+ * creds file the endpoint loads to authenticate as this id.
+ */
+export interface Identity {
+  /** User nkey public key (`U…`). The stable agent id. */
+  id: string;
+  /** User nkey seed (`SU…`). Private — kept off the wire. */
+  seed: string;
+}
+
+/** Generate a fresh user nkey identity locally. The seed is derived here and never
+ *  leaves the generating process except as a creds file handed to its own agent. NATS generates
+ *  the seed; the existing native signer derives its public key. */
+export function newIdentity(): Identity {
+  const kp = nativeNkeySigner(createUser().getSeed());
+  const seed = new TextDecoder().decode(kp.getSeed());
+  return { id: kp.getPublicKey(), seed };
+}
+
+/** The wire rule for a user nkey public key (`U…`), shared by every parser. It checks shape
+ *  only; `fromPublic` also verifies the checksum. */
+export function isUserNkey(value: unknown): value is string {
+  return typeof value === "string" && /^U[A-Z2-7]{55}$/.test(value);
+}
+
+/** The wire rule for an account nkey public key (`A…`), shared by every parser. It checks shape
+ *  only; `fromPublic` also verifies the checksum. */
+export function isAccountNkey(value: unknown): value is string {
+  return typeof value === "string" && /^A[A-Z2-7]{55}$/.test(value);
+}
+
+/** The signing half an authority-bearing artifact needs: `signArtifact` / `mintSessionGrant`
+ *  take exactly `{ sign(input): Uint8Array }`, and the matching `publicKey` is what the
+ *  verifying anchor pins. An nkey KeyPair already satisfies both; this narrows it to the
+ *  artifact surface so a consumer that must not depend on `@nats-io/nkeys` directly (an
+ *  `implementations/*` package) can still sign — core owns the signing primitive. */
+export interface ArtifactSigner {
+  /** The signer's nkey public key (`U…`) — the `SignerAnchor.publicKey` a verifier resolves. */
+  publicKey: string;
+  /** Ed25519 signature over an artifact's canonical signature input. */
+  sign(input: Uint8Array): Uint8Array;
+}
+
+/** Build an artifact signer from an existing nkey seed (e.g. an endpoint's own key material).
+ *  The seed never leaves the process; only signatures + the public key do. */
+export function artifactSignerFromSeed(seed: string): ArtifactSigner {
+  const kp = fromSeed(new TextEncoder().encode(seed));
+  return { publicKey: kp.getPublicKey(), sign: (input) => kp.sign(input) };
+}
+
+/** A fresh artifact signer (its own keypair + seed): for a self-signing endpoint that mints its
+ *  own session grants and registers the matching public key as its `sessions` trust anchor. */
+export function newArtifactSigner(): ArtifactSigner & { seed: string } {
+  const { seed } = newIdentity();
+  return { ...artifactSignerFromSeed(seed), seed };
+}
+
+/** The stable id carried by a creds file: the agent's nkey public key. Derived from the
+ *  seed block (format-independent) and cross-checked against the JWT subject — a mismatch
+ *  means a corrupt or spliced creds file (a seed paired with someone else's JWT), which
+ *  would otherwise auth as one identity while the subject token claims another. Lets an
+ *  endpoint that authenticates with creds adopt the matching `card.id`, keeping one id
+ *  everywhere. */
+export function idFromCreds(creds: string): string {
+  return identityFromCreds(creds).id;
+}
+
+/** The compact USER JWT carried by a creds file — ONE extraction, shared by every reader that
+ *  needs the token rather than the whole envelope. Returns undefined when there is no JWT block;
+ *  callers decide whether that is fatal. */
+export function jwtFromCreds(creds: string): string | undefined {
+  return creds.match(/BEGIN NATS USER JWT-----\s*([\s\S]*?)\s*------END NATS USER JWT/)?.[1].trim();
+}
+
+/** What is wrong with a creds text the NATS client cannot present. */
+export interface CredsProblem {
+  code: "empty" | "no-jwt-block" | "no-seed-block" | "crlf" | "invalid-seed";
+  /** The likely cause, which never quotes the text. */
+  message: string;
+}
+
+/** Why the NATS client cannot present this creds text, or undefined when it can. The client's own
+ *  parser decides, so a check made before dialing agrees with the dial. {@link jwtFromCreds} is
+ *  more lenient, so it cannot decide this. */
+export function credsProblem(creds: string): CredsProblem | undefined {
+  if (!creds.trim()) return { code: "empty", message: "it is empty" };
+  try {
+    credsAuthenticator(new TextEncoder().encode(creds))(undefined);
+    return undefined;
+  } catch {
+    if (!jwtFromCreds(creds)) return { code: "no-jwt-block", message: "it has no complete NATS user JWT block" };
+    if (!/BEGIN USER NKEY SEED-----\s*\S[\s\S]*?------END USER NKEY SEED/.test(creds)) return { code: "no-seed-block", message: "it has no complete user nkey seed block" };
+    if (creds.includes("\r")) return { code: "crlf", message: "it has Windows (CRLF) line endings" };
+    return { code: "invalid-seed", message: "its user nkey seed is not valid" };
+  }
+}
+
+/** The ACCOUNT a creds file authenticates as.
+ *
+ *  `iss` is NOT the answer, and assuming it was is a live-verified mistake: when a user JWT is
+ *  signed by an account SIGNING key (which every credential this repo mints is), `iss` carries the
+ *  SIGNING key and the account identity lives in `nats.issuer_account`. Comparing `iss` to an
+ *  account public key rejects every correctly-configured mesh. So: `nats.issuer_account` when
+ *  present, falling back to `iss` for a JWT signed directly by the account identity key.
+ *
+ *  This exists so a process can cross-check its own tenancy against material it read off DISK.
+ *  A daemon that resolves its scan target from a file (`membership.json`) has no way, without
+ *  this, to notice it is reading a DIFFERENT tenant's file than the one it authenticates as — and
+ *  a complete, well-formed sweep of the wrong account is indistinguishable from "the principal is
+ *  gone". Fail-closed: no JWT block, or no usable `iss`, throws rather than returning a value a
+ *  caller might compare loosely. */
+export function accountFromCreds(creds: string): string {
+  const jwt = jwtFromCreds(creds);
+  if (!jwt) throw new Error("creds: no NATS user JWT block found - cannot determine the issuing account");
+  const payload = jwt.split(".")[1];
+  if (!payload) throw new Error("creds: the NATS user JWT is not a three-part token - cannot determine the issuing account");
+  let claims: unknown;
+  try { claims = JSON.parse(Buffer.from(payload, "base64url").toString("utf8")); }
+  catch (e) { throw new Error(`creds: the NATS user JWT payload does not decode (${(e as Error).message}) - cannot determine the issuing account`); }
+  const c = claims as { iss?: unknown; nats?: { issuer_account?: unknown } } | null;
+  const account = typeof c?.nats?.issuer_account === "string" ? c.nats.issuer_account : c?.iss;
+  if (!isAccountNkey(account))
+    throw new Error("creds: the NATS user JWT names no issuing account in account-nkey form (neither `nats.issuer_account` nor `iss`) - cannot determine the issuing account");
+  return account;
+}
+
+/** A non-secret GENERATION token for a credential: SHA-256 of its compact USER JWT.
+ *
+ *  The JWT, not the whole creds envelope, on purpose. The JWT is exactly what the broker is
+ *  presented with, so hashing it binds the claims, permissions, and signature of the generation
+ *  being adopted. The envelope additionally carries the nkey SEED, so hashing that would put a
+ *  stable secret-derived token on a control rail and make the value sensitive to envelope
+ *  formatting, without proving anything more about broker authorization. The seed stays bound
+ *  separately: {@link identityFromCreds} rejects a seed whose public key is not the JWT subject.
+ *
+ *  Safe to send on the privileged rail as an EXPECTED-generation token; the credential itself is
+ *  never sent. Ephemeral by contract — it must not be persisted (see the renewal record). */
+export function credsFingerprint(creds: string): string {
+  const jwt = jwtFromCreds(creds);
+  if (!jwt) throw new Error("creds: no NATS user JWT block found - cannot fingerprint");
+  return createHash("sha256").update(jwt).digest("hex");
+}
+
+/** The `nats` claim block of a NATS user JWT — the permission set the broker enforces. Declared
+ *  because a local reader sometimes needs to know what a cred is SCOPED TO, not just when it
+ *  expires: an account-scoped cred names its own account inside `pub.allow`, which lets a holder
+ *  check a credential against the tenant it believes it serves BEFORE connecting, and report a
+ *  mismatch as a named refusal instead of a bare broker "Authorization Violation".
+ *
+ *  Read-only diagnosis, never enforcement: these claims are UNVERIFIED here (see
+ *  {@link credsClaims}), and the broker enforces the same permissions independently. A local check
+ *  over this block buys the DIAGNOSIS; it does not buy the guarantee. */
+export interface NatsUserClaims {
+  pub?: { allow?: string[]; deny?: string[] };
+  sub?: { allow?: string[]; deny?: string[] };
+  tags?: string[];
+  /** The account that ISSUED this user (for a data-account cred, the data account). */
+  issuer_account?: string;
+}
+
+/** The decoded (UNVERIFIED) claims of a creds file's user JWT — shared parse for every local
+ *  inspector (credential health, renewal scheduling, identity checks). Unverified is correct here:
+ *  the broker is the enforcement boundary; local readers only need the claims to schedule and
+ *  diagnose. Throws on a structurally-unusable file (no JWT block / undecodable payload).
+ *
+ *  `nats` was always PRESENT in the returned object (this is a whole-payload parse) but was not
+ *  DECLARED, so a caller needing the permission block had to cast past this signature. Declaring it
+ *  is a typing fix, not a behaviour change: no parse, no field and no error path moves. */
+export function credsClaims(creds: string): { sub?: string; iat?: number; exp?: number; name?: string; iss?: string; nats?: NatsUserClaims } {
+  const payload = jwtFromCreds(creds)?.split(".")[1];
+  if (!payload) throw new Error("creds: no NATS user JWT block found");
+  try {
+    return JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as { sub?: string; iat?: number; exp?: number; name?: string; iss?: string; nats?: NatsUserClaims };
+  } catch {
+    throw new Error("creds: undecodable user JWT payload");
+  }
+}
+
+/** Identify a static agent credential from its lifecycle DM grant and absence of a presence watch. */
+export function agentCredentialLifecycleUid(creds: string, space: string): string | undefined {
+  if (!jwtFromCreds(creds)) return undefined;
+  const grants = credsClaims(creds).nats?.pub?.allow ?? [];
+  const ids = new Set<string>();
+  for (const subject of grants) {
+    const match = /\.dm_[A-Za-z0-9_]+-[A-Za-z0-9_]+-([a-z0-9]{26,32})$/.exec(subject);
+    if (match) ids.add(match[1]!);
+  }
+  const watch = `$JS.API.CONSUMER.CREATE.KV_${presenceBucket(space)}.>`;
+  return ids.size === 1 && !grants.some((row) => subjectMatches(row, watch)) ? [...ids][0] : undefined;
+}
+
+/** Verify the native NATS signature, matching user seed and account/signing pins. The caller must
+ *  obtain those pins from trusted space authority. Out-of-window credentials are accepted only when
+ *  explicitly requested. This does not prove revocation, broker admission or lifecycle state. */
+export function verifyStaticUserCredential(
+  creds: string,
+  expected: { accountPub: string; signingPub: string },
+  options: { allowOutOfWindow?: boolean; requireProfile?: boolean } = {},
+) {
+  try {
+    if (typeof creds !== "string" || Buffer.byteLength(creds, "utf8") > 1_048_576 || !expected.accountPub.startsWith("A") || !expected.signingPub.startsWith("A")) throw new Error();
+    const jwt = jwtFromCreds(creds);
+    if (!jwt) throw new Error();
+    const claims = decode<Record<string, unknown>>(jwt), identity = identityFromCreds(creds).id;
+    const nats = claims.nats, now = Math.floor(Date.now() / 1000);
+    if (!nats || typeof nats !== "object" || Array.isArray(nats) || nats.type !== Types.User || !isUserNkey(identity) || claims.sub !== identity || claims.iss !== expected.signingPub) throw new Error();
+    if (expected.signingPub === expected.accountPub ? nats.issuer_account !== undefined && nats.issuer_account !== expected.accountPub : nats.issuer_account !== expected.accountPub) throw new Error();
+    if (claims.aud !== undefined && claims.aud !== "NATS" || !Number.isSafeInteger(claims.iat) || claims.iat < 0) throw new Error();
+    if (claims.exp !== undefined && (!Number.isSafeInteger(claims.exp) || claims.exp < 0 || !options.allowOutOfWindow && claims.exp <= now) || claims.nbf !== undefined && (!Number.isSafeInteger(claims.nbf) || claims.nbf < 0 || !options.allowOutOfWindow && claims.nbf > now)) throw new Error();
+    const tags: unknown = nats.tags;
+    if (tags !== undefined && (!Array.isArray(tags) || !tags.every((tag: unknown) => typeof tag === "string"))) throw new Error();
+    const markers = (tags ?? []).filter((tag: string) => tag.startsWith("profile:"));
+    const profile: Profile | null = markers.length === 1 ? PROFILES.find((value) => `profile:${value}` === markers[0]) ?? null : null;
+    if (options.requireProfile && profile === null) throw new Error();
+    return { identity, accountPub: expected.accountPub, expiresAt: claims.exp ?? null, permissionFields: { pub: nats.pub ?? null, sub: nats.sub ?? null, resp: nats.resp ?? null }, principalTags: tags ?? [], profile, brokerAdmitted: false as const };
+  } catch { throw new Error("verifyStaticUserCredential: no matching native user credential under the supplied account/signing pins"); }
+}
+
+/** Ms until a source-fed cred's RENEWAL point — 75% of its iat→exp lifetime (the cert-manager-style
+ *  renew-early convention: the remaining 25% is the loud-failure window, wide for day-scale standing
+ *  creds). Negative when already past it. A source-fed cred WITHOUT a numeric `exp` is fail-loud: the
+ *  renewal seam exists precisely for bounded creds, so an unbounded one signals a matrix/caller
+ *  mismatch, not a cred to keep silently forever. Shared by the endpoint's `delivery.creds` renewal
+ *  and the membership feed's rw-cred renewal so the 75% convention is defined once. */
+export function credsRenewalDelayMs(creds: string): number {
+  const claims = credsClaims(creds); // throws on a structurally-unusable file (fail-loud)
+  if (typeof claims.exp !== "number")
+    throw new Error("creds source returned a cred without a numeric exp - a standing-renewal endpoint requires bounded creds (mint with a lifetime, or pass a static string instead of a source)");
+  const iatMs = (typeof claims.iat === "number" ? claims.iat : Date.now() / 1000) * 1000;
+  const expMs = claims.exp * 1000;
+  return iatMs + 0.75 * (expMs - iatMs) - Date.now();
+}
+
+/** Combine a host-signed user JWT with a locally held matching user nkey seed. The seed never
+ * crosses the authority protocol; this is the participant-side materialization step. */
+export function credsFromJwt(jwt: string, identity: Identity): string {
+  const claims = JSON.parse(Buffer.from(jwt.split(".")[1] ?? "", "base64url").toString("utf8")) as { sub?: unknown };
+  if (claims.sub !== identity.id)
+    throw new Error(`JWT subject ${String(claims.sub)} != local identity ${identity.id}`);
+  const kp = fromSeed(new TextEncoder().encode(identity.seed));
+  if (kp.getPublicKey() !== identity.id)
+    throw new Error(`local identity seed does not match ${identity.id}`);
+  return new TextDecoder().decode(fmtCreds(jwt, kp));
+}
+
+/** The full identity (id + seed) carried by a creds file — what a standing-renewal REMINTER needs:
+ *  re-signing a fresh JWT for the file's EXISTING nkey (never a new one) is what lets the renewed
+ *  cred pass the endpoint's identity pin, so renewal can never silently swap who a daemon is. Same
+ *  seed-block parse + JWT-subject cross-check as {@link idFromCreds}. */
+export function identityFromCreds(creds: string): Identity {
+  const seedM = creds.match(/BEGIN USER NKEY SEED-----\s*([\s\S]*?)\s*------END USER NKEY SEED/);
+  if (!seedM) throw new Error("creds: no user nkey seed block found");
+  const seed = seedM[1].trim();
+  // Node's Ed25519 derives the public key in well under a millisecond; the library's JavaScript
+  // curve takes milliseconds, which a process constructing thousands of endpoints pays per endpoint.
+  const signer = nativeNkeySigner(new TextEncoder().encode(seed));
+  const id = signer.getPublicKey();
+  signer.clear();
+  const payload = jwtFromCreds(creds)?.split(".")[1];
+  const sub = payload
+    ? (JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as { sub?: string }).sub
+    : undefined;
+  if (sub && sub !== id) throw new Error(`creds: seed identity ${id} != JWT subject ${sub}`);
+  return { id, seed };
+}

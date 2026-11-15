@@ -1,0 +1,1877 @@
+# @cotal-ai/lang
+
+## 0.151.2
+
+No changes in this release.
+
+## 0.151.1
+
+### Patch Changes
+
+- f84069e: The docs site now has a TypeScript reference for every published package, generated from source. Each of these packages' entry files gains a `@module index` comment so the reference names the main import path `index` instead of leaving it blank. The published code is otherwise unchanged.
+
+## 0.151.0
+
+### Patch Changes
+
+- 6e67bbf: A scope reached inside `once` is now refused with L4028 by its `dispatches` scope trait, the same row that gives it a request id and the effect ceiling. Before, the refusal named `conclave` by its literal kind, so a new scope kind that calls the handler would have compiled, run inside `once` with no refusal, and could have been dispatched again on resume. Shipped behaviour is unchanged: `conclave` is still the one scope that dispatches.
+
+## 0.150.0
+
+### Minor Changes
+
+- 8ff39d3: Require workflow workers to match the language package version loaded by their host before running a program. A worker also refuses an older host that sends no version pin, so restart managers after an in-place package upgrade before starting or resuming workflows. A mismatch fails the run without ending the manager process.
+
+## 0.149.0
+
+No changes in this release.
+
+## 0.148.2
+
+No changes in this release.
+
+## 0.148.1
+
+No changes in this release.
+
+## 0.148.0
+
+No changes in this release.
+
+## 0.147.8
+
+No changes in this release.
+
+## 0.147.7
+
+No changes in this release.
+
+## 0.147.6
+
+No changes in this release.
+
+## 0.147.5
+
+No changes in this release.
+
+## 0.147.4
+
+No changes in this release.
+
+## 0.147.3
+
+No changes in this release.
+
+## 0.147.2
+
+No changes in this release.
+
+## 0.147.1
+
+No changes in this release.
+
+## 0.147.0
+
+No changes in this release.
+
+## 0.146.0
+
+No changes in this release.
+
+## 0.145.1
+
+No changes in this release.
+
+## 0.145.0
+
+No changes in this release.
+
+## 0.144.0
+
+No changes in this release.
+
+## 0.143.0
+
+No changes in this release.
+
+## 0.142.0
+
+No changes in this release.
+
+## 0.141.11
+
+### Patch Changes
+
+- d389b22: A pause-plane deadline is recognized by the NATS client's TimeoutError class, so an error that only carries that name is no longer retried and then failed as a late reply.
+
+## 0.141.10
+
+No changes in this release.
+
+## 0.141.9
+
+No changes in this release.
+
+## 0.141.8
+
+No changes in this release.
+
+## 0.141.7
+
+No changes in this release.
+
+## 0.141.6
+
+No changes in this release.
+
+## 0.141.5
+
+No changes in this release.
+
+## 0.141.4
+
+No changes in this release.
+
+## 0.141.3
+
+No changes in this release.
+
+## 0.141.2
+
+No changes in this release.
+
+## 0.141.1
+
+No changes in this release.
+
+## 0.141.0
+
+### Minor Changes
+
+- bacabd0: An agent can define its helper on the spawn itself. `cotal_spawn` takes a `persona` record (the persona prompt, role, model, variant, description, channels and capabilities) next to `name`, and the helper runs from a private snapshot of it. `persona.save: true` also writes a catalog copy under that name, owned by the spawner. A cotal-lang program does the same with `spawn({ name, prompt, ... }, opts)`, and the run journal records the definition and its digest, so a resume never submits another one. `cotal_persona` takes `capabilities` and says how a saved persona is removed.
+  
+  A helper never gets more than its spawner holds. On a static mesh every spawn is measured against the spawner's issued evidence: each channel, the role and each capability token it does not hold is refused by name, and a spawner whose evidence does not resolve hands on nothing. Operator commands and admin agents are exempt. A workflow run's spawns are bounded by what its starter held when the run was admitted, on its host and on any other static manager its spawn reaches, which reads the run's admission. A `cotal run start --local` run's helpers get only channels within the `--admit-read` and `--admit-publish` ceiling. The static agent mint now grants task-queue rows for each `role:<r>` capability, so a spawner hands on a role it was given either way. On a participant manager the issuing host makes the agent that asked for a helper its ledger parent, taking the caller from the spawn request it observed, and a run's helper is parented to the run's starter and also bounded by the grant its admission recorded. A run revoked mid-step starts no further helper, and a persona a run saves is owned by its starter. The loopback `verify-enrollment` door a host platform asks decides the same parent and bound and answers `parent`, and a retry of the same enrollment gets the same answer.
+  
+  A seat started by foreground `cotal spawn`, or a bare `cotal join`, on a static mesh is now issued against its own lifecycle. Its credential has no expiry unless `--expires-in` or `--expires-at` is passed, is never renewed, and is retired when the seat leaves cleanly.
+  
+  Breaking: a static spawner that hands its helpers channels, capabilities or a role it does not hold is refused, an older issuing host refuses the new enrollment field, an older manager refuses a run's spawn, which now names its run, an older reader refuses an admission carrying `spawnExempt` or `delegation`, and an enrollment retry is refused when its read set is not its grant's, which is the case for a grant an older host wrote for a helper that named only a subscribe set. See UPGRADING.
+
+## 0.140.8
+
+No changes in this release.
+
+## 0.140.7
+
+No changes in this release.
+
+## 0.140.6
+
+No changes in this release.
+
+## 0.140.5
+
+No changes in this release.
+
+## 0.140.4
+
+No changes in this release.
+
+## 0.140.3
+
+No changes in this release.
+
+## 0.140.2
+
+No changes in this release.
+
+## 0.140.1
+
+No changes in this release.
+
+## 0.140.0
+
+No changes in this release.
+
+## 0.139.1
+
+No changes in this release.
+
+## 0.139.0
+
+No changes in this release.
+
+## 0.138.2
+
+No changes in this release.
+
+## 0.138.1
+
+No changes in this release.
+
+## 0.138.0
+
+No changes in this release.
+
+## 0.137.0
+
+No changes in this release.
+
+## 0.136.8
+
+No changes in this release.
+
+## 0.136.7
+
+No changes in this release.
+
+## 0.136.6
+
+No changes in this release.
+
+## 0.136.5
+
+No changes in this release.
+
+## 0.136.4
+
+No changes in this release.
+
+## 0.136.3
+
+No changes in this release.
+
+## 0.136.2
+
+No changes in this release.
+
+## 0.136.1
+
+### Patch Changes
+
+- 102c2aa: A concurrency scope that fails with an `Error` now records the `L4000` `host` fault a `catch` receives for it live, so a resumed run catches the same kind instead of `scope-fault` and no longer diverges when it branches on it. An engine fault inside a scope, including a native `ReferenceError` in a branch, settles nothing, so the resume unwinds the same way the live run did.
+
+## 0.136.0
+
+No changes in this release.
+
+## 0.135.21
+
+No changes in this release.
+
+## 0.135.20
+
+### Patch Changes
+
+- d90d949: A concurrency scope now hands the program the frozen copy of its value that its record carries, live as on resume. Before, it froze the value in place. A record a branch returned from outside the scope stayed frozen for the rest of the live run but writable on resume, so a resume of unchanged source could diverge with L5001.
+
+## 0.135.19
+
+### Patch Changes
+
+- 0fa57f9: A worker thread that sends the effect bridge a message its host does not expect now fails only its own run. Before, the bridge threw on the host's stack, an uncaught exception that ended the whole host process and every run on it. An in-place upgrade under a live manager was enough to trigger it.
+
+## 0.135.18
+
+No changes in this release.
+
+## 0.135.17
+
+No changes in this release.
+
+## 0.135.16
+
+No changes in this release.
+
+## 0.135.15
+
+No changes in this release.
+
+## 0.135.14
+
+No changes in this release.
+
+## 0.135.13
+
+No changes in this release.
+
+## 0.135.12
+
+No changes in this release.
+
+## 0.135.11
+
+No changes in this release.
+
+## 0.135.10
+
+No changes in this release.
+
+## 0.135.9
+
+No changes in this release.
+
+## 0.135.8
+
+No changes in this release.
+
+## 0.135.7
+
+No changes in this release.
+
+## 0.135.6
+
+No changes in this release.
+
+## 0.135.5
+
+No changes in this release.
+
+## 0.135.4
+
+No changes in this release.
+
+## 0.135.3
+
+No changes in this release.
+
+## 0.135.2
+
+No changes in this release.
+
+## 0.135.1
+
+No changes in this release.
+
+## 0.135.0
+
+No changes in this release.
+
+## 0.134.0
+
+No changes in this release.
+
+## 0.133.13
+
+No changes in this release.
+
+## 0.133.12
+
+### Patch Changes
+
+- 13499c0: Preserve documentation bookmarks and offline HTTP reference navigation after the MDX migration. Keep executable documentation checks aligned with the split references, validate generated HTTP content on root builds, preserve complete Card destinations, and improve light-mode navigation contrast.
+- 13499c0: Rewrite the MeshView, cotal-lang card, and glossary references as direct MDX with source-backed definitions and examples. Update the language example check and terminal model source references for the renamed pages. Preserve complete Markdown and existing page calls in the installed release's offline documentation.
+- 13499c0: Rewrite Security and Agent coordination as focused MDX explanations with complete supporting references. Preserve documentation URLs, Markdown downloads, and offline documentation tools, and update source links and documentation checks for the renamed pages.
+
+## 0.133.11
+
+No changes in this release.
+
+## 0.133.10
+
+No changes in this release.
+
+## 0.133.9
+
+No changes in this release.
+
+## 0.133.8
+
+No changes in this release.
+
+## 0.133.7
+
+No changes in this release.
+
+## 0.133.6
+
+No changes in this release.
+
+## 0.133.5
+
+No changes in this release.
+
+## 0.133.4
+
+### Patch Changes
+
+- 5629f59: L3022 now reads a scope's body from the scope table, as the captured-write check does, instead of naming `parallel`, `race` and `fanOut`. A new scope primitive is judged without being added to the check, and a single-body scope that runs its function once (`once`, `conclave`) is left alone.
+- 60b5c33: The scope runner and the compiled engine's scope helpers dispatch on the typed `ScopeKind` instead of the primitive's name. A scope kind added to the union without its runner arm, or without its calling convention in the engine, now fails the build rather than throwing an interpreter defect the first time a program opens it.
+
+## 0.133.3
+
+No changes in this release.
+
+## 0.133.2
+
+No changes in this release.
+
+## 0.133.1
+
+### Patch Changes
+
+- 28b245f: The shipped conformance corpus (`conformance/corpus.json`) now carries the ninth example in the language reference: the reusable-helper example under §10.2 "Keys", which #5446 added to the spec. That change did not regenerate the corpus, so the corpus held only 8 of the reference's 9 examples. The corpus is regenerated with `pnpm gen:conformance`, and the new case is an accepted program.
+
+## 0.133.0
+
+No changes in this release.
+
+## 0.132.7
+
+No changes in this release.
+
+## 0.132.6
+
+No changes in this release.
+
+## 0.132.5
+
+No changes in this release.
+
+## 0.132.4
+
+No changes in this release.
+
+## 0.132.3
+
+No changes in this release.
+
+## 0.132.2
+
+No changes in this release.
+
+## 0.132.1
+
+No changes in this release.
+
+## 0.132.0
+
+No changes in this release.
+
+## 0.131.6
+
+No changes in this release.
+
+## 0.131.5
+
+No changes in this release.
+
+## 0.131.4
+
+No changes in this release.
+
+## 0.131.3
+
+No changes in this release.
+
+## 0.131.2
+
+No changes in this release.
+
+## 0.131.1
+
+No changes in this release.
+
+## 0.131.0
+
+No changes in this release.
+
+## 0.130.2
+
+No changes in this release.
+
+## 0.130.1
+
+### Patch Changes
+
+- 029df4f: Keep foreign error names and messages consistent across worker execution, inspection and the host bridge. Shared readers retain only string-valued fields and contain throwing accessors or failed string conversion, so formatting a failure does not strand its answer.
+
+## 0.130.0
+
+No changes in this release.
+
+## 0.129.9
+
+No changes in this release.
+
+## 0.129.8
+
+No changes in this release.
+
+## 0.129.7
+
+No changes in this release.
+
+## 0.129.6
+
+No changes in this release.
+
+## 0.129.5
+
+No changes in this release.
+
+## 0.129.4
+
+No changes in this release.
+
+## 0.129.3
+
+No changes in this release.
+
+## 0.129.2
+
+No changes in this release.
+
+## 0.129.1
+
+No changes in this release.
+
+## 0.129.0
+
+No changes in this release.
+
+## 0.128.7
+
+No changes in this release.
+
+## 0.128.6
+
+No changes in this release.
+
+## 0.128.5
+
+No changes in this release.
+
+## 0.128.4
+
+No changes in this release.
+
+## 0.128.3
+
+No changes in this release.
+
+## 0.128.2
+
+No changes in this release.
+
+## 0.128.1
+
+No changes in this release.
+
+## 0.128.0
+
+No changes in this release.
+
+## 0.127.5
+
+No changes in this release.
+
+## 0.127.4
+
+No changes in this release.
+
+## 0.127.3
+
+No changes in this release.
+
+## 0.127.2
+
+No changes in this release.
+
+## 0.127.1
+
+No changes in this release.
+
+## 0.127.0
+
+### Minor Changes
+
+- 53fbd95: Allow an authorized personal native conversation to bind itself with `participant()` and receive hosted workflow turns through a finite exact-lifecycle lease without gaining manager seat custody.
+
+## 0.126.3
+
+No changes in this release.
+
+## 0.126.2
+
+No changes in this release.
+
+## 0.126.1
+
+No changes in this release.
+
+## 0.126.0
+
+No changes in this release.
+
+## 0.125.0
+
+No changes in this release.
+
+## 0.124.3
+
+No changes in this release.
+
+## 0.124.2
+
+No changes in this release.
+
+## 0.124.1
+
+No changes in this release.
+
+## 0.124.0
+
+No changes in this release.
+
+## 0.123.0
+
+No changes in this release.
+
+## 0.122.0
+
+No changes in this release.
+
+## 0.121.7
+
+No changes in this release.
+
+## 0.121.6
+
+No changes in this release.
+
+## 0.121.5
+
+No changes in this release.
+
+## 0.121.4
+
+No changes in this release.
+
+## 0.121.3
+
+No changes in this release.
+
+## 0.121.2
+
+### Patch Changes
+
+- 60f5412: Derive `Frame.depth` and `EngineFrame.depth` from `keys.path.length` as a getter instead of storing a separate constructor field and incrementing it alongside `keys.branch`.
+
+## 0.121.1
+
+No changes in this release.
+
+## 0.121.0
+
+No changes in this release.
+
+## 0.120.2
+
+No changes in this release.
+
+## 0.120.1
+
+No changes in this release.
+
+## 0.120.0
+
+No changes in this release.
+
+## 0.119.5
+
+No changes in this release.
+
+## 0.119.4
+
+No changes in this release.
+
+## 0.119.3
+
+No changes in this release.
+
+## 0.119.2
+
+No changes in this release.
+
+## 0.119.1
+
+No changes in this release.
+
+## 0.119.0
+
+No changes in this release.
+
+## 0.118.3
+
+No changes in this release.
+
+## 0.118.2
+
+No changes in this release.
+
+## 0.118.1
+
+No changes in this release.
+
+## 0.118.0
+
+No changes in this release.
+
+## 0.117.1
+
+No changes in this release.
+
+## 0.117.0
+
+No changes in this release.
+
+## 0.116.5
+
+No changes in this release.
+
+## 0.116.4
+
+No changes in this release.
+
+## 0.116.3
+
+No changes in this release.
+
+## 0.116.2
+
+No changes in this release.
+
+## 0.116.1
+
+No changes in this release.
+
+## 0.116.0
+
+No changes in this release.
+
+## 0.115.4
+
+No changes in this release.
+
+## 0.115.3
+
+No changes in this release.
+
+## 0.115.2
+
+No changes in this release.
+
+## 0.115.1
+
+No changes in this release.
+
+## 0.115.0
+
+No changes in this release.
+
+## 0.114.1
+
+No changes in this release.
+
+## 0.114.0
+
+No changes in this release.
+
+## 0.113.3
+
+No changes in this release.
+
+## 0.113.2
+
+No changes in this release.
+
+## 0.113.1
+
+No changes in this release.
+
+## 0.113.0
+
+No changes in this release.
+
+## 0.112.0
+
+No changes in this release.
+
+## 0.111.1
+
+No changes in this release.
+
+## 0.111.0
+
+No changes in this release.
+
+## 0.110.0
+
+No changes in this release.
+
+## 0.109.25
+
+No changes in this release.
+
+## 0.109.24
+
+No changes in this release.
+
+## 0.109.23
+
+No changes in this release.
+
+## 0.109.22
+
+No changes in this release.
+
+## 0.109.21
+
+No changes in this release.
+
+## 0.109.20
+
+No changes in this release.
+
+## 0.109.19
+
+No changes in this release.
+
+## 0.109.18
+
+No changes in this release.
+
+## 0.109.17
+
+No changes in this release.
+
+## 0.109.16
+
+No changes in this release.
+
+## 0.109.15
+
+No changes in this release.
+
+## 0.109.14
+
+No changes in this release.
+
+## 0.109.13
+
+No changes in this release.
+
+## 0.109.12
+
+No changes in this release.
+
+## 0.109.11
+
+No changes in this release.
+
+## 0.109.10
+
+No changes in this release.
+
+## 0.109.9
+
+No changes in this release.
+
+## 0.109.8
+
+No changes in this release.
+
+## 0.109.7
+
+No changes in this release.
+
+## 0.109.6
+
+No changes in this release.
+
+## 0.109.5
+
+No changes in this release.
+
+## 0.109.4
+
+No changes in this release.
+
+## 0.109.3
+
+No changes in this release.
+
+## 0.109.2
+
+No changes in this release.
+
+## 0.109.1
+
+No changes in this release.
+
+## 0.109.0
+
+No changes in this release.
+
+## 0.108.1
+
+No changes in this release.
+
+## 0.108.0
+
+No changes in this release.
+
+## 0.107.0
+
+### Minor Changes
+
+- 0ae11a6: One manager can host seats on different terminal runtimes at the same time.
+  
+  `cotal spawn --runtime <name>` with `-d` or `--on`, `cotal_spawn` with `runtime`, and a workflow `spawn(persona, { runtime })`, choose the runtime of that one seat. A seat that names none keeps the runtime the manager was started with. An unknown or unreachable runtime, and `auto`, refuses the launch and starts nothing. Stopping, attaching, and recovery follow the runtime recorded for that seat, so a later seat does not move one that is already running.
+
+## 0.106.1
+
+No changes in this release.
+
+## 0.106.0
+
+No changes in this release.
+
+## 0.105.1
+
+No changes in this release.
+
+## 0.105.0
+
+No changes in this release.
+
+## 0.104.2
+
+No changes in this release.
+
+## 0.104.1
+
+### Patch Changes
+
+- c6021e5: Share dispatch-failure settlement between `waitUntil` observations and ordinary effects, preserving refusal, cancellation, error details and journal rejection handling without a second recorder.
+
+## 0.104.0
+
+### Patch Changes
+
+- e0c4e6e: Correct the documentation page by page against the implementation, including CLI commands, connector delivery and activity sharing, authentication, observer surfaces, hosted composition, telemetry and historical design status. Refresh package guides and generated tool and HTTP references while preserving existing links and normative contracts.
+
+## 0.103.4
+
+No changes in this release.
+
+## 0.103.3
+
+No changes in this release.
+
+## 0.103.2
+
+No changes in this release.
+
+## 0.103.1
+
+No changes in this release.
+
+## 0.103.0
+
+No changes in this release.
+
+## 0.102.0
+
+No changes in this release.
+
+## 0.101.7
+
+No changes in this release.
+
+## 0.101.6
+
+No changes in this release.
+
+## 0.101.5
+
+No changes in this release.
+
+## 0.101.4
+
+No changes in this release.
+
+## 0.101.3
+
+No changes in this release.
+
+## 0.101.2
+
+No changes in this release.
+
+## 0.101.1
+
+No changes in this release.
+
+## 0.101.0
+
+### Patch Changes
+
+- 71e8b88: `cotal run amend` for a run ID that no run is recorded under now says no run is recorded under that
+  ID. With `--local`, an amend that finds no answer to amend is refused `TARGET_NOT_FOUND`, exit 2, as
+  the hosted amend is, where it reported an unknown outcome although nothing was written.
+- b3738e8: `cotal run amend` sent right after an accepted answer, before the run has recorded it, now says the answer was accepted and is not recorded yet, and to amend once the step lists it. Before, it said the step was "still open, so answer it instead", which sent the caller to a pause that had already taken their answer.
+- c22bcff: `cotal run answer` for a run ID that no run is recorded under now says no run is recorded under
+  that ID, where it said no step is recorded under that key. With `--local` it is refused
+  `TARGET_NOT_FOUND`, exit 2, as the hosted answer is, where it reported an unknown outcome although
+  nothing was written.
+- b926504: A checkpoint that expires under `onExpiry: "fail"` now says in its L4007 whether the deadline came
+  from its own `timeout` or from the run's default, and its last option matches: raise the
+  checkpoint's timeout, or give it one or start the run with a longer default. The two used to print
+  the same text.
+- 9e0b1c5: `run validate` and `run start` now refuse a literal that is not a duration where a program reads
+  one, such as `sleep("5")`, `sleep(5000)` or a checkpoint `timeout` of `"PT5M"`, with L2034 and the
+  same text the call gives. Such a program used to validate and start, then fail its run at the call.
+  `run start` and `run resume` refuse a `--timeout` that is not a duration longer than zero with
+  `USAGE_INVALID`, where it used to start a run whose checkpoints then failed.
+- e53c3a3: `run validate` no longer refuses a `fanOut` with L3025 when a property name in an items object
+  literal holds `/`, `#` or `:`. The static rule read those names as branch keys. A `fanOut` mints its
+  branch keys at run time from `key` or each item's `id`, and the run still refuses one that holds a
+  reserved character with L3025. The static rule keeps covering `parallel` and `race` record keys.
+- 2895911: L1008 is now titled "Invalid syntax or newline hazard", since a program that does not parse, such as
+  one holding a NUL byte, is refused under it as well as the two newline hazards. The code is unchanged.
+- 94207f0: `run validate` and a hosted `run start` now refuse an effect other than `ask` inside `once`, in its
+  body or in a function the body calls by name, with L2033. Such a program used to validate and then
+  fail every run with L4028.
+- b2fcd9c: A program that does not parse, such as one holding a NUL byte, is still refused with L1008, and its
+  fix now says only to fix the syntax at the marked position. It used to say the language has no
+  automatic semicolon insertion, which it does.
+- b432707: A step that a race cancelled in a losing branch now says so. `run show` labels its row
+  `cancelled, <branch> won <race>`, and `run answer` at that step is refused with `that step was
+  cancelled because branch <branch> won the race <race>` instead of `that step has already settled`.
+- 761c861: `cotal run simulate` now tells a program that fails under its script apart from a script that does not cover the program. A program failure, such as a checkpoint scripted `expired` under the default `onExpiry: "fail"` (L4007), is a completed simulation, exit 0, whose program outcome is failed: it shows the step and that step's outcome with the language's error, and the JSON result carries `outcome` and `failure` beside the effects that ran. A script with no result for an effect (L6001) still does not complete, exit 5, and now names the step and the entry to add. Before, both printed "the offline simulation did not complete; unscripted effects are not invented" with a null result. `dryRunOutcome` returns a failed program's report with its fault, and `dryRun` takes an optional `journal`, so a caller can read the step a dry run that did not complete stopped at.
+- ce05dbf: When a simulation script's list of results for a step is too short, the L6001 failure now says which
+  result the step needs, counted from 1, as in "step /turn:build#1 needs result 2". It used to say
+  "this is occurrence 1" for the second occurrence.
+- 78a2035: A workflow's `log(...)` lines are no longer discarded. A run the manager hosts writes each line to
+  the manager's log as `run <run-id>: log <text>`, a `--local` drive prints them, and `run simulate`
+  lists them under `Log`, with `result.log` in `--json`. The lines stay out of the journal, as the
+  language defines.
+
+## 0.100.2
+
+No changes in this release.
+
+## 0.100.1
+
+### Patch Changes
+
+- 86b2cd5: A `conclave` reached on a branch that is already cancelled now raises the cancellation before its entry begins, as every other effect does. Before, a race's losing branch that reached a conclave after the race was decided wrote a conclave entry and settled it `cancelled`, and a resume that re-entered a pending conclave on a cancelled branch opened and closed the room and could hand the race to the branch the live run had cancelled. Effects and conclaves now pass one shared set of admission checks (cancellation, the host's stop, the effect ceiling) before they begin.
+
+## 0.100.0
+
+### Minor Changes
+
+- 9f69a20: `ADMITTED_NODES`, `STRUCTURAL_NODES`, `RESERVED_NAMES`, `FORBIDDEN_GLOBALS` and `MUTATING_METHODS` are now exported as frozen arrays instead of `Set`s, and `CATALOG` is frozen. Code that imports the package could call `add` or `delete` on one of those sets, or assign a `CATALOG` title, and change what `validate` accepted or how its errors were titled for the rest of the process. The tables can no longer be changed: a write throws in strict-mode code, such as an ES module, and changes nothing elsewhere. This changes the exported type, so a caller that used `.has` or `.size` on one of these tables uses `.includes` or `.length` instead.
+
+## 0.99.3
+
+No changes in this release.
+
+## 0.99.2
+
+No changes in this release.
+
+## 0.99.1
+
+No changes in this release.
+
+## 0.99.0
+
+No changes in this release.
+
+## 0.98.0
+
+No changes in this release.
+
+## 0.97.1
+
+No changes in this release.
+
+## 0.97.0
+
+No changes in this release.
+
+## 0.96.1
+
+No changes in this release.
+
+## 0.96.0
+
+No changes in this release.
+
+## 0.95.2
+
+No changes in this release.
+
+## 0.95.1
+
+No changes in this release.
+
+## 0.95.0
+
+No changes in this release.
+
+## 0.94.7
+
+No changes in this release.
+
+## 0.94.6
+
+No changes in this release.
+
+## 0.94.5
+
+No changes in this release.
+
+## 0.94.4
+
+No changes in this release.
+
+## 0.94.3
+
+No changes in this release.
+
+## 0.94.2
+
+No changes in this release.
+
+## 0.94.1
+
+No changes in this release.
+
+## 0.94.0
+
+No changes in this release.
+
+## 0.93.0
+
+No changes in this release.
+
+## 0.92.2
+
+No changes in this release.
+
+## 0.92.1
+
+No changes in this release.
+
+## 0.92.0
+
+### Minor Changes
+
+- 1db940e: Add authenticated cooperative workflow cancellation through the manager endpoint. The original caller can cancel under a live issued generation; signerless hosts also verify interactive owner or admin authority through the issuing host. Replies distinguish the durable revocation marker from an observed local drive outcome, preserve unknown write outcomes and retain the first marker. Read-only status inspection remains available after revocation without permitting new drive or checkpoint-answer authority. The run show view displays revocation separately from recorded state and returns a partial result with exit 4 when the marker cannot be read, in human and JSON output.
+
+  Breaking: embedded RunHostDrive implementations must supply cancel(reason) separately from release(reason). Both language engines and the worker bridge propagate cooperative root cancellation. This does not preempt external tools, stop agent processes or prove resource cleanup. No new CLI or MCP convenience command is added.
+
+## 0.91.0
+
+## 0.90.1
+
+## 0.90.0
+
+## 0.89.0
+
+## 0.88.0
+
+## 0.87.0
+
+## 0.86.0
+
+### Patch Changes
+
+- add70b8: `validate()` and `transform()` now refuse a write to a `const` binding through a destructuring assignment (`[c] = [1]`, `({ c } = { c: 1 })`) or a `for...of` with no declaration (`for (c of xs)`) with L2003. These used to validate clean and fail with L2003 only when the line ran, after any effects dispatched before it.
+- e754d4f: `validate()` now refuses with L2032 a `waitUntil` probe or `terminal` predicate that writes a binding declared, or a value built, outside it. Both engines run them one level deeper than the call and refuse the write at run time, so such a program used to validate clean and then fail on the first observation of every run.
+
+## 0.85.0
+
+## 0.84.0
+
+## 0.83.0
+
+## 0.82.2
+
+## 0.82.1
+
+## 0.82.0
+
+## 0.81.1
+
+## 0.81.0
+
+## 0.80.0
+
+## 0.79.0
+
+### Patch Changes
+
+- aaa6bc9: A failure a bridged host handler throws now crosses into the engine thread as the class it was raised as, with that class's own fields, and is rebuilt with nothing defaulted. Before, an `EffectError` missing its `code` or `kind` was journaled as `L4000` / `handler-fault`, and an `EffectRefused` missing its `code` as `L5016`, while the in-process walker recorded the same failure with those fields absent. A bridged failure now journals the same as an in-process one.
+
+## 0.78.1
+
+## 0.78.0
+
+### Minor Changes
+
+- a74b832: `PrimitiveSpec.opensScope` is replaced by `scope`, the `ScopeKind` a primitive opens or `null`. A scope row in `PRIMITIVES` now has to name a member of `ScopeKind` to compile, and both engines read that kind from the table instead of casting the primitive's name to it, so a new scope primitive left out of the union no longer reaches the journal as a kind its readers do not know. Code that read `spec.opensScope` reads `spec.scope !== null`.
+
+### Patch Changes
+
+- 8b92413: The static captured-write check (L2032) now reads a scope's body position from the syntax table, as the argument just before the options bag. It used to name `fanOut` and `conclave` as the primitives whose body is the second argument, so a scope primitive added to the table with its body second had its first argument walked and a captured write in its body passed `validate` with no error. The five current scope primitives validate as before.
+- d04629a: Whether a scope calls the handler itself is now its own `dispatches` row in `scopeTraits`, and `performScope` reads it there. Before, it inferred dispatch from whether the scope hashes a subject, so changing `conclave`'s `hashesSubject` still typechecked and then silently dropped the conclave's durable request id, its cancel re-check after begin and its count against the effect ceiling (L4009), and let a migration walk into a settled conclave and call the handler's `openConclave` where it used to refuse with `UnwalkableScope`. Shipped behaviour is unchanged.
+- 905a78b: `waitUntil` now enters its step through the same code as every other effect. The replay verdicts, the cancellation checks, the host stop, request-id recovery and the `begin` append were written out a second time for `waitUntil`, so a rule changed in one copy could leave waits replaying, stopping or recovering differently from the rest. Behaviour is unchanged.
+
+## 0.77.1
+
+## 0.77.0
+
+## 0.76.0
+
+### Patch Changes
+
+- ea15e8d: A `conclave` now asks the host's stop before it opens, as every other effect does. A run whose driver has asked it to stop (an operator pause or a passed work horizon) is released (L5012) at the next conclave instead of opening it, and a program made only of conclaves no longer runs to completion after the stop. A settled conclave still replays under a stop.
+- 9adcf1c: `PRIMITIVES`, `EVENT_CONSTRUCTORS`, `PURE_PRIMITIVES` and `FORBIDDEN_NODES` are now frozen through every row and nested array. A write to a row, or to the `callee` a validation `LangError` carries, throws instead of changing what `validate` accepts or reports for the rest of the process.
+
+## 0.75.0
+
+## 0.74.0
+
+## 0.73.0
+
+## 0.72.1
+
+## 0.72.0
+
+## 0.71.0
+
+### Patch Changes
+
+- 3400d53: A value a program throws out of a concurrency scope now reaches `catch` as itself on resume, as it already did on the live run. The scope's `L4000` `scope-fault` record carries the value in a new `error.thrown` field, and a replay delivers that value instead of building the fault from the record. Before this, a `conclave` body that threw `"failure"` was caught as `"failure"` live and as `{ code: "L4000", kind: "scope-fault", message: "failure" }` on resume, on both engines, so a program that branched on the caught value diverged on the resume of unchanged source. The record carries a copy, and `catch` receives that copy deep-frozen like a scope's result, live, on resume and in a migration check's walk, while the thrown value itself is not frozen. The copy is the value as the journal's JSON reads it back, so a record held at two places in the thrown value arrives as two records, live as on a resume from a durable store. A resume refuses a loaded `error.thrown` that is not `{ value }` or `{}`, or whose value has no canonical form (L5024). A thrown value with no canonical form, such as a function, cannot be recorded, so the scope delivers its fault record in its place on the live run too.
+
+## 0.70.2
+
+## 0.70.1
+
+### Patch Changes
+
+- fe54eb0: `validate()` now refuses with L2032 a `parallel`, `race` or `fanOut` branch, or a `once` or `conclave` body, that writes a binding declared outside it through a destructuring target (`[n] = r`, `({ n } = r)`, `[o.a] = r`, nested, default and rest elements included) or through a `for (n of xs)` loop with no declaration. These writes used to validate clean and fail with L2032 only when the branch ran, after any effects dispatched before it.
+- 1ef1396: The run-time half of L2032 now gives the reason that fits the scope a write is refused in. A write from a `once` or `conclave` body, or from a `waitUntil` probe, to a binding declared or a value built outside it now says that a settled scope is replayed without entering its body, and that the value should be read out of the scope's result. That is what the static check already says for `once` and `conclave`. Before, the refusal described concurrent branches writing in completion order and suggested `race`, which only applies to `parallel`, `race` and `fanOut`. The walker and the compiled engine now share one write check and refuse the same binding write with the same message, so a program that catches L2032 reads the same text on both engines. The compiled engine used to word a binding write as a value write.
+
+## 0.70.0
+
+### Minor Changes
+
+- 83a6352: A run on the compiled engine no longer reports a value the program threw as a host hold or release. The worker thread used to copy `code`, `reason`, `step` and `kind` off whatever was thrown, and the host rebuilt `RunHeld` or `RunReleased` from the code alone, so `throw { code: "L5025", reason: "..." }` came back as a held run with the placeholder step `(step not carried)`, and `throw { code: "L5012", ... }` as a release. Both now fail as the plain value they are, as they do on the walker. `WorkerRunFailed` is now a union discriminated by `class` (`released`, `held`, `effect`, `too-large`, `rejected` or `error`). The thread picks the variant with `instanceof`, each variant requires its class's fields, and the host rebuilds the class with no defaults. `tooLarge` is replaced by the `too-large` variant's `stepKey`, `bytes` and `bound`. This breaks code that calls `runInWorker` itself: `code` now crosses only on the `effect` and `error` variants, so a caller that branched on `L5012`, `L5025`, `L5006` or `L5010` branches on `class` instead.
+
+## 0.69.0
+
+### Patch Changes
+
+- 1bdc7f2: A `conclave` now counts toward a run's `effectCeiling` (L4009). Opening one is a dispatch against the world, but it was counted neither by the live counter nor by the journal tally a resume seeds that counter from, so a program whose only effect was `conclave` could open any number of them, live or across a resume, without reaching the ceiling. It is counted once, before its entry begins, on both engines. A resume that re-enters a pending or refused step, a `conclave` or an effect, no longer counts it a second time, so a resumed run reaches the ceiling at the same step as a fresh one instead of faulting where the fresh run goes on. `spec/cotal-lang.md` §8.3 no longer excludes it.
+- 94996e5: The scope kinds' traits now come from one record keyed by `ScopeKind`, exported as `scopeTraits`, which returns a frozen row: whether a scope settles an assembly of branch outcomes, and whether a fork whose cut lies inside it re-enters it. The journal seed check, the scope value rule, the static captured-write check (L2032) and `planFork` read it instead of keeping their own kind lists, so a scope kind added to `ScopeKind` does not compile until it is classified. Before, a new kind compiled with a list missed and failed only at run time, for example a settled no-return scope of that kind refused at the journal seed with L5024. Shipped behaviour is unchanged.
+- f409b46: A `waitUntil` whose first observation is not terminal now waits out its cadence on a host that checks journal authority (a manager-hosted run, or `cotal run start --local`) and fails `L4023` at its deadline. Before, its second observation failed `L4000`: the interpreter sent the observation index as the effect's attempt, which the run authority refused, and the authority listed no pause token for a `waitUntil` cadence. Which pause tokens a step owns is now one table that the run authority, the adoption re-arm and a cancelled branch's discharge all read, so a cancelled `waitUntil` on a hosted run also releases its open cadence pause.
+
+## 0.68.0
+
+### Minor Changes
+
+- 6141e7b: The issuing host no longer signs an answering run operator for a checkpoint token a participant manager names. The manager's request now names the run and step it answers (`operator.answers: { runId, stepKey, amend? }`), and the host requires that run admitted on the manager's instance, reads the pause's token off the run's journal under a read it mints for that run, and requires a served answer to name the same run and step as the request it observed. Before, a manager could be issued the answer and settle writes for another instance's waiting pause. The pause lookups `openCheckpointToken`, `settledPauseToken`, `stepPauseToken`, `CheckpointNotOpen` and `CheckpointNotAmendable` move to `@cotal-ai/lang`; `@cotal-ai/runtime` still exports the first four. A participant manager and its issuing host must upgrade together.
+
+### Patch Changes
+
+- b38a683: A `conclave` body may no longer write a binding declared outside it, or a field of a record or array built outside it (L2032), on both engines, as `once` already could not. A settled `conclave` is replayed from its journal entry without entering its body, so the write happened on the live run and never on resume: the resumed run read the old value and diverged at the next effect that took it as input. Return the value from the body and assign the scope's result instead.
+- d5ea4d2: The cotal-lang spec's migrate orphan table has a `waitUntil` row. An orphaned `waitUntil` is ignored whether it settled or is still pending, and its recorded observations stay in the journal. This is what `cotal run migrate` already reported; the table's "any other kind" row required L5015, so an implementation written from the spec refused the same migrations. No behavior changes.
+- 54e0199: The cotal-lang spec lists the scopes and the traits in which they differ in one table (§7): what a scope settles, its verdict when a migration orphans it, and whether a fork re-enters it when the cut lies inside it or refuses the cut (L5020). The journal entry's `kind` field, the absence rule for a scope's settled value, the L2013 admission, the migrate orphan table and the fork cut rule cite that table or the primitive table instead of listing kinds, so a new scope is one row in each. No behavior changes.
+
+## 0.67.0
+
+### Patch Changes
+
+- 48f18d0: Remove sentences from shipped comments in core, lang, the CLI and the manager that described what earlier revisions of those comments claimed. The request-path validation note in `endpoint-envelope.ts` now states as current fact that registration-time profile bounds do not replace request-path enforcement, with the `uniqueItems` measurement under it. The barrier-window note in `endpoint-action.ts`, the lang worker header, the worker result backstop, the `--rotate-sys` broker check and the manager's goal-writer epoch belt keep their contract text and drop the history. No behavior changes.
+
+## 0.66.1
+
+## 0.66.0
+
+### Patch Changes
+
+- a9be586: Apply the driver's result bound on the compiled engine. A hosted run on language version 2 never received the result bound that `cotal run` and the manager derive from the broker's `max_payload`, so an oversized effect result was recorded when it fit the store, or released as the store's own L5010 when it did not. The bound now reaches the journal the worker thread builds, an oversized `ok` result is refused ahead of the settling append (L5006) as it is on version 1, and the host rebuilds that refusal as `EffectResultTooLarge`, so the driver releases the run instead of recording it as failed. `WorkerRunRequest` gains `resultBytes`, refused outside the bridged route, and `WorkerRunFailed` gains `tooLarge`.
+
+## 0.65.0
+
+### Minor Changes
+
+- 8577576: Add `once`, an at-most-once scope for cotal-lang steps that write to a far side. A resume that finds a step inside `once` begun and never settled does not dispatch it again: it opens a hold, a checkpoint minted under `holdRequestId` of the step's recorded request id, and the answer becomes the step's result, while an expired hold fails the step with the catchable L4027. A hold the host refuses leaves the step pending rather than refused, so no later host writes again, and its L5025 says so. A hold whose checkpoint answers an outcome other than `resolved` or `expired` fails the step as a handler fault. Only `ask` runs inside `once`; every other effect is refused before it begins (L4028), and a write from the body to a binding outside it is refused (L2032). The journal entry gains a `hold` field for the hold's own binding. The hosted runtime ends the held `ask`'s open attempt pause before the hold binds, and `cotal run answer`, `cotal run amend` and `cotal run journal` read a held step at its hold. A fork may cut inside `once`, and a migration ignores an orphaned `once`. `once` becomes a reserved name, so a program that declares its own `once` binding is refused (L2002). The design record is `docs/design/at-most-once-external-effect.md`.
+
+## 0.64.0
+
+### Patch Changes
+
+- eb2b2d5: A journal append the store refuses now crosses the worker effect bridge as the real `JournalAppendRejected` (or `EffectResultTooLarge`) in both directions. Before, the bridge flattened it into a plain `Error`, so when a host handler's `ctx.bind` was refused and the handler rethrew, the compiled engine settled the step `failed` as an L5010 handler fault and a program `try`/`catch` could catch it. The bridged route now matches the in-process interpreter: the entry stays pending, nothing is settled on top of it, and the run stops on the uncatchable L5010 path.
+
+## 0.63.0
+
+## 0.62.0
+
+### Patch Changes
+
+- 1b3ba08: A host stack overflow in a cotal-lang run is no longer catchable. A builtin that ran out of stack (for example `json.stringify` on an array nested a few thousand deep) used to raise a catchable L4016, so a program could branch on how much stack its host had, and a journal recorded on one host was refused with L5001 when resumed on a host with a larger stack. Both the tree-walker and the compiled engine now unwind the run through it, the same as the other faults a program cannot catch: a `finally` does not run past it, a `parallel`, `race` or other scope it fails inside settles nothing, even when another branch failed first, the overflow itself cancels no sibling, and a `conclave` whose body overflowed does not close. A resume on a host with more stack then proceeds instead of replaying a recorded scope failure.
+
+## 0.61.0
+
+## 0.60.0
+
+## 0.59.0
+
+### Patch Changes
+
+- acb713e: Keep the simulator in step with a program running behind the worker bridge. The bridge now reports when the thread has reacted to every message it was sent, and `SimHandler` waits for that before delivering its next wake, so a bridged simulation settles a `race` on the arm that finished first instead of the one declared first. Handlers gain an optional `useQuiescence` hook for this, and `RecordingHandler` forwards it, so a wrapped simulator keeps the same pacing. It returns a release that the bridge calls when it closes, including when the worker fails to start, so a `SimHandler` used for one bridged run can be reused for another run afterwards.
+- 77e2654: The record and array builtins refuse an argument of another kind in the language, so a program can no longer branch on an answer the host made up for a value it was never meant to take.
+
+  Each of these builtins read its record or array argument through a host operation that answers for any kind. Measured before the fix, on both engines: `map(5, f)` and `keys(5)` answered `[]`, `every(5, f)` answered true, `pick(5)` answered undefined, `has(f, "length")` answered true off the implementation's function wrapper, `keys("ab")` answered index strings, `concat("a", [1])` answered `"a1"` past L4018, and `keys(null)` refused with the host's error text.
+
+  `keys`, `values`, `entries`, `has` and both arguments of `merge` now take a record, and `map`, `filter`, `find`, `some`, `every`, `sort`, `slice`, `join`, `reverse`, `unique`, `sum`, `pick` and the first argument of `concat` take an array. Every other kind, a string, `null` and `undefined` included, is refused with L4016 naming the builtin and the kind, before the host is reached, as `len` already was. The refusal is catchable. The second argument of `concat` keeps the method's meaning. The spec's library-failure section, its replay posture and its change log carry the rule in the same change.
+
+- 608f5f4: Re-attach doc comments that had drifted away from the declarations they document. A `/** */` block followed directly by another one documented nothing, so editor hovers and the published type declarations showed no doc for the intended declaration (for example `Manager`, the `plane3` field and `AclResolver`). Each such block now sits above its declaration, is merged into the block it duplicated, or is removed when its declaration no longer exists. A new `pnpm check:doc-comments` check, run as part of `check:docsbundle`, refuses a doc block followed directly by another in shipped source.
+- 7b39a0b: `spawn` in a workflow program accepts `events`, the workflow form of `cotal spawn --no-events`. `events: false` starts the seat without its AG-UI event plane, so a hosted run can now start a connector that publishes none, such as Hermes. Before this the option was refused as an unknown key (L3011), and the same spawn without it was refused by the manager because an omitted `events` arms the plane. A value that is not a boolean is refused at the spawn. Like `supervise`, the option is launch policy and is not part of the step's input hash.
+
+## 0.58.0
+
+### Patch Changes
+
+- 4229e53: Forward `observe` through the worker bridge, so a `waitUntil` run hosted by a manager completes instead of failing with "host.options.handler.observe is not a function".
+
+## 0.57.0
+
+### Minor Changes
+
+- ae90f5d: The scripted turn no longer asks for a timestamp it discards: `SimScript`'s turn entries drop the unused `at` field, so a script author's previously valid `at` literal now fails to typecheck (#729). The simulator grades a scripted wait's delivered value and a scripted ask's two-minute clock instead of taking them on faith (#724). `EffectHandler`'s docblock and the docs now state the handler failure contract: a `bind` failure is a throw (#735).
+
+## 0.56.1
+
+## 0.56.0
+
+### Patch Changes
+
+- 493eef5: The tree-walker's `++` and `--` refuse an operand that is not already a number with L4018, the same sentence the compiled engine's `case "update"` throws, instead of reading it through a bare `Number(...)`: a record no longer decays to NaN and a numeric string no longer silently becomes a number, so `x++`, `x + 1` and `x += 1` agree (#646). The two declared divergences this covered are retired.
+
+## 0.55.0
+
+### Patch Changes
+
+- 2b28653: A `RunDivergence` raised inside a concurrency scope is no longer recorded as the scope's own outcome: `performScope`'s ladder rethrows it and settles nothing, so the scope entry stays pending and a resume re-enters it and diverges again at the step that broke, instead of replaying a recorded `L4000` scope-fault a program's `try`/`catch` can swallow. A divergence among a `race`'s settled arms is hoisted ahead of the winner scan beside a refused append and a held arm, so a losing arm's divergence is never discarded behind a winning sibling and the winner's value is never handed back over it. A divergence also cancels no sibling: `parallel`, `fanOut` and the `race` settle treat it like a release or a refused append, leave every other arm to run to its own boundary and rethrow bare, so a resume of the original source completes the run instead of replaying a cancellation the divergence recorded.
+
+## 0.54.0
+
+## 0.53.0
+
+## 0.52.1
+
+## 0.52.0
+
+### Patch Changes
+
+- 7ea6fee: A scope's failure record keeps a catalog code the language itself raised. A `RuntimeFault` thrown inside `parallel`, `race`, `fanOut` or `conclave` used to settle the scope's entry as the generic `L4000` `scope-fault` with its own sentence still inside the message, so the record disagreed with the rethrow: the program caught its own `L3021` (a `fanOut` with no stable key) live while every resume replayed `L4000` off the entry. The settle ladder now records a `RuntimeFault` under its own code with kind `runtime`, the kind both engines' catch binding already gives this class. A plain non-`EffectError` throw inside a scope still records `L4000` `scope-fault`, a handler's `EffectError` still keeps its code and kind, and the raw rethrow is unchanged. Refs #1519.
+
+## 0.51.0
+
+## 0.50.1
+
+## 0.50.0
+
+### Minor Changes
+
+- 87dda9f: The caller half of a durable spawn's physical working directory, pinned to one manager instance
+
+  A durable spawn can name a physical working directory with `cwd`, and doing so requires an explicit
+  `placement` target naming one manager instance as `{ endpoint, instanceId }`. A directory is
+  host-local, so a `cwd` with no target would ride the class anycast queue and land wherever the
+  anycast fell; that combination refuses rather than guessing, with no fallback. The target is
+  hashed into the step identity beside the directory, so a replay retargeted at a different instance
+  diverges as a migration instead of replaying a resolution taken against the old host. Logical
+  `worktree` keeps its meaning and its exclusivity, and a spawn that names neither option hashes
+  exactly the object it hashed before, byte for byte, so recorded runs replay unchanged.
+
+  **Explicit `cwd` placement does not resolve yet on a shipped manager, and refuses by name until it
+  does.** What ships here is the caller half: the language forwards and hashes the options, the
+  runtime asks its pinned target to state the directory's canonical form before it submits anything,
+  and the core grant builder mints the instance-pinned rails that ask would need. The question is
+  asked with a `resolve-cwd` command, and **no manager in this release serves `resolve-cwd`** — the
+  only servers of it are the smoke suites that grade this code. So on a real manager every explicit
+  `cwd` placement ends in a named refusal saying that this manager serves no `resolve-cwd` command
+  and can therefore state no canonical form. That is the intended direction and it is not a crash:
+  nothing is submitted, allocated or launched, and the caller is told why. A non-`ok` reply and a
+  reply whose path is not absolute are refused the same way. Until a manager serves the command,
+  treat `cwd` with `placement` as unavailable rather than as a directory that silently differs from
+  the one you named.
+
+  The grant surface and the serving surface are deliberately asymmetric, and it is worth stating
+  plainly: `runMediatorGrants` does mint the three placement capabilities (`describe`, `resolve-cwd`,
+  `spawn`) for the one named instance when a program names a target, bounded to that instance with
+  no anycast rail and no wildcard, but the manager's hosted-run credential minting never passes a
+  program's placement into it, so an authenticated hosted run receives none of those rows today. The
+  rails are built and graded; nothing production yet asks for them or answers them.
+
+  A malformed `placement` is now refused by name at the call. `placement: null` used to raise a raw
+  `TypeError` from inside the interpreter's identity projection, with no code, no effect kind and no
+  journal entry, because the option reader guarded the option bag being null rather than the value it
+  held. A primitive, an empty record and a half-filled record were quieter and worse: they were
+  forwarded, projected two undefined fields into the step identity, and the run carried on under an
+  identity describing a placement the program never named. All of these are now `L3048`, raised
+  before the step key is minted, so nothing is journalled and the repair is an edit to the program.
+
+### Patch Changes
+
+- c59d96d: Stop a parked step from dying on one slow pause-plane reply. A workflow `ask` that waited long enough settled `failed` with `{code: "L4000", kind: "handler-fault", message: "timeout"}` while most of its deadline was still unspent, the seat was alive, and nothing in the program threw. Measured on the reporting run: the two asks under 4.5 minutes settled `ok` and the two over 7.5 minutes failed with that exact record, with 11 minutes of deadline left.
+
+  The cause is how long a parked step reads for. While a pause is parked the run host polls the plane for the life of the step, once for the settle fact and once for the broker's fire, each read riding a NATS API request with its own 5s client-side deadline. A reply that arrives after that deadline raises the client's bare `TimeoutError: timeout`, and the interpreter records any non-`EffectError` throw as `L4000 handler-fault` verbatim. So the step issued roughly one unretried request per second for its whole duration and one late reply ended it, which is why the exposure grew with how long the step waited rather than with anything about the program.
+
+  A late reply is a fact about that one request and not about the pause behind it. The pause is a durable record on the plane, its timer is armed, and it is still answerable, so the read is now re-issued rather than raised, and the step settles on the answer it was waiting for. Re-reading is safe for the same reason the starvation repair's re-entry is: the plane's operations are idempotent by construction, and reading a one-use settle fact again observes the same world.
+
+  It is the second half of a distinction the host already drew for #1508 and it reuses that machinery rather than adding its own. A client deadline has two causes that produce the identical error, and the host can tell them apart by measuring whether its own event loop ran: off the CPU is the host's own starvation (`L4025`), and on it is a plane that answered late. The case that moves is only the second, which the classifier previously answered "fault" and handed to the program as its own failure.
+
+  Neither retry is unbounded and neither is merged into the other. A run that cannot be served must fail rather than hang, so the two conditions carry separate counts that are never reset, which bounds the call however they interleave; a host that stays starved still fails under `L4025`, and a plane that never answers now fails under the new `L4026` naming the measurement rather than the effect. The two are kept apart because the remedies differ: one says give this host capacity, the other says the broker is behind. Every failure that is not a client deadline is still raised on the first attempt, unretried and unwrapped, and still recorded as `L4000`.
+
+  A recorded handler fault also carries the stack of the value that was thrown, in a new optional `error.stack` on the journal entry. A handler fault is the one failure class whose cause is in neither the program nor the language, so `message` alone ("timeout") is the symptom with no origin, and the durable entry is usually the only look anyone gets at it. The field is written only when the thrown value carried a non-empty string `stack`: a handler may throw a primitive, and a recorder that trusted the field would replace the handler's failure with its own.
+
+## 0.49.0
+
+### Minor Changes
+
+- 1469d18: Add `waitUntil(probe, { name, every, deadline })`: a durable wait on a resource the mesh does not own. Before this a program could only wait on a mesh event or on the clock, so blocking until something outside the mesh became true meant writing a poll loop, and a poll loop is broken across a resume: the probe's observation of "not yet" was journalled as the step's RESULT and replayed forever, so a resumed run was handed a stale answer for a resource that had since completed, and never looked again.
+
+  A `waitUntil`'s non-terminal observation is now journalled AS AN OBSERVATION and leaves the entry pending, so a resumed run re-observes the world. Only a terminal observation settles the entry, carrying its observation history beside the result. Each observation's probe is journalled in its own key namespace, so the effects one look performs can never be replayed as another look's answer. The deadline is absolute from the entry's start, so a crash does not buy the wait more time, and an elapsed deadline is catchable as `L4023` and reports how many times it looked. The handler is asked only to wait out the cadence: which resource to look at, and what counts as done, stay with the program. `every` and `deadline` are part of the step's identity, so editing either on a resumed run diverges; the predicate is not, so a program can correct it on a run that is already waiting. Neither `every` nor `deadline` may be defaulted, and a cadence longer than the deadline is refused at parse.
+
+  Journals written before this release are unaffected: the new entry shape adds an optional field, and no existing kind changes.
+
+### Patch Changes
+
+- 4b3881f: A workflow `sleep` that a busy host was simply too loaded to schedule no longer fails the run. A pause waits by reading the durable checkpoint plane, and each of those reads carries a client-side deadline that is itself a timer; when the machine is loaded hard enough that the run's process does not get back onto the CPU, that timer cannot run either, so it expires the moment the process resumes and reports a bare `timeout` even though the broker answered long ago. That was recorded as `L4000 EffectError: timeout`, which names the effect as the thing that broke and sends the author looking at their own program, and it killed runs whose only fault was being polite about load.
+
+  The runtime now measures whether its own process was actually running across the wait, namely event-loop lag over the window together with a shortfall in the ticks that window should have contained, and treats a deadline that elapsed while the process was demonstrably off the CPU as a fact about the host rather than about the effect. The pause and its timer are durable, so the wait is simply re-entered and a `sleep` whose deadline passed during the starvation completes late, which is what a lower-bound wait promises. Nothing is widened and nothing is swallowed: a deadline on a loop that was running, and every failure that is not a client deadline, still fails immediately as `L4000` with its message intact. A host that still cannot serve the run after a bounded number of consecutive starved attempts fails under the new `L4025`, "Host did not schedule the run", quoting the lag and tick measurement it made, so a caller that genuinely cannot be served fails rather than hanging and the operator reads the real cause.
+
+## 0.48.2
+
+## 0.48.1
+
+### Patch Changes
+
+- 9a8a2a6: Inspect version-2 workflow journals on the compiled engine when planning forks and migrations. Preserve recorded pins, stop before new effects, and retain divergence and branch-refusal details across the worker boundary. Fork cuts remain fixed through catch and finally blocks, and inspection leaves pending broker effects untouched.
+
+## 0.48.0
+
+## 0.47.1
+
+## 0.47.0
+
+## 0.46.0
+
+## 0.45.0
+
+## 0.44.0
+
+## 0.43.0
+
+## 0.42.0
+
+### Minor Changes
+
+- a87709c: Every cotal-lang effect now performs on the mesh: the durable-action group is built end to end and
+  the not-yet-durable seam is gone.
+
+  `spawn` submits a real manager goal and returns the allocated seat's handle, and meters the
+  agent's `permits` (`turns`, `wallClock`; the turn that would exceed one is L4001, and a budget the
+  host cannot meter is refused at spawn); `conclave` opens a scoped sub-team as durable membership
+  rows; `ask` parks schema-checked pauses answered through `cotal run answer` and tells the agent
+  over the turn relay, one relay per attempt carrying the schema, the attempt and the previous
+  refusal, which every connector's intake renders with the answer command; `monitor` registers the
+  handle on its journal entry and `wait(down)` reads a monitored incarnation's death off presence
+  liveness, refusing an agent nobody monitored.
+  `turn` rides a new pull-shaped manager relay: the manager serves `turn` (targeted, the
+  despawn/input reach) plus `turn-pending` and `turn-yield` (self reach, manager contract revision
+  10), holds the payload on the goal-index note, pins the goal to the seat's incarnation, and denies
+  at a goal-bound deadline hold; the seat side (all connectors) pulls pending turns, surfaces them
+  two-phase into host context, auto-yields `done` when the host turn ends, and yields `blocked` or
+  `handoff` through the new `cotal_yield` tool; the run client renders context with pending notices,
+  arms its own pause on the acceptance's deadline as the L4003 authority, watches presence as the
+  L4002 authority (a death the manager marks on the deadline terminal reads the same way), and
+  honors handoffs (L4005/L4004 validation, the `handoffFrom` goal chain); the manager shows a seat
+  one turn at a time. The relay holds on an auth mesh: the agent baseline gains the self-mode
+  `turn-pending` and `turn-yield` rows, the operator seat-write set (`control-caller-admin`, the
+  `admin` capability) gains `turn` beside `input`, and the manager mints the deadline hold's
+  schedule over its serve connection and owner-expires the hold once due instead of reading a
+  fire it holds no grant for. `wait(replied)` observes the run's own turn terminals as a level, and never a
+  turn the run itself ended without an accepted yield. A `spawn` may bind a logical worktree: the
+  validator rejects two literal-worktree spawns in one concurrent scope (L3022, named branch
+  functions included) and the runtime claims a tree before it submits, refusing a second spawn into
+  a tree held by a live seat or by a spawn in flight (L4008), with sequential reuse the moment the
+  holder's presence lapses. A spawn refused at accept is L4000 (L4001 for seat capacity) and one
+  whose seat never came up is L4002; an `ask` whose deadline passes with no conforming record is
+  L4006; a fork copies a spawn that said `onFork: "adopt"` and refuses one that would have to
+  respawn (L5019). The run driver re-issues
+  recorded-but-undischarged cancellations at adoption, so recovery does not wait for completion to
+  release a dead loser's seat, pause, or tree. A migration's `--adopt <handle>` hands the orphaned
+  seat to the edited program's next spawn of that persona, and `--release <handle>` despawns it at
+  commit through the run's own discharge; both name the agent the step spawned, and a spawn that
+  produced none is an orphan like a sleep; the adopting spawn binds the orphaned spawn's goal as
+  its own, so a resume re-reads the seat and a cancellation despawns it. A turn accept the manager
+  cannot finish unwinds to a failed terminal on its bound goal, and a retry of it is refused naming
+  that terminal. The delivery daemon hosts the checkpoint timer writer, so mediated deadlines fire
+  with no suite pump.
+
+## 0.41.4
+
+## 0.41.3
+
+## 0.41.2
+
+## 0.41.1
+
+## 0.41.0
+
+### Minor Changes
+
+- 42d80da: cotal-lang DX: the conformance corpus and the language card. Every js block in the language reference is generated into a JSON artifact shipped inside @cotal-ai/lang (conformance/corpus.json) with the verdict the validator gives it, served by a new conformanceCorpus() accessor, so a second implementation can run the same claims from the file alone; pnpm gen:conformance regenerates it and smoke:lang-conformance holds the shipped bytes identical to a fresh build from the reference. The artifact states its own adjudication rule, so a reader holding only the JSON knows a refusal is checked by membership in the validator's answered codes, never by equality with a single code. docs/lang-card.md is a one-page card of the language (effects and their results, the await rule, branch keys, top refusals), validated block by block like the reference itself, carried in the connector docs bundle, and published on the docs site beside the other reference pages.
+
+## 0.40.0
+
+## 0.39.1
+
+## 0.39.0
+
+### Minor Changes
+
+- 2277e28: A capability refusal is durable and retryable. A handler that cannot perform an effect on its host
+  throws the new `EffectRefused`; the interpreter settles the entry with the new status `refused`
+  under the handler's code (L5016 for the mesh handler's `NotYetDurable`, which now extends it) and
+  unwinds the run with the uncatchable `RunHeld` (L5025). The driver grades the run `released`, and a
+  resume on a capable host finds the new `refused` lookup verdict and performs the step live, so a
+  run started before the durable-action surface lands heals the day it does. Previously the refusal
+  settled `failed` and a resume replayed the failure forever.
+
+  Two concurrent `turn`s on one agent handle are serialized at the dispatch seam both engines share:
+  the second begins when the first settles, in dispatch order. Turns on different handles are
+  unaffected.
+
+  A fork's child records its lineage: the run record's spec gains `forkedFrom` (`{ run, step }`,
+  absent on runs started fresh), `commitFork` writes it with the spec, and `ForkCommitResult.
+lineageRecorded` is now true.
+
+  Spec: §6.5 (turn serialization), §9.2 (six uncatchables), §10.1/§10.7 (the `refused` status and
+  verdict), §11.1, §11.3, Appendix A (+L5025), and SPEC.md §14.3 (`forkedFrom`).
+
+- 43e1f7d: Simulator fidelity, ask schema enforcement, journal result bound, and the scope release law.
+
+  The simulator is now discrete-event: timed effects park at their wake times and are delivered in
+  wake order on one virtual clock, so concurrent branches accumulate the durations they wrote and a
+  simulated race is decided by the same rule as a live handler (least recorded clock, ties by
+  declaration order) instead of by the order effects were asked.
+
+  The reference simulator enforces the ask schema shorthand (spec §6.5): a schema it cannot read is
+  refused with the new L4022 rather than skipped, a non-conforming reply consumes one attempt, and
+  exhausted attempts report L4006.
+
+  A journal can be constructed with a result bound (`JournalInit.resultBytes`, plumbed through
+  `DriveRequest.resultBytes`); a settled ok result over it is refused ahead of the settling append
+  with L5006, which leaves the reserved list.
+
+  A host release or refused append inside a parallel, race, fanOut or conclave no longer cancels
+  sibling branches or settles their in-flight entries cancelled: the unwind propagates bare, the
+  scope settles nothing, and a resume picks the run up exactly where the journal says it stopped.
+  The old behavior permanently poisoned any run a driver stopped while an effect was in flight
+  inside a scope.
+
+## 0.38.0
+
+## 0.37.0
+
+### Minor Changes
+
+- 00ac9d9: manager: refuse a manager-role spawn of a persona without the spawn capability. A persona defined over the wire (`cotal_persona`) carries no `capabilities:` line (the write path is content-only by design), and `cotal_spawn` takes a free-form `role`, so a wire-defined persona could be spawned with `role: "manager"` and join presenting as a manager whose credential cannot reach the control plane, silently, until the seat first tried to seat a worker (issue #966). The manager now refuses that spawn at accept, before any provisioning, naming the remediation for both authors: an operator adds `capabilities: [spawn]` to the persona file; a peer-defined persona cannot declare capabilities and must ask an operator. The guard keys on the effective role (a spawn-time role override wins over the file's, mirroring existing precedence) and leaves every non-manager spawn untouched. `cotal_spawn`'s `role` argument documents the requirement. Capabilities remain non-declarable over the wire: the closed `define-persona` input schema is unchanged and still guarded by `smoke:persona-input-closed`.
+
+### Patch Changes
+
+- 0098000: A host stop inside a concurrency scope no longer poisons the run. `shouldStop` returning a reason while the walker was inside `parallel` or `fanOut` settled the scope entry as a failure carrying the release's own text as an `L4000` scope-fault, and a resume with a healthy host then replayed that entry and threw. The one interruption the release mechanism exists to make safe permanently ended any run that happened to be inside a scope, while the identical stop at a sequential seam resumed cleanly. `RunReleased` now joins the classes a scope refuses to record as its outcome, so the scope stays pending and a resume re-enters and finishes it.
+
+## 0.36.0
+
+## 0.35.0
+
+## 0.34.0
+
+## 0.33.9
+
+## 0.33.8
+
+## 0.33.7
+
+## 0.33.6
+
+## 0.33.5
+
+## 0.33.4
+
+## 0.33.3
+
+## 0.33.2
+
+## 0.33.1
+
+## 0.33.0
+
+## 0.32.0
+
+## 0.31.0
+
+## 0.30.2
+
+## 0.30.1
+
+## 0.30.0
+
+## 0.29.2
+
+## 0.29.1
+
+## 0.29.0
+
+## 0.28.2
+
+## 0.28.1
+
+## 0.28.0
+
+## 0.27.0
+
+## 0.26.0
+
+## 0.25.0
+
+### Minor Changes
+
+- 0471af2: The driver hosts the version-2 compiled engine: a fresh run is stamped language version 2 and executes on the engine in its own locked-down worker thread, while every version-1 record keeps replaying on the tree-walker and a record whose version the build does not serve keeps refusing by name (L5023). The engine gains a bridged handler route for hosts whose effect handler is a live object: the handler and the durable journal store stay in the host process, and the worker forwards the effect seam over a message port, so effects stay durable pending-before-effect and no socket or credential enters the isolate holding the program. Failures cross the thread boundary whole: an EffectError keeps its code, kind and detail, a release keeps its reason, and a lost journal is regraded as the class the driver's outcome contract names. A race loser's cancellation crosses the bridge and fires the host handler's signal while the effect is still in flight (a cancel aimed at an effect that already answered does not cross, which is the only time a handler could not act on one anyway). The driver also refuses a malformed run record by its own name: a `languageVersion` that is not a string is released as malformed before the engine table is consulted, instead of being misread as an unserved version. A stop check that throws inside the host's poll is re-raised as the run's fault on the caller's stack rather than escaping as an uncaught exception.
+- dbeec0f: The language version belongs to the engine that runs a program, and a build declares which engines it hosts.
+
+  There are two engines and now two versions: the tree-walker is language version `1` and stays the
+  replay engine for every run recorded under it, and the compiled engine is version `2`, a different
+  language rather than a faster one, since `log` is data there and refuses code, and a step is a
+  transformed-site hit rather than a walker dispatch. `resolvePins` and `bindPins` take the version as
+  an argument, so each engine stamps its own and compares against its own; `WALKER_LANGUAGE_VERSION`
+  and `ENGINE_LANGUAGE_VERSION` are exported beside `LANGUAGE_VERSION`, which is an alias for the
+  current language, the engine's.
+
+  Bumping one shared constant was measured and is not available: the walker would stamp 2 and compare
+  1, and every walker fresh-run-then-resume round trip fails. Leaving it at 1 while the engine speaks
+  2 fails the other way, on records already written. Each engine stamping and comparing its own breaks
+  neither.
+
+  The run driver now holds a table of the versions this build hosts, ordered by declared precedence
+  rather than by a string sort. A fresh run is stamped with the version of the engine that will
+  actually execute it, and a record whose version no engine here serves is released by name with the new **L5023**,
+  naming both the version it met and the set this build serves, with the run left untouched: nothing
+  activated and nothing appended. It is released rather than failed or thrown, because a build that
+  cannot host a language has observed nothing about the program.
+
+  Migration: `resolvePins(options, now)` and `bindPins(recorded, options)` now require a third
+  argument, the calling engine's version. Callers inside this repo pass their own; an external caller
+  passes `WALKER_LANGUAGE_VERSION` to keep today's behaviour. Records do not cross between versions in
+  either direction, which was already true and is now enforced by the engine that meets them.
+
+- d3553be: `SimScript.checkpoints` no longer accepts an `at`, because the simulator never honoured one.
+
+  `SimHandler.checkpoint()` has two return paths and both stamp `at: this.virtualNow`, so a value
+  written into a checkpoint script was required by the type and then discarded. The cost was not the
+  wasted field, it was that every fixture carried a timestamp that meant nothing and read to the next
+  author as though the simulator were using it.
+
+  The scripted type is now `Omit<CheckpointResultValue, "at">`.
+
+  Migration: a checkpoint script written as a fresh object literal in the call itself is now a type
+  error if it passes `at`. Delete the field.
+
+  Know the limit as a RULE rather than as a list of shapes. Three earlier versions of this note gave a
+  list, of one shape, then two, then two escapes, and every one of them was short. The rule: the error
+  fires exactly where `SimScript` is already the expected type of the literal you are writing, and
+  nowhere else. Where it fires, the fix is deleting one field.
+
+  Stated that way it reaches the shapes a list kept missing. Writing the literal at a call that takes a
+  `SimScript`, under a `SimScript` annotation on a `const` or on a `let` you assign later, in a
+  parameter declared `SimScript`, and under `satisfies SimScript` are all errors now. It also settles
+  what escapes without a second list: anywhere the literal is typed before it meets this type, or is
+  never measured against it at all. A value whose type is inferred and only then passed by name
+  escapes, so does one put through an `as` cast, and so does one handed to a parameter declared
+  `unknown`. That last one is how the three sites in the runtime consumer escape: their helper takes
+  `script: unknown` and casts inside, so their literal is never checked against `SimScript` at all.
+  All of those still compile with `at` present and still have it discarded, silently, exactly as
+  before. Measured across the whole repository at this commit that is **seven pre-existing consumer
+  fixtures**, and three of them are in the runtime consumer rather than in this package's own tests,
+  so the discarded field is not confined to the package that defines the type. Two of the seven are
+  worth naming, because a first count of this missed them and a second reader found them: the two
+  scripts in `packages/lang/smoke/differential.smoke.ts` sit in a corpus whose tuple declares that
+  slot as `object`, so they are never measured against `SimScript` at all. That is the third escape
+  this paragraph lists, and it is the one a count reaches for last, because the other two at least
+  name the type they slip past. An eighth literal with `at` exists at this commit and is deliberately
+  not one of the seven: this change adds it, in
+  `packages/lang/smoke/sim.smoke.ts`, as the cell that proves the implementation discards a scripted
+  `at` on both return paths. It escapes the same way, through a parameter declared `unknown`, which
+  is the point of it. The type closes the
+  two idioms a new author reaches for first; it does not close the loophole.
+
+  Nothing about the value the simulator produces changes, because it was always stamped from virtual
+  time.
+
+  One more shipped type, and it moves in the same direction: `EngineCtx.call` declared
+  `args: unknown[] | (() => unknown[])` while the implementation writes
+  `typeof args === "function" ? await args() : args`. An async thunk is accepted at runtime and the
+  engine suite passes one deliberately, to prove the arguments arrive as a list rather than as a
+  promise, so the declaration was the half that was wrong. It is now
+  `unknown[] | (() => unknown[] | Promise<unknown[]>)`. Nothing about what the engine accepts changes;
+  a caller that was already passing an async thunk stops needing a cast to say so.
+
+  Those two are the whole of the shipped change. The rest of that work is test-tree only: the
+  `packages/lang` smoke files now typecheck under a check-only project, which is a gate, not a
+  behaviour.
+
+### Patch Changes
+
+- dc34423: `len` counts an array or a string and refuses every other kind in the language, so a function's host arity can no longer leak into a program value.
+
+  The builtin read `.length` off whatever it was handed. For a function that is the host's `Function.length`, and inside the interpreter it is the arity of the implementation's own wrapper: measured live before the fix, `len` of a program function answered 2 whatever parameters it declared, `len` of a builtin answered 0, `len` of a record, a number or a boolean silently answered undefined, and `len(null)` surfaced the host's TypeError text. A host-object internal was crossing into program values, against the language's determinism invariant: there is no ambient host property a program should reach.
+
+  `len` now accepts exactly the value kinds that have a length of their own, an array's elements and a string's units, and refuses every other kind with L4016 in the language, before the host is reached: no host property is read, no host error text appears, and the refusal is catchable. For a record's size, `len(keys(r))`. The spec's library-failure section and its change log carry the rule in the same change.
+
+- 445e110: A record may not carry a callable `then`, and the run that tries to build one now refuses it with L4021 instead of dying.
+
+  To the host's promise machinery any object with a callable `then` is a thenable, and resolving a promise with one calls the record's own `then` instead of delivering the value. Inside the interpreter every function is async, so a program-authored `then` that throws turned that throw into the rejection of a promise nobody owns: it escaped `run()` as an unhandled rejection and killed the host process, while the await that adopted the record never settled and the run hung behind it with its journal and its lease. Measured live before the fix: a program returning `{ then: () => { throw { code: "stray-then" } } }` from a function left the host dead with an unowned rejection and `run()` forever pending.
+
+  The refusal is at the write, on every route that can put a member on a record: a literal key or a computed one, in an object literal, a spread, a rest pattern, or a member assignment. No thenable value ever exists for the machinery to adopt, on any path, the same way the language carries no sparse arrays and no `__proto__` fields. A `then` that is not callable is untouched data, and functions under any other member name are unaffected. The spec's record rules (§4.3), its error catalog, and its change log carry the rule in the same change.
+
+## 0.24.0
+
+### Minor Changes
+
+- 9939dcc: The pure fragment of cotal-lang is JavaScript, and the run's outcomes are decided by recorded facts.
+
+  One syntax table now drives both the validator and the interpreter, so every construct the language
+  admits executes and every one it refuses carries a code with a fix: compound assignment (`+=`, which
+  had behaved as `=`), `++`/`--`, `**` and the bitwise operators, optional chaining, rest parameters,
+  logical assignment, `undefined` as a nameable value, per-iteration `for (let …)` bindings, braced
+  `switch` cases; `==`, the comma operator, `void`, `__proto__` and syntax outside the table are
+  refused statically. Member access reaches no host prototype: records answer their own fields, arrays,
+  strings and numbers answer a curated method table with JavaScript's meaning (`xs.map`, `s.trim()`,
+  `n.toFixed()`, the array mutators), and `sort` and `json` are declared. Records and arrays a program
+  builds are writable by the frame that built them and freeze when they cross an effect boundary
+  (L2031); a value born outside a concurrent branch cannot be written inside it, through any alias
+  (L2032). An effect input with no canonical form is refused at the boundary before any entry is
+  written (L3041, L3042 for a function). A workflow's `catch` now never sees a divergence or a
+  migration walk's refusal, alongside the cancellation, refused append and host release it already
+  could not see. `xs.length = n` truncates as in JavaScript; a longer length is L4017 (holes are not a
+  value here). The never-built names `any` and `all` are no longer reserved. Host errors from builtins
+  are L4016.
+
+  The binding, selection and completion rules are JavaScript's too. A `let`/`const` binds its whole
+  block: a straight-line reference above the declaration is refused when the program is read (L2004,
+  the temporal dead zone made static), a closure over a later binding stays legal and finds the dead
+  zone at run time only if called early, parameters bind left to right so a default sees only the
+  parameters before it, and a named function expression binds its own name inside itself. `default`
+  written above a matching case no longer shadows it, and a `finally` completion (return, break,
+  throw) replaces the try's or catch's — while an uncatchable fault (divergence, refused append,
+  release, cancellation, walk refusal) now unwinds past `finally` too, so cleanup can neither act on
+  nor replace a fault the program was never allowed to see. Bigint literals are refused (L1030).
+
+  Values do not coerce through the host and methods are not values: a record, array or function where
+  a primitive is needed (`+`, comparisons, unary `-`/`+`/`~`, `${...}`) is L4018 instead of the
+  host's ToPrimitive machinery, an array index write past the end is L4019 instead of a hole (at the
+  length it appends), and a bare method read (`xs.map` without the call) is L4020 — a method is
+  looked up at the call. The curated methods keep their namesakes' meaning under mutation (the length
+  is captured before the first callback) and in replacement strings (`$&` and friends mean what
+  JavaScript says); `sort`'s order is genuinely total (kinds rank, NaN after every number);
+  `json.stringify` refuses a value with no canonical form instead of silently dropping or nulling it,
+  and `json.parse` refuses a `"__proto__"` key exactly as the literal does (L4016).
+
+  Freeze-on-share holds at the share, in both directions: every admitted effect argument is deep-
+  frozen when it is dispatched, and a journal seeded from serialized entries freezes them on the way
+  in, so a replayed result is as immutable as the live one was. The crossing boundary refuses a
+  sparse array's holes, a cycle, and a minted own `__proto__` field by name (diamonds still cross).
+
+  And a scope's clock survives resume: the scope entry is stamped with the joined branch clock at
+  settle — the value `now()` answers after the scope, live — so a resume answers the same `now()` and
+  takes the same path. A cancelled race arm whose in-flight effect lands past the settled frontier is
+  cut there instead of burning the step budget on a verdict from its old clock (an arm landing before
+  the frontier can still win), and a cancellation that arrives while an effect's `begin` append is in
+  flight settles the pending entry cancelled and never dispatches the handler.
+
+  A live `race` is decided by the arms' recorded clocks and declaration order and never by the
+  scheduler: a loser is cut short in pure work only once it can no longer win, so no `yieldEvery` value
+  selects the winner. Two new suites hold this: `semantics.smoke` runs the same pure programs on the
+  interpreter and on node and requires identical output, and `surface.smoke` holds the syntax table
+  and the library tables to the implementation, and validates every example in the language reference
+  and the guide when those files are present.
+
+- b7cc4fa: Host a cotal-lang run on the mesh.
+
+  `@cotal-ai/lang` gains the durability the language rested on but did not have: run pins with a
+  run clock, scope journal entries that record a race's winner and its losers so a replay resolves
+  the same arm, a refusal when a resume is handed a journal without the pins that decide it, and an
+  effect ceiling read from the pins rather than a default.
+
+  `@cotal-ai/core` gains the step journal's storage plane, the run record and its lease, the
+  checkpoint answer record, and the notice and migration records.
+
+  `@cotal-ai/runtime` is new: the mesh handler that performs a program's effects on the real planes
+  (durable pauses on the checkpoint plane, event awaits over durable consumers, notices), the
+  `RunDriver` the manager daemon hosts, journal-replay resume, migration onto edited source, and a
+  fork that redoes work under a new run id. Effects that need durable actions refuse through one
+  named seam rather than pretending to succeed.
+
+## 0.23.0
+
+## 0.22.0
+
+## 0.21.0
+
+## 0.20.1
+
+## 0.20.0
+
+## 0.19.0
+
+### Patch Changes
+
+- 758e1e3: Pin `json-canonicalize` exactly, so a published install cannot resolve a broken tarball.
+
+  `json-canonicalize@2.0.1` was published without the `bundles/` directory its own `package.json`
+  `main` points at. A `^2.0.0` range therefore resolves, on any fresh install, to a package that
+  cannot be imported: `cotal --version` crashes with `ERR_MODULE_NOT_FOUND` before printing
+  anything.
+
+  The repo never saw it. A lockfile pins 2.0.0 and CI stayed green throughout; a published package
+  carries no lockfile, so npm re-resolves every range at install time and users got a version CI had
+  never exercised. That gap between what CI resolves and what an install resolves is the actual
+  defect this fixes.
+
+  Both ranges are now exact, and `smoke:dep-pins` keeps them that way: it fails if either floats
+  back to a range, and fails if its quarantine list stops matching any declared dependency, so a
+  list that has quietly stopped applying cannot read as a list that holds.
+
+  Stated as a limit rather than left implied: the new cell proves the range is exact, not that the
+  pinned version is installable. Only installing the packed tarball against the live registry proves
+  that, which is `smoke:seed-tarball:live` - and that suite sits outside `smoke:ci`, so the
+  instrument that would have caught this incident exists and does not run. Wiring it into the gate
+  is a separate decision about live-network tests in CI, not something this change makes quietly.
+
+## 0.18.0
+
+### Minor Changes
+
+- df4d37e: Version `@cotal-ai/lang` with the rest of the workspace. It is a public package (`packages/lang`, alongside `core` and `workspace`) but was missing from the `fixed` group, so Changesets never bumped it: it stayed pinned at 0.15.0 while every other package moved, and `pnpm publish -r` would have pushed a version permanently out of lockstep with the release it shipped in. Joining the group means it versions and publishes with everything else.

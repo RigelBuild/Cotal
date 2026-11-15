@@ -1,0 +1,248 @@
+/**
+ * LIVE PROBE (F-d1): `cotal up --restore` must reach its listener-bind boundary, and its re-entry
+ * must complete, while the process holds the root maintenance lock.
+ *
+ * The other half of the corner the P2 lock hand-off opened, and the more severe half. `up --restore`
+ * re-enters `up()` for the commit pass, and since P2 that re-entry always holds `startupLock`. The
+ * restore-side journal writers in lib/restore.ts took no lock parameter and self-acquired, so they
+ * refused against a lock this same process already owned: the lock is not reentrant, and it cannot
+ * stale-reap its way out because the recorded owner is alive — it is us. The FIRST of them to fire
+ * is `bindPreparedRestoreListener`, so the restore died before any of the later seams, and the
+ * command did not run at all.
+ *
+ * The sibling probe (up-adopt-resume-lock:live) covers the adopt paths. Neither covers the other:
+ * that one enters through a resume with no artifact and would stay green through this break.
+ *
+ * Driven through the REAL command, as a subprocess, against a REAL broker:
+ *
+ *  1. CONTROL - reach an interrupted restore: boot, cut with state preserved, take a registry
+ *     artifact. Without all three the restore below has nothing to restore FROM, and a red would be
+ *     the fixture failing rather than the subject.
+ *  2. SUBJECT A - the first `up --restore` reaches the listener-bind boundary (exit 86). This is the
+ *     regression itself: it exited 1 on a maintenance-lock refusal, which is asserted against BY
+ *     NAME, because a bare non-zero check would report this finding for an unrelated failure.
+ *  3. CONTROL - that pass left `commit-intent` with a bound listener still ALIVE, the precondition
+ *     for the re-entry to take the resume branch rather than start over.
+ *  4. SUBJECT B - the restore re-entry completes (exit 0) under that same inherited lock.
+ *  5. SUBJECT C - the mesh record that re-entry writes for the listener it adopted keeps the attach
+ *     host, the session ceiling and the store cap the restored broker runs with (#3977).
+ *
+ * Sandboxes COTAL_HOME under a scratch base with proven-clean `.cotal` ancestry; kills only its own
+ * children. Needs `nats-server` on PATH.
+ * Run: pnpm smoke:up-restore-reentry:live
+ */
+import { spawn, spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { join, resolve as resolvePath } from "node:path";
+import { assertSmokeSandboxDown, freePort, recordSmokeSandbox } from "@cotal-ai/smoke-kit";
+import { makeScratch, assertScratchHeld } from "../../../bin/smoke/_scratch.js";
+
+const scratch = makeScratch("cotal-up-restore-reentry-");
+const home = mkdtempSync(join(scratch, "home-"));
+const root = mkdtempSync(join(scratch, "root-"));
+const configDir = join(home, "xdg");
+const sandbox = recordSmokeSandbox({ root, cotalHome: home, xdgConfigHome: configDir });
+process.env.COTAL_HOME = home;
+
+const WT = resolvePath(import.meta.dirname, "..", "..", "..");
+const CLI = join(WT, "bin", "cotal.ts");
+const TSX = join(WT, "node_modules", ".bin", "tsx");
+const journalPath = join(root, ".cotal", "maintenance", "v1", "journal.json");
+const prepareIntentPath = join(root, ".cotal", "maintenance", "v1", "prepare-intent.json");
+const artifact = join(root, "registry-backup");
+const coreDist = join(WT, "packages", "core", "dist", "index.js");
+const openConfPath = join(root, ".cotal", "server-open.conf");
+// Roomy enough for the fixture's real writes; what is under test is that the record keeps it.
+const CAP = 17179869184;
+const recorded = (space: string): { attachHost?: unknown; maxSessions?: unknown; maxFileStore?: unknown } | undefined => {
+  const dir = join(home, "meshes");
+  for (const f of existsSync(dir) ? readdirSync(dir).filter((n) => n.endsWith(".json")) : []) {
+    const entry = JSON.parse(readFileSync(join(dir, f), "utf8")) as { space?: string; attachHost?: unknown; maxSessions?: unknown; maxFileStore?: unknown };
+    if (entry.space === space) return entry;
+  }
+  return undefined;
+};
+
+// A bare unmanaged endpoint the manager did not spawn: the ten-line idle-endpoint shape from
+// console-control.smoke.ts (:68-78), copied because that suite does not export it. It registers
+// presence on the mesh with the manager's own env and idles until killed.
+const UNMANAGED_CHILD = [
+  "const{pathToFileURL}=require('node:url');",
+  "import(pathToFileURL(process.env.CORE_DIST).href).then(async({CotalEndpoint})=>{",
+  "const ep=new CotalEndpoint({space:process.env.COTAL_SPACE,servers:process.env.COTAL_SERVERS,",
+  "channels:[],consume:false,registerPresence:true,watchPresence:false,",
+  "card:{name:process.env.COTAL_NAME,kind:'agent',role:'worker'}});",
+  "ep.on('error',()=>{});await ep.start();setInterval(()=>{},1000);});",
+].join("");
+
+let pass = 0;
+const ok = (name: string, cond: boolean, extra?: unknown) => {
+  if (!cond) throw new Error(`FAIL: ${name}${extra !== undefined ? ` - ${JSON.stringify(extra)}` : ""}`);
+  pass++;
+  console.log(`  ✓ ${name}`);
+};
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * The ambient environment with every `COTAL_` key stripped, then this smoke's own sandbox put back.
+ *
+ * A suite can be run from a mesh-joined session, and that environment carries a live credential path
+ * and a live broker URL. The child here is the real `cotal` CLI, which DOES read connection material,
+ * so spreading `process.env` in unfiltered points it at the CALLER's mesh instead of this sandbox —
+ * and it would pass while doing it, which is the failure mode worth naming: not a red, a false green.
+ * Strip first, then re-add the one variable the children are meant to see.
+ * Enforced by bin/smoke/suite-ambient-env.smoke.ts.
+ */
+const baseEnv = (() => {
+  const copy = { ...process.env };
+  for (const key of Object.keys(copy)) if (key.startsWith("COTAL_")) delete copy[key];
+  return { ...copy, COTAL_HOME: home, XDG_CONFIG_HOME: configDir, COTAL_SKIP_CONNECTOR_SEED: "1" };
+})();
+
+/** Blocking `cotal <args>`, the way an operator runs it. */
+function runSync(args: string[], extraEnv: Record<string, string> = {}) {
+  const options = {
+    cwd: root,
+    env: { ...baseEnv, ...extraEnv },
+    encoding: "utf8" as const,
+    timeout: 240_000,
+  };
+  assertSmokeSandboxDown(sandbox, args, options);
+  return spawnSync(TSX, [CLI, ...args], options);
+}
+
+const tail = (r: { stdout?: string; stderr?: string }) => `${r.stdout ?? ""}${r.stderr ?? ""}`;
+
+type Journal = { state?: string; listenerProof?: { processOwner?: { pid?: number } } };
+const journal = (): Journal =>
+  existsSync(journalPath) ? (JSON.parse(readFileSync(journalPath, "utf8")) as Journal) : {};
+
+const alive = (pid: number | undefined): boolean => {
+  if (!Number.isInteger(pid) || (pid ?? 0) <= 0) return false;
+  try { process.kill(pid as number, 0); return true; } catch { return false; }
+};
+
+try {
+  mkdirSync(join(root, ".cotal"), { recursive: true });
+  assertScratchHeld(root, "up restore re-entry fixture");
+
+  const port = await freePort();
+  const server = `nats://127.0.0.1:${port}`;
+  const space = "restore_alpha";
+
+  console.log("1) CONTROL: a preserved mesh and an artifact to restore from");
+  const first = runSync(["up", "--detach", "--open", "--server", server, "--space", space, "--host", "127.0.0.1", "--max-sessions", "7", "--max-file-store", String(CAP)]);
+  ok("the ordinary boot exited 0", first.status === 0, tail(first).slice(-1200));
+
+  // The cut describes the manager over the ep rails, so it must not be taken until the manager has
+  // finished registering there. `up --detach` returns ~2s BEFORE that registration lands (measured,
+  // 3/3 on an idle box), and a describe issued into the gap can miss the registration and then wait
+  // out its whole 10s deadline rather than retry - a refusal reproduced 1-in-4 with no load at all.
+  // A registry write is the cheapest question that only answers once the manager is there. A rail
+  // that never answers is a broken fixture, not the residual, so this waits rather than reporting
+  // the cut's refusal as the finding.
+  let railsUp = false;
+  for (let i = 0; i < 30 && !railsUp; i++) {
+    if (runSync(["channel", "set", "railprobe", "--desc", "rails", "--space", space]).status === 0) railsUp = true;
+    else await sleep(5_000);
+  }
+  ok("the manager answers on the ep rails before the cut", railsUp);
+
+  console.log("\n1b) SUBJECT: a live unmanaged endpoint refuses the cut, then leaves the manager unfenced");
+  const unmanaged = spawn(process.execPath, ["-e", UNMANAGED_CHILD], {
+    cwd: root,
+    env: { PATH: process.env.PATH ?? "", CORE_DIST: coreDist, COTAL_SPACE: space, COTAL_SERVERS: server, COTAL_NAME: "bystander" },
+    stdio: "ignore",
+    detached: true,
+  });
+  unmanaged.unref();
+  const { readPresenceWithoutConsumer } = await import("../src/commands/down.js");
+  let onRoster = false;
+  for (let i = 0; i < 30 && !onRoster; i++) {
+    const observed = await readPresenceWithoutConsumer(space, server);
+    if (observed.roster.some((presence) => presence.card.name === "bystander")) onRoster = true;
+    else await sleep(1_000);
+  }
+  ok("the unmanaged endpoint reaches the roster", onRoster);
+
+  const refused = runSync(["down", "--preserve-state"]);
+  const refusedLog = tail(refused);
+  ok("a live unmanaged endpoint refuses the cut before any child stops",
+    refused.status !== 0 && /cannot preserve while unmanaged endpoints are live: bystander/.test(refusedLog),
+    { status: refused.status, log: refusedLog.slice(-1200) });
+
+  const psAfterRefusal = runSync(["ps", "--space", space, "--server", server]);
+  ok("a refused prepare leaves the manager answering ps, not fenced",
+    psAfterRefusal.status === 0 && !/preserving mode/.test(tail(psAfterRefusal)),
+    { status: psAfterRefusal.status, log: tail(psAfterRefusal).slice(-1200) });
+
+  ok("a refused prepare clears its intent", !existsSync(prepareIntentPath));
+
+  if (unmanaged.pid) try { process.kill(unmanaged.pid, "SIGKILL"); } catch { /* already gone */ }
+  let offRoster = false;
+  for (let i = 0; i < 30 && !offRoster; i++) {
+    const observed = await readPresenceWithoutConsumer(space, server);
+    if (!observed.roster.some((presence) => presence.card.name === "bystander")) offRoster = true;
+    else await sleep(1_000);
+  }
+  ok("the unmanaged endpoint leaves the roster once killed", offRoster);
+
+  const cut = runSync(["down", "--preserve-state"]);
+  ok("the cut exited 0", cut.status === 0, tail(cut).slice(-1200));
+  const made = runSync(["backup", "create", artifact, "--only", "registry"]);
+  ok("the registry backup exited 0", made.status === 0, tail(made).slice(-1200));
+
+  console.log("\n2) SUBJECT A: the first `up --restore` reaches the listener-bind boundary");
+  const restore = runSync(
+    ["up", "--restore", artifact, "--detach", "--server", server, "--space", space, "--max-file-store", String(CAP)],
+    { COTAL_SMOKE_EXIT_AFTER_RESTORE_LISTENER_BIND: "1" },
+  );
+  const restoreLog = tail(restore);
+  ok("the restore did not fail on a maintenance-lock refusal",
+    !/held by a live owner|holds this root|recovery is already in progress|maintenance lock/i.test(restoreLog),
+    { status: restore.status, log: restoreLog.slice(-2000) });
+  ok("the restore stopped at the listener-bind boundary (exit 86)", restore.status === 86,
+    { status: restore.status, log: restoreLog.slice(-2000) });
+
+  await sleep(1500);
+  console.log("\n3) CONTROL: it left commit intent with a LIVE bound listener");
+  const intent = journal();
+  ok("the journal is `commit-intent`", intent.state === "commit-intent", intent.state);
+  const boundPid = intent.listenerProof?.processOwner?.pid;
+  ok("…and its bound listener is ALIVE (the re-entry precondition)", alive(boundPid), { boundPid });
+  const jetstream = existsSync(openConfPath) ? readFileSync(openConfPath, "utf8").split("\n").filter((l) => l.startsWith("jetstream")).join("\n") : "";
+  ok("…and that listener runs with the restore's store cap", jetstream.includes(`max_file_store: ${CAP}`), jetstream);
+
+  console.log("\n4) SUBJECT B: the restore RE-ENTRY completes under the inherited lock");
+  const recovered = runSync(["up", "--detach", "--server", server, "--space", space]);
+  const log = tail(recovered);
+  ok("the re-entry did not fail on a maintenance-lock refusal",
+    !/held by a live owner|holds this root|recovery is already in progress|maintenance lock/i.test(log),
+    { status: recovered.status, log: log.slice(-2000) });
+  ok("the restore re-entry exited 0", recovered.status === 0, { status: recovered.status, log: log.slice(-2000) });
+
+  console.log("\n5) SUBJECT C: the adopted listener's mesh record keeps what that broker runs with");
+  const adopted = recorded(space);
+  ok("the adopted record keeps the attach host and the session ceiling",
+    adopted?.attachHost === "127.0.0.1" && adopted.maxSessions === 7, adopted);
+  ok("…and the store cap the restored broker runs with", adopted?.maxFileStore === CAP, adopted);
+
+  runSync(["down"]);
+  console.log(`\nUP RESTORE RE-ENTRY SMOKE OK ✅  (${pass} passed)`);
+} catch (e) {
+  console.error("  ✗ FAIL:", (e as Error).message);
+  process.exitCode = 1;
+} finally {
+  try { runSync(["down"]); } catch { /* best effort */ }
+  await sleep(500);
+  // Every runtime record this root holds, whatever space each belongs to. The records are
+  // space-keyed now (`manager.<hex>.pid`), and a teardown running after a failure cannot assume
+  // which spaces got as far as writing one, so it matches the SHAPE rather than a fixed name list.
+  // The pre-segmentation root-scoped spelling matches too, so a root an older build left behind is
+  // still swept.
+  for (const name of readdirSync(join(root, ".cotal")).filter((n) => /^(nats|manager|delivery)\.([^.]+\.)?pid$/.test(n))) {
+    const pid = Number.parseInt(readFileSync(join(root, ".cotal", name), "utf8").trim(), 10);
+    if (Number.isInteger(pid) && pid > 0) try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ }
+  }
+  rmSync(scratch, { recursive: true, force: true });
+}

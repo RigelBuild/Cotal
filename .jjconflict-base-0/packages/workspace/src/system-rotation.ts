@@ -1,0 +1,216 @@
+import { existsSync, lstatSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import {
+  credsClaims,
+  mintConnectionEvictorCreds,
+  mintMembershipObserverCreds,
+  newIdentity,
+  rotateSystemAccount,
+  writeSecretFileAtomic,
+  type SpaceAuth,
+} from "@cotal-ai/core";
+import { assertSingleSpaceBroker, authDir, getSpaceAuth, putSpaceAuth } from "./auth-paths.js";
+import { workspaceSecretStore } from "./secret-store-fs.js";
+import { retainSystemSigningSeed } from "./system-signing-seed.js";
+import { credentialFileExposure, readLocalRecordSource } from "./protected-records.js";
+import {
+  connectionEvictorCredsKey,
+  CONNECTION_EVICTOR_CREDS_KIND,
+  membershipObserverCredsKey,
+  MEMBERSHIP_OBSERVER_CREDS_KIND,
+  migrateLegacyCotalMaterial, type MaterialPathOptions,
+} from "./space-segmentation.js";
+
+/**
+ * The class-3 ($SYS) renewal owner's half, the counterpart to `renewal.ts`, which owns the class-2
+ * standing renewal and deliberately EXCLUDES these two files.
+ *
+ * `membership-observer.creds` and `connection-evictor.creds` are `rotation-renewed`: they are signed
+ * by the system-account seed, which the trust record omits (`putSpaceAuth` strips it; the root's
+ * separate custody record, see `system-signing-seed.ts`, serves own-broker caller issuance only), so
+ * no running process re-signs them for their existing identity the way `remintDaemonCreds` does. Their only
+ * renewal is a system-account ROTATION: a fresh $SYS account under the SAME broker operator, fresh
+ * creds minted from its in-memory seed, and a broker that reloads the new operator/system JWTs.
+ *
+ * That rotation is NOT destructive. `rotateSystemAccount` re-signs the operator JWT with a new
+ * `system_account` using the operator's own (unchanged) seed, so the space's DATA account, its
+ * signing key, every agent credential minted from it, and the JetStream store all survive untouched.
+ * What dies is exactly what should: the retired system account and any copy of the old $SYS creds.
+ *
+ * The one thing this module cannot do is make the broker load the result. Rotation is only complete
+ * once the broker restarts on a `server.conf` rendered from the rotated record, which is why the
+ * operator surface is `cotal up --rotate-sys` (the one command that already renders that config and
+ * boots the broker + daemons from it) rather than a standalone verb that would leave the mesh in a
+ * half-rotated state.
+ *
+ * WORKSTATION ONLY, deliberately: unlike `renewal.ts`, nothing here takes a {@link SecretStore}. The
+ * $SYS pair lives on the raw FS with no store seam, and the multi-tenant guard below reads the FS
+ * account records, which an injected store could neither supply nor be enumerated for. See
+ * {@link rotateSystemCreds}.
+ */
+
+/** The two $SYS credential KINDS, in rotation-write order. They stay on the raw FS, with no injected
+ *  secret-store seam: renewing them means rewriting the broker config too, so the pair and the trust
+ *  record move together or not at all, which is not something a store can hold half of. Named here so
+ *  the rotation writer, the staleness check and `cotal clean`'s removal list cannot drift apart —
+ *  which is also why they are the KIND constants and not a second pair of literals (P7 made the
+ *  kind and the location two different strings; a literal here would silently stay the old one). */
+export const SYSTEM_CREDS_FILES = [MEMBERSHIP_OBSERVER_CREDS_KIND, CONNECTION_EVICTOR_CREDS_KIND] as const;
+
+export interface SystemRotationResult {
+  /** The broker record's new system-account generation (the successor discriminator `putSpaceAuth` guards). */
+  gen: number;
+  /** The rotated bundle. The caller MUST render `server.conf` from this, not from its pre-rotation copy. */
+  auth: SpaceAuth;
+  /** Expiry (epoch sec) of the freshly minted $SYS creds, so the caller can print the next rotation date. */
+  expiresAt?: number;
+}
+
+/**
+ * Rotate the space's system account and re-mint both $SYS creds against it.
+ *
+ * `expectedSpace` is validated by `getSpaceAuth` against the store's signer, the same cross-space
+ * guard `remintDaemonCreds` runs: rotating with a foreign space's operator would re-issue an operator
+ * JWT this broker does not trust and strand every account under it.
+ *
+ * Ordering is the safety property, and it is a DIRECTIONAL one, not atomicity. All MINTING (the
+ * rotation and both creds) happens in memory before anything is persisted, so a mint failure changes
+ * nothing on disk. Then the trust record commits, where `putSpaceAuth`'s generation guard refuses a
+ * stale or non-successor write. Then the creds land. What this buys is a single failure direction: a
+ * cred file is never overwritten for a system account the record does not already carry, because the
+ * inverse order could clobber the last-good creds with creds for an authority the broker will never
+ * load, which is the availability loss `remintDaemonCreds` guards on its own class.
+ *
+ * It does NOT make the persistence atomic. `putSpaceAuth` is two puts and the creds are two more, so
+ * a crash leaves the record AHEAD of the creds. That state is detected rather than prevented (see
+ * {@link staleSystemCreds}) and is repaired by re-running the rotation.
+ *
+ * THROWS rather than degrading: a stripped signer (no operator seed) cannot rotate, and a caller that
+ * ignored the throw would boot a broker whose config still carries the retired system account.
+ */
+export async function rotateSystemCreds(root: string, expectedSpace: string): Promise<SystemRotationResult> {
+  // A rotation is BROKER-wide, not space-wide, however it is spelled: the system account lives in
+  // the shared broker record and the re-issued operator JWT names the successor for every space
+  // under it, while the two $SYS cred files are per-ROOT (one pair, its observer permissions pinned
+  // to ONE data account). So on a multi-tenant root, "rotate space A" would retire space B's system
+  // account and leave no cred that can observe B. Same guard, same reason, as `cotal down`,
+  // `cotal backup`, `cotal clean` and `cotal up --restore`.
+  //
+  // The guard reads the FS account records, and that is exactly why this function takes NO
+  // SecretStore. `SecretStore` cannot enumerate, so an injected multi-tenant store paired with an
+  // empty local root would sail past this check and retire the system account for every tenant in
+  // it: a guard that looks broker-wide while enforcing nothing. Taking the store away makes the
+  // mismatch impossible to express rather than merely refused at runtime, and it costs nothing real:
+  // the $SYS pair is FS-only anyway (a hosted composition has nowhere in the store to put it), so
+  // this operation was never store-composable to begin with. If store enumeration ever exists, this
+  // becomes a real hosted seam; until then it is a workstation operation and says so.
+  assertSingleSpaceBroker(authDir(root), "a system-account rotation (`cotal up --rotate-sys`)");
+  const s = workspaceSecretStore(root);
+  const auth = await getSpaceAuth(s, expectedSpace);
+  if (!auth)
+    throw new Error(`rotateSystemCreds: no trust record for space "${expectedSpace}" - there is no system account to rotate`);
+  if (!auth.operator.seed)
+    throw new Error(
+      "rotateSystemCreds: the broker operator seed is required to rotate the system account (this root holds a stripped signer) - run the rotation where the broker trust record lives",
+    );
+
+  // In-memory first: the rotation and BOTH mints must succeed before anything is persisted.
+  const rotated = await rotateSystemAccount(auth);
+  const observer = await mintMembershipObserverCreds(rotated, newIdentity());
+  const evictor = await mintConnectionEvictorCreds(rotated, newIdentity());
+
+  // Commit the trust record FIRST: the generation guard lives in this call, and it is what makes the
+  // successor real. Only then the creds that record authorizes.
+  //
+  // This is NOT one atomic act, and the code must not pretend otherwise: `putSpaceAuth` is itself two
+  // puts, and the two cred writes are two more. A crash anywhere in this sequence leaves the record
+  // AHEAD of the creds: both files stale (crash before either write) or one stale (crash between
+  // them). The window is not closed here; it is DETECTED, by {@link staleSystemCreds}, which every
+  // boot and every `doctor auth` runs against the persisted record. It cannot be repaired in place
+  // either: nothing re-signs these two creds in place after this call returns, so the only repair is
+  // another rotation, which is idempotent and costs one generation. A durable rotation journal would
+  // close the window instead of reporting it; that is deliberately not built for a display-only feed
+  // plus an eviction rail whose recovery is one re-run.
+  //
+  // Each file is still written atomically, so no reader can ever see a half-written credential.
+  //
+  // Written through the per-kind resolvers (P7 §2 rule 1) rather than a hand-composed
+  // `join(root, ".cotal", …)`: the pair is per-SPACE now, and this is a workstation-only operation,
+  // so the composition is the FS one by construction. The store's `put` is the same
+  // `mkSecretDir` + `writeSecretFileAtomic` the raw write used, and it is what creates the
+  // `space.<hex>/` dir on a root whose pair has never been segmented.
+  const composition = { injected: false as const, root };
+  await putSpaceAuth(s, rotated);
+  await retainSystemSigningSeed(s, rotated); // the successor's seed replaces the retired account's
+  await s.put(membershipObserverCredsKey(expectedSpace, composition), observer);
+  await s.put(connectionEvictorCredsKey(expectedSpace, composition), evictor);
+
+  return { gen: rotated.gen ?? 0, auth: rotated, expiresAt: credsClaims(observer).exp };
+}
+
+/** A $SYS credential file on disk that the persisted trust record does NOT authorize. */
+export interface StaleSystemCred {
+  file: string;
+  /** The retired system account that signed it; absent when the file could not be parsed. */
+  iss?: string;
+}
+
+/**
+ * The $SYS cred files whose issuer is not `sysPub`: the ONE staleness question, asked in one place
+ * so every surface answers it identically.
+ *
+ * This exists because expiry cannot see the failure. A rotation that committed the trust record and
+ * then died leaves credential files that parse, are nowhere near their expiry, and are refused by the
+ * broker, because the account that signed them no longer exists as far as the successor config is
+ * concerned. Comparing the two files to each other is not enough either: a crash BEFORE either write
+ * leaves them stale but mutually consistent. Only the persisted record settles it, which is why this
+ * takes `sysPub` and why the callers are the two surfaces that hold it: the boot path, which warns
+ * before it renders a config the files cannot serve, and `cotal doctor auth`, which must never call
+ * this state healthy. The delivery daemon is deliberately NOT a caller: it never loads the signer.
+ *
+ * Absent files are not stale (an unprovisioned space is a different, separately reported state), and
+ * the mutating/default path reports an unreadable file with no `iss`. A read-only observation
+ * refuses a required migration or an unreadable protected input instead of guessing issuer state,
+ * except a file other accounts can open: it is left unjudged, because the read-only caller reads
+ * each file itself and names that exposure and its repair.
+ */
+export function staleSystemCreds(root: string, sysPub: string, space: string, options: MaterialPathOptions = {}): StaleSystemCred[] {
+  const stale: StaleSystemCred[] = [];
+  for (const file of SYSTEM_CREDS_FILES) {
+    // The CHOKE POINT, called for its path (P7 §2 rule 1). A reader, not a writer — but it must not
+    // read the canonical location without moving a legacy pair into it first: reading past an
+    // unmigrated pair would answer "absent, therefore not stale" for the exact half-rotated state
+    // this function exists to catch, and both surfaces that call it (the boot path, `doctor auth`)
+    // are the first thing to touch these creds on a root `up` has not re-provisioned. A §2 rule 3/4
+    // refusal propagates, loudly, rather than being swallowed into a healthy-looking answer.
+    const path = migrateLegacyCotalMaterial(root, space, file, options);
+    if (!existsSync(path)) continue;
+    let iss: string | undefined;
+    try {
+      if (options.readOnly) {
+        const bytes = readLocalRecordSource(path, 1024 * 1024, true);
+        if (!bytes) continue;
+        iss = credsClaims(new TextDecoder("utf-8", { fatal: true }).decode(bytes)).iss;
+      } else iss = credsClaims(readFileSync(path, "utf8")).iss;
+    } catch (error) {
+      if (options.readOnly) {
+        if (exposedFile(path)) continue;
+        throw error;
+      }
+      stale.push({ file }); // unreadable: cannot be shown to match, so it is not assumed to
+      continue;
+    }
+    if (iss !== sysPub) stale.push({ file, iss });
+  }
+  return stale;
+}
+
+/** Whether `path` is a regular file other accounts own or can open. */
+function exposedFile(path: string): boolean {
+  try {
+    const stat = lstatSync(path);
+    return stat.isFile() && credentialFileExposure(path, stat) !== undefined;
+  } catch {
+    return false;
+  }
+}

@@ -1,0 +1,187 @@
+{
+  "suite": [
+    "extensions/connector-core/smoke/agui-holder.smoke.ts"
+  ],
+  "guard": "after a failure the holder re-establishes the plane itself on a doubling, capped backoff, by a fresh start that replaces the emitter whether or not it halted; the backoff resets only after a pump returns; close cancels a pending re-establish; the seat never stops for the plane; every terminal of an outage is reported with the source position taken at the hook and handed to the fresh emitter before its pump, whether it arrives while down, while the fresh start is in flight, or during the recovery pump; the terminals and the last turn begun a dying emitter held are carried to the next one",
+  "command": "pnpm smoke:agui-holder",
+  "completionMarker": "agui-holder smoke:",
+  "proveWith": "node scripts/mutation-proof.mjs --config extensions/connector-core/smoke/mutations/agui-holder-revive.json",
+  "why": [
+    "THE DEFECT THIS GUARDS WAS A SEAT THAT STOPPED. On a space that requires events the holder's",
+    "first failure ended the seat (exit 1), which Claude Code showed as 'MCP server cotal has",
+    "disconnected' and restarted on the next tool call: once per keystroke, with a dropped mesh",
+    "connection each time. Measured on two live sessions on 2026-10-12. The holder now re-establishes",
+    "the plane in process and the seat keeps its connection.",
+    "",
+    "THE SECOND DEFECT WAS A PLANE THAT NEVER CAME BACK. The first cut kept a running emitter across",
+    "the re-establish, and a failure that leaves the emitter running leaves it running with state the",
+    "log never accepted: a frame frozen pending by a failed publish, or a mapper holding a run the log",
+    "never opened. Every later pump refused, forever, behind a retry every minute. Measured with the",
+    "real reader, mapper, log and frontier on 2026-10-12 (Sol's review probe and the live seat test).",
+    "",
+    "R1 makes a failure terminal again, so the re-establish cell reds. R2 flattens the backoff, so the",
+    "doubling cell reds. R3 drops the cancel on close, so the revive after close clears the failure a",
+    "closed holder is supposed to keep readable. R4 keeps a running emitter across the re-establish,",
+    "so the wedged emitter is pumped again and never replaced. R5 resets the backoff when a start",
+    "lost and the next prompt closes the run as a finish. R9 drops the last turn begun from what a",
+    "dying emitter hands back, so a terminal for a turn that opened no run is placed on the run the log",
+    "has open. R7 takes the source position at the hand-over instead of at the hook, so a terminal",
+    "reported before the next prompt was written is placed on that prompt's turn. R15 drops the settle",
+    "loop, so a terminal reported past the recovery read is never placed. R13 forgets the last turn",
+    "begun on a failed start, so the terminal that arrives next is placed on nothing and dropped. R17",
+    "hands a live terminal to the emitter only when its step runs, after the flush before it has read the next prompt."
+  ],
+  "mutations": [
+    {
+      "name": "R1 a failure is terminal again: no re-establish is scheduled",
+      "file": "extensions/connector-core/src/agui-holder.ts",
+      "find": "    this.reviveTimer = setTimeout(() => this.revive(), delay);\n",
+      "replace": "    void delay;\n",
+      "expectRed": "revive:the-emitter-is-started-again-at-once",
+      "note": "The old latch. The sink is still told a delay, so only the start-count cell can see that nothing follows it."
+    },
+    {
+      "name": "R2 the first retry is paced too, not at once",
+      "file": "extensions/connector-core/src/agui-holder.ts",
+      "find": "    const delay = this.retried ? (this.hooks.retryMs ?? 1_000) : 0;\n",
+      "replace": "    const delay = this.hooks.retryMs ?? 1_000;\n",
+      "expectRed": "revive:the-sink-is-told-the-re-establish-is-at-once",
+      "note": "The first attempt after a failure is at once; only the attempts after it are paced by the fixed wait."
+    },
+    {
+      "name": "R3 close no longer cancels a pending re-establish",
+      "file": "extensions/connector-core/src/agui-holder.ts",
+      "find": "    if (this.reviveTimer) clearTimeout(this.reviveTimer);\n",
+      "replace": "    void this.reviveTimer;\n",
+      "expectRed": "revive:a-closed-holder-keeps-its-failure-readable",
+      "note": "The revive runs after close, clears the failure, and starts nothing because the chain refuses a shut holder. The failure being cleared is the only trace."
+    },
+    {
+      "name": "R4 the re-establish keeps a running emitter instead of starting a fresh one",
+      "file": "extensions/connector-core/src/agui-holder.ts",
+      "find": "    this.dead = undefined;\n    this.emitter = undefined;\n",
+      "replace": "    this.dead = undefined;\n    if (this.emitter?.stopped) this.emitter = undefined;\n",
+      "expectRed": "revive:a-WEDGED-emitter-is-replaced-by-a-fresh-start",
+      "note": "The first cut's rule. A halted emitter is still replaced, so only the wedged emitter, which never halts and never pumps, can see it."
+    },
+    {
+      "name": "R5 the wait resets when a start returns, not when the re-establish goes through",
+      "file": "extensions/connector-core/src/agui-holder.ts",
+      "find": "      this.emitter = await this.startEmitter(path, this.startContext);\n",
+      "replace": "      this.emitter = await this.startEmitter(path, this.startContext);\n      this.retried = false;\n",
+      "expectRed": "revive:a-start-that-passes-does-NOT-reset-the-delay",
+      "note": "A start reaches the broker only for its preflight. Reset there, a broker that refuses every publish is retried at the base delay for as long as the outage lasts."
+    },
+    {
+      "name": "R6 a terminal that arrives while the plane is down is dropped",
+      "file": "extensions/connector-core/src/agui-holder.ts",
+      "find": "    else this.held.push(entry);\n",
+      "replace": "    else if (this.dead === undefined) this.held.push(entry);\n",
+      "expectRed": "revive:a-terminal-held-through-the-outage-closes-its-run-after-the-re-establish",
+      "note": "The first cut's rule. The seat stays connected and the plane comes back, so only the close on the fresh emitter can see that the failed turn's run was left open."
+    },
+    {
+      "name": "R7 the source position is taken at the hand-over, not at the hook",
+      "file": "extensions/connector-core/src/agui-holder.ts",
+      "find": "    this.held = this.held.filter((h) => h !== entry);\n    emitter.queueTerminal(entry);\n",
+      "replace": "    this.held = this.held.filter((h) => h !== entry);\n    emitter.queueTerminal({ terminal: entry.terminal, at: Promise.resolve(this.hooks.sourceEnd(this.boundPath!)) });\n",
+      "expectRed": "revive:a-terminal-during-an-in-flight-start-does-NOT-close-the-successor-run",
+      "note": "A position taken when the step runs is past whatever the session wrote in between: the next prompt, written while the start was in flight, makes the failed turn's terminal the successor's."
+    },
+    {
+      "name": "R8 a close that fails loses its terminal",
+      "file": "extensions/connector-core/src/agui-holder.ts",
+      "find": "      if (open !== undefined) this.held.unshift(entry);\n      throw e;\n",
+      "replace": "      throw e;\n",
+      "expectRed": "revive:a-close-that-FAILED-holds-its-terminal-for-the-re-establish",
+      "note": "Round 4 of review, through the built MCP entry point: a terminal-only log write failure left the run open and the next prompt closed it as a finish."
+    },
+    {
+      "name": "R9 the last turn begun is not carried from a dying emitter",
+      "file": "extensions/connector-core/src/agui-holder.ts",
+      "find": "      this.held.push(...left.terminals);\n      this.lastTurn = { turn: left.lastTurn };\n",
+      "replace": "      this.held.push(...left.terminals);\n",
+      "expectRed": "revive:the-last-turn-begun-is-carried-so-a-terminal-for-a-turn-that-opened-no-run-closes-nothing",
+      "note": "A fresh emitter sees only the run the log has open; a terminal for the turn that opened nothing, begun after that run, is then placed on the run and closes it."
+    },
+    {
+      "name": "R10 the held terminals reach the emitter only after the pump",
+      "file": "extensions/connector-core/src/agui-holder.ts",
+      "find": "      for (const entry of [...this.held]) this.handOver(emitter, entry);\n      await emitter.pump();\n",
+      "replace": "      await emitter.pump();\n      for (const entry of [...this.held]) this.handOver(emitter, entry);\n",
+      "expectRed": "revive:a-held-ERROR-is-handed-to-the-fresh-emitter-BEFORE-the-pump",
+      "note": "Round 5 of review, through the built MCP entry point: with the next prompt among the unread records, the pump closed the failed run as a finish and the held error was dropped behind it."
+    },
+    {
+      "name": "R11 the wait resets after the pump, before the held close",
+      "file": "extensions/connector-core/src/agui-holder.ts",
+      "find": "      await this.settle(emitter);\n      this.reviving = false;\n      this.retried = false;\n",
+      "replace": "      this.retried = false;\n      await this.settle(emitter);\n      this.reviving = false;\n",
+      "expectRed": "revive:the-wait-stays-fixed-while-the-held-close-keeps-failing",
+      "note": "Round 5 of review: a terminal-only write failure held for four seconds was retried five times at one second, behind a pump that read nothing."
+    },
+    {
+      "name": "R12 a terminal reported while the plane is down is queued to the dead emitter, not held",
+      "file": "extensions/connector-core/src/agui-holder.ts",
+      "find": "    const queued = this.dead === undefined && live !== undefined && !live.stopped;\n",
+      "replace": "    const queued = live !== undefined && !live.stopped;\n",
+      "expectRed": "revive:a-terminal-held-through-the-outage-closes-its-run-after-the-re-establish",
+      "note": "The dying emitter is dropped by the re-establish with everything queued to it after it died; a terminal that reaches it then is never handed to the fresh start. R6 drops the hold outright; this keeps the hold and misroutes the terminal."
+    },
+    {
+      "name": "R13 a failed re-establish start forgets the last turn begun",
+      "file": "extensions/connector-core/src/agui-holder.ts",
+      "find": "    if (this.emitter !== undefined) {\n      const left = this.emitter.unsettled();\n      this.held.push(...left.terminals);\n      this.lastTurn = { turn: left.lastTurn };\n    }\n",
+      "replace": "    const left = this.emitter?.unsettled();\n    if (left) this.held.push(...left.terminals);\n    this.lastTurn = { turn: left?.lastTurn };\n",
+      "expectRed": "revive:a-terminal-while-down-after-a-FAILED-re-establish-start-is-held-for-the-down-run",
+      "note": "A failed start has no emitter to ask, so the last turn begun is replaced with nothing; the terminal that arrives next is placed on no turn and dropped."
+    },
+    {
+      "name": "R14 a terminal during the recovery pump is only held, not handed to the emitter at the hook",
+      "file": "extensions/connector-core/src/agui-holder.ts",
+      "find": "    const queued = this.dead === undefined && live !== undefined && !live.stopped;\n",
+      "replace": "    const queued = this.dead === undefined && !this.reviving && live !== undefined && !live.stopped;\n",
+      "expectRed": "revive:a-terminal-during-the-recovery-pump-is-handed-to-the-emitter-AT-THE-HOOK",
+      "note": "The round-8 defect: a terminal reported while the fresh emitter is mid-recovery, held for after its pump, arrives after that pump has read the next prompt and closed the failed run as a finish."
+    },
+    {
+      "name": "R15 the settle pumps no further for a terminal reported past the recovery read",
+      "file": "extensions/connector-core/src/agui-holder.ts",
+      "find": "    while (emitter.waitingTerminals > 0) await emitter.pump();\n",
+      "replace": "",
+      "expectRed": "revive:a-terminal-reported-past-the-recovery-read-is-placed-by-the-pump-after-it",
+      "note": "A terminal that arrived while the recovery pump was reading was reported past that read; left waiting, it is placed by no pump until the next flush, and the run it closes stays open until then."
+    },
+    {
+      "name": "R16 the terminals a dying emitter still held are dropped with it",
+      "file": "extensions/connector-core/src/agui-holder.ts",
+      "find": "      this.held.push(...left.terminals);\n",
+      "replace": "",
+      "expectRed": "revive:the-terminals-a-dying-emitter-held-reach-the-next-one-in-order",
+      "note": "A recovery pump that fails after the hand-over would lose every terminal of the outage."
+    },
+    {
+      "name": "R17 a live terminal reaches the emitter when its step runs, not at the hook",
+      "file": "extensions/connector-core/src/agui-holder.ts",
+      "find": "    if (queued) live.queueTerminal(entry);\n    else this.held.push(entry);\n",
+      "replace": "    this.held.push(entry);\n",
+      "expectRed": "live:a-terminal-reported-during-a-flushs-read-closes-its-own-turn-under-the-prompt-the-read-returned",
+      "note": "The flush queued ahead of the terminal reads the next prompt the harness wrote in between; queued by its step, the terminal is placed after that prompt closed its turn and opened the next, and closes the next run."
+    },
+    {
+      "name": "R18 a terminal reported before any emitter exists is queued by its own step, behind the flush",
+      "file": "extensions/connector-core/src/agui-holder.ts",
+      "find": "    else this.held.push(entry);\n",
+      "replace": "\n",
+      "expectRed": "first-start:a-terminal-during-the-first-start-is-handed-to-the-emitter-BEFORE-its-first-pump",
+      "note": "The round-16 defect: the flush the stop hook queued ahead of the close read past the terminal's position, the next prompt closed the failed run as a finish and the terminal closed the successor."
+    },
+    {
+      "name": "R19 the first start hands nothing over",
+      "file": "extensions/connector-core/src/agui-holder.ts",
+      "find": "      if (!this.reviving) for (const entry of [...this.held]) this.handOver(this.emitter, entry);\n",
+      "replace": "\n",
+      "expectRed": "first-start:a-terminal-during-the-first-start-is-handed-to-the-emitter-BEFORE-its-first-pump"
+    }
+  ]
+}

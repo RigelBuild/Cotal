@@ -1,0 +1,91 @@
+/**
+ * The first-party agent connectors, name → npm package. This is NOT authority — a connector is
+ * usable only once installed (seeded on first run, or `cotal ext add`ed) and imported, exactly like
+ * a third-party one. It is the operator-UX source of truth so an absent official connector names its
+ * REAL package in the install hint, and the seeder knows which built-ins to seed. A third-party
+ * connector installs under its own package name and resolves the same way without appearing here.
+ *
+ * It lives in workspace (not cli) because both the CLI and the manager consume it and the manager
+ * must not import the CLI — it is pure data supplied to the generic materialize/hint path.
+ */
+export const OFFICIAL_CONNECTORS: Readonly<Record<string, string>> = {
+  claude: "@cotal-ai/connector-claude-code",
+  opencode: "@cotal-ai/connector-opencode",
+  codex: "@cotal-ai/connector-codex",
+  hermes: "@cotal-ai/connector-hermes",
+  jcode: "@cotal-ai/connector-jcode",
+  pi: "@cotal-ai/pi",
+  omp: "@cotal-ai/omp",
+};
+
+/** A first-party extension the umbrella (`cotal-ai`) bundles and versions in lockstep: its npm package
+ *  plus the repo-relative source dir the prepack copy and dev seeding resolve it from. This is the connector set
+ *  PLUS the web dashboard and the zellij runtime — every first-party piece the binary ships and the seed reconcile
+ *  keeps at the binary's own version, so `npm i -g cotal-ai@X` carries them all at X with no separate
+ *  fetch and no version skew. A third-party `cotal ext add`ed package is NOT here; it versions on its
+ *  own line. web lives in `implementations/web` (the connectors under `extensions/`), hence the explicit
+ *  source dir rather than a derived `extensions/<name>`. */
+export interface SeededExtension {
+  readonly pkg: string;
+  readonly srcDir: string;
+  /** Every word the package's commands claim, names and aliases. The dispatcher resolves these words
+   *  before the first seed installs the package, and the seed refuses a package that claims a
+   *  different set. */
+  readonly commands: readonly string[];
+}
+
+export const SEEDED_EXTENSIONS: Readonly<Record<string, SeededExtension>> = {
+  ...(Object.fromEntries(
+    Object.entries(OFFICIAL_CONNECTORS).map(([name, pkg]) => [name, { pkg, srcDir: `extensions/${pkg.split("/")[1]}`, commands: [] }]),
+  ) as Record<string, SeededExtension>),
+  web: { pkg: "@cotal-ai/web", srcDir: "implementations/web", commands: ["__service-web"] },
+  zellij: { pkg: "@cotal-ai/zellij", srcDir: "extensions/zellij", commands: [] },
+};
+
+/** The files every seeded connector payload carries an identical copy of: the `cotal_docs` corpus
+ *  and index each bundle reads from beside itself. The `cotal-ai` prepack ships one copy of each in
+ *  `seeded-connectors/<SEEDED_SHARED_DIR>/` and records where it removed them, and the seed store puts
+ *  a copy back at each of those paths, so an installed connector holds the files it was packed with. */
+export const SEEDED_SHARED_FILES: readonly string[] = ["docs-bundle.bin", "docs-index.bin"];
+
+/** The `seeded-connectors/` directory that holds the shared files and `placements.json`. It is not a
+ *  {@link SEEDED_EXTENSIONS} key, so no seed can read it as a payload. */
+export const SEEDED_SHARED_DIR = "_shared";
+
+/** Whether `word` names a command a seeded package registers. */
+export function isSeededCommand(word: string): boolean {
+  return Object.values(SEEDED_EXTENSIONS).some((ext) => ext.commands.includes(word));
+}
+
+/** Why the commands a seeded package registers disagree with the words its seed entry declares, or
+ *  undefined when they agree or `pkg` is not seeded. A name or alias the entry does not declare
+ *  would be an unknown command until the first seed installed the package. */
+export function seededCommandsMismatch(pkg: string, commands: readonly { name: string; aliases?: readonly string[] }[]): string | undefined {
+  const declared = Object.values(SEEDED_EXTENSIONS).find((seeded) => seeded.pkg === pkg)?.commands;
+  if (!declared) return undefined;
+  const claimed = commands.flatMap((cmd) => [cmd.name, ...(cmd.aliases ?? [])]);
+  if ([...claimed].sort().join(" ") === [...declared].sort().join(" ")) return undefined;
+  return `registers commands claiming [${claimed.join(", ")}], but its seed entry declares [${declared.join(", ")}] - the binary and this package disagree`;
+}
+
+/** The default connector/agent type when `COTAL_DEFAULT_AGENT` is unset (David's locked decision). */
+export const DEFAULT_CONNECTOR = "claude";
+
+/** `cotal` is reserved: it is the binary's own name, so a connector must never claim it (there is no
+ *  runtime alias anymore). Rejected at `cotal ext add` and at materialization. */
+export const RESERVED_CONNECTOR_NAMES: readonly string[] = ["cotal"];
+
+/** The install-hint for an absent connector: name the exact package for an official one, else the
+ *  generic `cotal ext add` form. Shared by the manager and the CLI so the message never drifts. */
+export function connectorInstallHint(name: string): string {
+  const pkg = OFFICIAL_CONNECTORS[name];
+  return pkg
+    ? `no connector "${name}" installed - add it with \`cotal ext add ${pkg}\``
+    : `no connector "${name}" - install its integration with \`cotal ext add <npm-package>\`, or check the name`;
+}
+
+/** The connector a {@link connectorInstallHint} at the start of `text` names, or undefined when
+ *  `text` does not start with one. A caller reads a remote manager's refusal with it. */
+export function hintedConnector(text: string): string | undefined {
+  return /^no connector "([^"]+)"(?: installed - add it with | - install its integration with )/.exec(text)?.[1];
+}

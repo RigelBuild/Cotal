@@ -1,0 +1,532 @@
+import * as p from "../lib/prompts.js";
+import { findMesh, findPreparedSpace, inputDisabledByFlag, type MeshEntry } from "@cotal-ai/workspace";
+import { bold, brand, brandBold, dim, ok } from "../lib/theme.js";
+import { abortIfCancel } from "../lib/cancel.js";
+import { readFileSync } from "node:fs";
+import { listSpaces } from "@cotal-ai/core";
+import {
+  candidateTarget,
+  checkDialPolicy,
+  checkEnforcement,
+  checkMode,
+  checkRoot,
+  checkServer,
+  checkSpaceName,
+  checkTrust,
+  checkUserBundle,
+  isDir,
+  persistRemoteUserEntry,
+  probeEnforcement,
+  spacesAtRoot,
+  tlsIntent,
+  tlsTrustFailure,
+  userExchangeIssuer,
+  verifyTarget,
+  verifyUserExchange,
+  writeRecord,
+} from "./meshes-add.js";
+
+/**
+ * The guided form of `cotal meshes add` — a bare `cotal meshes add` on a terminal.
+ *
+ * It exists because the flag form asks the operator to already know four things: the broker
+ * address, whether that broker authenticates, which space name to use, and that credentials must
+ * be copied locally first. Three of those the machine can find out, so this asks for the ONE that
+ * cannot be derived (the address), then probes and reports what it learned. Every question after
+ * that is a choice between real options rather than free text: the space names come from the trust
+ * actually on disk, and the mode is stated as a fact about the broker, never asked.
+ *
+ * The rules are not re-implemented here. Every decision goes through `meshes-add.ts`, so the
+ * guided and flag forms cannot drift; this module owns presentation and recovery only — which
+ * failures offer a way out (a wrong URL is worth retyping; a mesh that is simply down is worth
+ * recording anyway) instead of ending the command.
+ */
+
+/**
+ * The prompts, as an interface rather than direct clack calls.
+ *
+ * Not indirection for its own sake: the wizard's VALUE is its control flow — does a name that came
+ * from the command line still hit the clash gate, does "point at a different folder" actually ask
+ * for one, does a replacement still get verified — and every one of those questions was answered
+ * wrong at least once. None of it is reachable by a test that cannot answer a prompt, so the review
+ * that caught those bugs was doing work the suite structurally could not. With the prompts injected,
+ * a test drives the real function with scripted answers and asserts what it asked and what it wrote.
+ */
+export interface WizardIO {
+  intro(message: string): void;
+  outro(message: string): void;
+  note(body: string, title: string): void;
+  cancel(message: string): void;
+  log: { info(m: string): void; warn(m: string): void; error(m: string): void };
+  spinner(): { start(m: string): void; stop(m: string): void };
+  text(opts: { message: string; placeholder?: string; defaultValue?: string; validate?: (v: string | undefined) => string | undefined }): Promise<string>;
+  select<T>(opts: { message: string; options: { value: T; label: string; hint?: string }[] }): Promise<T>;
+  confirm(opts: { message: string; initialValue?: boolean }): Promise<boolean>;
+}
+
+/** What a cancel says. Nothing is written before the last confirmation, so a cancel changed nothing. */
+const CANCELLED = "Cancelled. Nothing was registered.";
+
+/** The real terminal, via clack. Cancellation (Ctrl-C / Esc) exits here rather than returning a
+ *  sentinel the wizard body would have to thread through every branch. */
+export function clackIO(): WizardIO {
+  return {
+    intro: (m) => p.intro(m),
+    outro: (m) => p.outro(m),
+    note: (body, title) => p.note(body, title),
+    cancel: (m) => p.cancel(m),
+    // Clack does not wrap a log line, so each is broken to the terminal here.
+    log: {
+      info: (m) => p.log.info(p.logLines(m, process.stdout)),
+      warn: (m) => p.log.warn(p.logLines(m, process.stdout)),
+      error: (m) => p.log.error(p.logLines(m, process.stdout)),
+    },
+    spinner: () => {
+      const s = p.spinner();
+      return { start: (m) => s.start(m), stop: (m) => s.stop(m) };
+    },
+    text: async (opts) => abortIfCancel(await p.text(opts as never), CANCELLED),
+    select: async <T>(opts: { message: string; options: { value: T; label: string; hint?: string }[] }) =>
+      abortIfCancel(await p.select<T>(opts as never), CANCELLED) as T,
+    // `initialValue` is a per-call decision, not a house style: an ordinary "register this?"
+    // may default yes, but a consent to an unencrypted transport must not be given by pressing
+    // Enter. Callers that omit it keep the old default.
+    confirm: async (opts) => abortIfCancel(await p.confirm({ initialValue: true, ...opts }), CANCELLED),
+  };
+}
+
+/** Whether a guided run is possible at all: both ends of the pipe must be a real terminal. Without
+ *  this a missing flag would hang a script waiting on input nobody is there to give; the flag form
+ *  keeps failing loud instead. */
+export function canPrompt(): boolean {
+  return Boolean(process.stdin.isTTY) && Boolean(process.stdout.isTTY) && process.env.COTAL_NO_PROMPT !== "1" && !inputDisabledByFlag();
+}
+
+/** Pre-filled from whatever the command line already supplied, so a half-typed command completes
+ *  itself rather than starting over. */
+export interface WizardSeed {
+  space?: string;
+  server?: string;
+  root?: string;
+  mode?: string;
+  force?: boolean;
+  /** Pre-accepted overlay tunnel dependency (the flag form's `--allow-unencrypted-overlay`). */
+  allowUnencryptedOverlay?: boolean;
+  /** The flag form's `--tls`: require TLS on whichever address the record ends on. */
+  tls?: boolean;
+}
+
+/** Run the guided registration. Returns false if the operator backed out (the caller exits 0 —
+ *  cancelling is not a failure). */
+export async function addWizard(seed: WizardSeed, cwd: string, io: WizardIO = clackIO()): Promise<boolean> {
+  io.intro(brandBold("Register a mesh"));
+  io.note(
+    "A mesh running somewhere else - another machine, a shared broker, a hosted space - so that\n`cotal spawn` and `--space` can reach it from any folder on this machine.\n\nNothing is written until you confirm.",
+    brand("What this does"),
+  );
+
+  // TWO different decisions, deliberately not one flag. `--force` conflates them for the scripted
+  // form (documented there), but here they are reached separately and must stay separate:
+  // `unverified` means the operator accepted a record nothing confirmed; `replace` means an
+  // existing record for that name is being overwritten. Folding replace into unverified would
+  // silently skip the broker checks for anyone who picked "replace that record" — a record
+  // presented as checked that never was, which is the failure this command exists to refuse.
+  let unverified = Boolean(seed.force);
+  let replace = Boolean(seed.force);
+
+  // ── 1. the one thing that cannot be derived ────────────────────────────────────────────────────
+  let server = seed.server;
+  // The address the operator accepted the tunnel dependency FOR, not merely that they once did.
+  // A bare boolean survives "use a different address", so accepting an overlay and then finishing
+  // on loopback wrote evidence of a consent that was never given for the recorded target. The
+  // flag form never had this because it persists from the FINAL classification; this now matches.
+  // `undefined` when nothing is accepted; a pre-seeded flag accepts only the seeded server.
+  let ackedFor: string | undefined = seed.allowUnencryptedOverlay && seed.server ? seed.server : undefined;
+  /** Whether the FINAL settled address carried a residual — the thing actually recorded. */
+  let overlayResidual = false;
+  let enforces: "auth" | "open" | "unreachable" = "unreachable";
+  // The TLS intent of an address, from `--tls` or its scheme, as the flag form sources it.
+  const tlsFor = (address: string) => tlsIntent(address, Boolean(seed.tls));
+  // After a refused address the question asks again with no example address, so the refusal's next
+  // step is the only one on screen.
+  let refused = false;
+
+  for (;;) {
+    if (!server) {
+      server = await io.text({
+          message: "Broker URL of the mesh you want to reach",
+          ...(refused ? {} : { placeholder: "nats://100.90.12.34:4222" }),
+          validate: (v) => {
+            if (!v) return "Required - this is the address the mesh's broker listens on.";
+            const r = checkServer(v, "--server");
+            if (!r.ok) return [r.message.replace(/^✗ (--server )?/, ""), r.remedy].filter(Boolean).join("; ");
+            // The same safety gate the flag form applies, asked here so a refused address is
+            // caught at the prompt instead of after the operator has answered three more
+            // questions. Both front ends must agree; that is what this module exists for.
+            // Classified as a CANDIDATE here (acceptance granted for the check) so an overlay
+            // address survives the prompt and reaches the question below. Refusing it here made
+            // that question unreachable: the operator could never say yes to something the
+            // validator had already rejected. TLS intent comes from `--tls` or the typed scheme.
+            const d = checkDialPolicy(v, { tlsRequired: tlsFor(v), allowUnencryptedOverlay: true });
+            return d.ok ? undefined : withRemedy({ ...d, message: d.message.replace(/^✗ /, "") });
+          },
+        });
+    } else {
+      const pre = checkServer(server, "--server");
+      if (!pre.ok) {
+        io.log.error(withRemedy(pre));
+        server = undefined;
+        refused = true;
+        continue;
+      }
+      const dial = checkDialPolicy(server, { tlsRequired: tlsFor(server), allowUnencryptedOverlay: true }); // candidate; the ask below decides
+      if (!dial.ok) {
+        io.log.error(withRemedy(dial));
+        server = undefined;
+        refused = true;
+        continue;
+      }
+    }
+
+    // A permitted-but-not-guaranteed target is said out loud here too, not only in the flag form.
+    // Recomputed rather than threaded because the typed path validates inside its own callback:
+    // the check is pure, and one call site for the warning beats two ways of reaching it.
+    // The guided form ASKS instead of taking a flag, which is the same explicit acceptance by a
+    // different surface. Refusing here without offering the choice would make the wizard unable to
+    // register an overlay mesh at all, and silently accepting would be the warning-and-continue
+    // shape that was just removed.
+    if (ackedFor !== server) {
+      const probe = checkDialPolicy(server, { tlsRequired: tlsFor(server), allowUnencryptedOverlay: true });
+      if (probe.ok && probe.value.residual) {
+        io.log.warn(probe.value.residual);
+        // DEFAULT DENY. This is the one confirmation in the wizard where pressing Enter must not
+        // agree: everything else here is a convenience default, this is consent to a transport we
+        // cannot verify.
+        const accepted = await io.confirm({ message: "Register it anyway, accepting that dependency?", initialValue: false });
+        if (!accepted) { server = undefined; continue; }
+        ackedFor = server; // bound to THIS address; a different one asks again
+      }
+    }
+    // Re-checked with the REAL answer, so the decision is enforced by the same rule the flag form
+    // uses rather than by the branch above happening to be right.
+    const settled = checkDialPolicy(server, { tlsRequired: tlsFor(server), allowUnencryptedOverlay: ackedFor === server });
+    if (!settled.ok) { io.log.error(withRemedy(settled)); server = undefined; refused = true; continue; }
+    overlayResidual = Boolean(settled.value.residual);
+
+    const spin = io.spinner();
+    spin.start(`Asking ${server} what it is`);
+    enforces = await probeEnforcement(server);
+    // A TLS broker whose certificate this machine cannot verify fails the probe too, but it answered,
+    // so it gets the flag form's trust refusal rather than the choices for an address with no broker.
+    const untrusted = enforces === "unreachable" && tlsFor(server) ? await tlsTrustFailure(server) : undefined;
+    spin.stop(
+      enforces === "auth"
+        ? `${ok("✓")} ${server} answered - it ${bold("requires credentials")}`
+        : enforces === "open"
+          ? `${ok("✓")} ${server} answered - it is ${bold("open")} (accepts anyone)`
+          : untrusted
+            ? `${server} answered, but its certificate is not trusted`
+            : `${server} did not answer`,
+    );
+    if (enforces !== "unreachable") break;
+    if (untrusted) io.log.error(untrusted);
+
+    // Node reads NODE_EXTRA_CA_CERTS only when it starts, so trusting the CA takes a new run, and the
+    // address is right: for a trust failure Cancel comes first.
+    const next = await io.select({
+        message: untrusted ? "This machine does not trust that broker's certificate." : "No broker answered there.",
+        options: untrusted
+          ? [
+              { value: "cancel", label: "Cancel", hint: "set NODE_EXTRA_CA_CERTS, then run this again" },
+              { value: "retype", label: "Use a different address" },
+              { value: "anyway", label: "Register it anyway", hint: "nothing is verified; dials fail without its CA" },
+            ]
+          : [
+              { value: "retype", label: "Use a different address", hint: "typo, wrong port, VPN not up" },
+              { value: "anyway", label: "Register it anyway", hint: "the mesh is down right now; nothing is verified" },
+              { value: "cancel", label: "Cancel" },
+            ],
+      });
+    if (next === "cancel") return cancelled(io);
+    if (next === "anyway") {
+      unverified = true;
+      break;
+    }
+    server = undefined;
+  }
+
+  // ── 2. where this mesh's local trust + personas live ───────────────────────────────────────────
+  // A LOOP, not a recursive re-entry: "point at a different folder" has to actually ask for one.
+  // Clearing the answer and inferring again would land on the same project root inside a project,
+  // re-hit the same dead end, and offer the same useless choice forever.
+  const inferred = checkRoot(seed.root, cwd);
+  let root = inferred.ok ? inferred.value : undefined;
+  if (root && !seed.root) io.log.info(`Using this project as its local folder: ${bold(root)}`);
+  // The cwd is only a sensible default the FIRST time. After the operator has been told this
+  // folder holds no credentials, offering it back pre-filled makes them clear the field to answer
+  // the question at all — so the recovery ask starts empty and insists on a real path.
+  let defaultRoot: string | undefined = cwd;
+  let accounts: string[] = [];
+  for (;;) {
+    while (!root) root = await askRoot(io, cwd, defaultRoot);
+    const inventory = spacesAtRoot(root);
+    if (!inventory.ok) {
+      // Unreadable trust is not "no trust": say so and let them point somewhere else.
+      io.log.error(inventory.message);
+      root = undefined;
+      defaultRoot = undefined;
+      continue;
+    }
+    accounts = inventory.value;
+    // An auth broker with no trust here cannot be registered at all — say what is missing and where
+    // it comes from, rather than failing after more questions.
+    if (enforces !== "auth" || accounts.length > 0) break;
+    io.log.warn(
+      `That broker requires credentials, and ${bold(root)} holds none.\n` +
+        dim("Copy the mesh's .cotal/auth from the machine it runs on, then point at that folder.\n") +
+        dim("That directory carries the space's account SIGNING SEED: a machine holding it can mint any\n") +
+        dim("identity in the space, so it is a certificate authority for the mesh rather than a client of it.\n") +
+        dim("`cotal mint` alone does NOT satisfy this - registration needs composable signing material."),
+    );
+    const next = await io.select({
+        message: "That folder holds no credentials for this broker. What next?",
+        options: [
+          { value: "root", label: "Point at a different folder", hint: "one that already holds its credentials" },
+          { value: "bundle", label: "It is a hosted user-auth mesh - I have its trust bundle", hint: "a bundle.json exported where the mesh runs" },
+          { value: "cancel", label: "Cancel" },
+        ],
+      });
+    if (next === "cancel") return cancelled(io);
+    // THE ONE GUIDED USER-AUTH BRANCH. No rule lives here: the bundle validation, the exchange
+    // trust probe, the auth-required PASS, and the record writer are the same functions the flag
+    // form calls (meshes-add.ts owns them); this branch only asks for the file and presents
+    // failures.
+    if (next === "bundle") {
+      const path = await io.text({
+        message: "Path to the trust bundle (bundle.json)",
+        placeholder: "exported where the mesh runs",
+        validate: (p) => (p ? undefined : "Required - the bundle carries the pins this registration adopts."),
+      });
+      let rawBundle: string;
+      try {
+        rawBundle = readFileSync(path, "utf8");
+      } catch (e) {
+        io.log.error(`Cannot read ${path} (${(e as Error).message})`);
+        return cancelled(io, "Nothing was registered.");
+      }
+      const parsed = checkUserBundle(rawBundle);
+      if (!parsed.ok) { io.log.error(parsed.message); return cancelled(io, "Nothing was registered."); }
+      const b = parsed.value;
+      const named = checkSpaceName(b.space);
+      if (!named.ok) { io.log.error(named.message); return cancelled(io, "Nothing was registered."); }
+      const userTls = b.tlsRequired || tlsFor(server as string);
+      const userDial = checkDialPolicy(server as string, { tlsRequired: userTls, allowUnencryptedOverlay: ackedFor === server });
+      if (!userDial.ok) { io.log.error(userDial.message); return cancelled(io, "Nothing was registered."); }
+      const exch = await verifyUserExchange(b.userAuth.endpoints.url, userExchangeIssuer(b.space));
+      if (!exch.ok) { io.log.error(exch.message); return cancelled(io, "Nothing was registered."); }
+      const enforce = checkEnforcement("user", enforces, server as string, b.space, root);
+      if (!enforce.ok) { io.log.error(enforce.message); return cancelled(io, "Nothing was registered."); }
+      io.note(
+        [
+          `space     ${b.space}`,
+          `broker    ${server}${userTls ? "  (TLS required)" : ""}`,
+          `issuer    ${b.userAuth.idp.issuer}`,
+          `audience  ${b.userAuth.idp.audience}`,
+          `exchange  ${b.userAuth.endpoints.url}`,
+        ].join("\n"),
+        brand("About to record (user-auth, pinned)"),
+      );
+      const goUser = await io.confirm({ message: "Register this user-auth mesh?" });
+      if (!goUser) return cancelled(io, "Nothing was registered.");
+      persistRemoteUserEntry(b.space, server as string, root, b, userTls, Boolean(userDial.value.residual));
+      io.outro(ok(`Registered "${b.space}"`));
+      return true;
+    }
+    root = undefined; // ask for a path; never re-infer, or this offers the same dead end again
+    defaultRoot = undefined; // …and never offer the folder we just rejected as the default
+  }
+
+  // ── 3. which space ────────────────────────────────────────────────────────────────────────────
+  // The clash gate runs for EVERY resolved name, including one that came in on the command line.
+  // Gating it on "did we just ask?" let `cotal meshes add <already-registered>` overwrite silently —
+  // something the flag form refuses outright.
+  let space = seed.space;
+  // An open broker lists the spaces it serves, so they are offered rather than typed blind.
+  let served: string[] = [];
+  if (!space && enforces === "open") {
+    try {
+      served = (await listSpaces({ servers: server as string })).map((info) => info.space).filter((name) => !accounts.includes(name));
+    } catch {
+      io.log.warn(`${server} answered, but the spaces it serves could not be read`);
+    }
+  }
+  for (;;) {
+    while (!space) {
+      if (accounts.length > 0 || served.length > 0) {
+        const picked = await io.select<string | null>({
+            message: "Which space on that broker?",
+            options: [
+              ...accounts.map((s) => ({ value: s as string | null, label: s, hint: "credentials for this space are already here" })),
+              ...served.map((s) => ({ value: s as string | null, label: s, hint: "that broker serves it" })),
+              { value: null, label: "Another name…" }, // null, not a sentinel string: no space name can collide with it
+            ],
+          });
+        if (picked !== null) space = picked;
+      }
+      if (!space) {
+        space = await io.text({
+            message: "Space name on that broker",
+            placeholder: "the name the mesh was started with",
+            validate: (v) => {
+              if (!v) return "Required - it must match the space name where the mesh runs.";
+              const named = checkSpaceName(v);
+              return named.ok ? undefined : `${named.message.replace(/^✗ /, "")}; ${named.remedy}`;
+            },
+          });
+      }
+    }
+    const clash = findMesh(space);
+    // A prepared space, or one this machine started or a catalog lists, is not replaced, as
+    // `space add` refuses it, so only another name is offered.
+    const owner = findPreparedSpace(space) ? "a space prepared on this machine" : clash && clash.origin !== "manual" ? clash.origin === "catalog" ? "listed by a signed-in space catalog" : "a space this machine started" : undefined;
+    if (!owner && (!clash || replace)) break;
+    // Another name comes first, so pressing Enter never replaces a record.
+    const next = await io.select({
+        message: owner ? `"${space}" is ${owner}, so it is not replaced.` : `"${space}" is already registered here (${clash!.server}).`,
+        options: [
+          { value: "rename", label: "Use a different name" },
+          ...(owner ? [] : [{ value: "replace", label: "Replace that record", hint: clash!.root }]),
+          { value: "cancel", label: "Cancel" },
+        ],
+      });
+    if (next === "cancel") return cancelled(io);
+    if (next === "rename") space = undefined;
+    else {
+      replace = true;
+      break;
+    }
+  }
+
+  // ── 4. mode + trust, decided rather than asked ─────────────────────────────────────────────────
+  // The probe's answer is the best evidence of the mode — but only when the broker actually
+  // answered. An UNREACHABLE broker knows nothing, and reading "not auth" out of silence would
+  // record an auth mesh as open (the exact wrong-mode failure this command is built to refuse); so
+  // fall back to the same on-disk inference the flag form uses.
+  const modeHint = seed.mode ?? (enforces === "unreachable" ? undefined : enforces);
+  const modeCheck = checkMode(space, root, accounts, modeHint);
+  if (!modeCheck.ok) {
+    io.log.error(modeCheck.message);
+    return cancelled(io, "Nothing was registered.");
+  }
+  const mode = modeCheck.value;
+  const trust = checkTrust(mode, root, space);
+  if (!trust.ok) {
+    io.log.error(trust.message);
+    return cancelled(io, "Nothing was registered.");
+  }
+  if (!unverified) {
+    const match = checkEnforcement(mode, enforces, server as string, space, root);
+    if (!match.ok) {
+      io.log.error(match.message);
+      return cancelled(io, "Nothing was registered.");
+    }
+  }
+
+  // ── 5. verify for real, then confirm ──────────────────────────────────────────────────────────
+  if (!unverified) {
+    const target = candidateTarget(space, server as string, root, mode, trust.value, tlsFor(server as string));
+    const spin = io.spinner();
+    spin.start(mode === "auth" ? `Checking this folder's credentials for "${space}"` : `Checking the connection to "${space}"`);
+    const verified = await verifyTarget(target);
+    spin.stop(verified.ok ? `${ok("✓")} ${mode === "auth" ? "Credentials accepted" : "Connected"}` : "Could not connect");
+    if (!verified.ok) {
+      io.log.error(verified.message);
+      const next = await io.select({
+          message: "The check did not pass. What next?",
+          options: [
+            { value: "anyway", label: "Register it anyway", hint: "the record will say it was not verified" },
+            { value: "cancel", label: "Cancel" },
+          ],
+        });
+      if (next === "cancel") return cancelled(io, "Nothing was registered.");
+      unverified = true;
+    }
+  }
+
+  io.note(
+    [
+      `${dim("space ")}  ${bold(space)}`,
+      `${dim("broker")}  ${server}${tlsFor(server as string) ? dim("  (TLS required)") : ""}`,
+      `${dim("mode  ")}  ${mode}${unverified ? dim("  (not verified - the broker was not reachable/checked)") : dim(mode === "auth" ? "  (broker enforces credentials)" : "  (broker is open)")}`,
+      ...(replace ? [`${dim("note  ")}  ${bold("replaces")} the existing record for "${space}"`] : []),
+      `${dim("folder")}  ${root}`,
+    ].join("\n"),
+    brand("About to record"),
+  );
+  // Replacing a record is the one write here that loses something, so Enter must not do it: it takes
+  // a typed yes, and Enter keeps No.
+  const go = await io.confirm({ message: replace ? `Replace the record for "${space}"?` : "Register this mesh?", ...(replace ? { initialValue: false } : {}) });
+  if (!go) return cancelled(io, "Nothing was registered.");
+
+  // The guided consent is PERSISTED, exactly as the flag form persists it. Asking the operator and
+  // then writing a record that does not remember the answer is the printed-and-forgotten shape the
+  // opt-in replaced, one surface over.
+  const entry: MeshEntry = {
+    space, server: server as string, root, mode, origin: "manual",
+    // The guided form's TLS intent, from `--tls` or the typed scheme, persisted the same way the
+    // flag form persists it — recorded strictness is what the dial policy relaxed on, so it must be carried.
+    ...(tlsFor(server as string) ? { tlsRequired: true } : {}),
+    // From the FINAL classification, never from "the operator accepted something earlier". The
+    // flag form persists `dial.residual` for the same reason: the field is evidence about the
+    // recorded target, and evidence that can detach from its subject is worse than none, because
+    // the use-time fence this exists for would read it as authorization.
+    ...(overlayResidual ? { unencryptedOverlay: true } : {}),
+    ts: new Date().toISOString(),
+  };
+  const result = writeRecord(entry);
+
+  // Padded from the rendered widths, not a guess: the commands carry the space name, so a
+  // hard-coded gutter misaligns for every name but the one it was written against.
+  const rows: [string, string][] = [
+    result.adoptedCurrent
+      ? ["cotal spawn", "launch an agent into it (it is now the default)"]
+      : [`cotal use ${space}`, "make it the default a bare spawn joins"],
+    [`cotal status --space ${space}`, "check it"],
+    [`cotal meshes rm ${space}`, "forget it again (never stops the mesh)"],
+  ];
+  const width = Math.max(...rows.map(([cmd]) => cmd.length));
+  io.note(rows.map(([cmd, why]) => `${bold(cmd.padEnd(width))}  ${dim(why)}`).join("\n"), brand("What you can do now"));
+  io.outro(ok(`Registered "${space}"${result.keptCurrent ? ` - "${result.keptCurrent}" is still the default` : ""}`));
+  return true;
+}
+
+/** Ask for the folder, re-asking until it resolves. `defaultTo` is accepted on an empty answer;
+ *  without one, an empty answer is a non-answer rather than a silent fallback. */
+async function askRoot(io: WizardIO, cwd: string, defaultTo: string | undefined): Promise<string> {
+  for (;;) {
+    const typed = await io.text({
+        message: "Local folder for this mesh's credentials and personas",
+        placeholder: defaultTo ?? "the folder holding its .cotal/auth",
+        // Pressing Enter takes the default, and the answer line then shows that folder.
+        ...(defaultTo ? { defaultValue: defaultTo } : {}),
+        validate: (v) => {
+          const candidate = v || defaultTo;
+          if (!candidate) return "Required - the folder that holds this mesh's .cotal/auth and .cotal/agents.";
+          return isDir(candidate) ? undefined : "Not a directory - it must already exist.";
+        },
+      });
+    const r = checkRoot(typed || (defaultTo as string), cwd);
+    if (r.ok) return r.value;
+    io.log.error(r.message);
+  }
+}
+
+/** A refusal with its next step on the line under it, as the flag form prints the two. */
+function withRemedy(r: { message: string; remedy?: string }): string {
+  return r.remedy ? `${r.message}\n${r.remedy}` : r.message;
+}
+
+function cancelled(io: WizardIO, message = CANCELLED): false {
+  io.cancel(message);
+  return false;
+}

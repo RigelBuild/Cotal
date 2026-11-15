@@ -1,0 +1,1659 @@
+/**
+ * The event emitter: the replica preflight's production call site, the one-unit-one-frame packing
+ * rule, and the halts that are supposed to be halts.
+ *
+ * WHAT IS REAL HERE AND WHAT IS NOT, stated up front because it decides what these cells prove.
+ * The `EventWal` is real and on a real filesystem. The `JsonlFileSource` is real and reads real
+ * appended bytes. ONLY the broker is substituted, and it is substituted by an instrument that
+ * RECORDS every call rather than one that pretends to succeed — because most of what this suite
+ * asserts is about calls that must NOT happen, and a mock that only knows how to return a value
+ * cannot testify to an absence.
+ *
+ * THE ORDERING CELLS ARE THE POINT OF THE FILE. `assertExpectationSemantics()` shipped with ZERO
+ * production callers: a check that existed, had its own suite, and never ran anywhere real. Moving
+ * it into `AguiEmitter.start()` is only worth something if it runs BEFORE anything can publish, and
+ * the publish that matters most is the one recovery makes — a `sent_unacked` frame re-published with
+ * a frozen id. A preflight placed after recovery would leave exactly that publish outside the guard
+ * while looking, in a diff, identical.
+ *
+ * THE HALT CELLS RE-READ THE WAL FROM DISK. Asserting on the in-memory frontier of the object that
+ * just halted proves the object did not mutate a field; the claim is that NOTHING WAS PERSISTED, and
+ * only a fresh `EventWal.open()` of the same path can say that.
+ *
+ * KILL SET, predicted as NAMES before the run:
+ *   E1  run the preflight AFTER recovery instead of before
+ *       -> `preflight:runs-before-RECOVERY-republishes-a-frozen-frame` ONLY. Every other cell stays
+ *          green, including the ordinary preflight cell, because on a WAL with no pending frame the
+ *          two orderings are indistinguishable. That is the whole danger.
+ *   E2  treat a duplicate ack as success (fold it) instead of halting
+ *       -> `halt:duplicate-on-a-FIRST-attempt-does-not-move-the-frontier-ON-DISK`
+ *   E3  publish frames splitting at EVENT boundaries, so an oversized unit is truncated rather than
+ *       refused -> `pack:one-observation-one-frame-a-single-oversized-unit-FAILS-LOUD`
+ *   E4  let one frame carry two runs -> `pack:a-run-change-flushes-even-when-the-frame-has-room`
+ *   E5  drop the cursor-only advance on an empty map -> `cursor-only:an-adopt-persists-its-cursor`
+ *   E6  size with a SHORT id instead of the longest admissible one
+ *       -> `sizing:the-UPPER-BOUND-keeps-a-packed-frame-under-the-REAL-ceiling`. Added because the
+ *          two earlier sizing cells assert a property of `encodedSize` and NOT of the emitter, so
+ *          they would have stayed green with `SIZING_ID` set to anything at all.
+ *
+ * ALL SIX KILLED, each on the cell it was predicted against, with the run's outcome recorded rather
+ * than the prediction restated. E5 first came back KILLED-but-with-ZERO-MARKS — the right verdict
+ * from a suite that had died rather than failed, which is the worse version of that defect because
+ * a correct verdict invites no second look. Fixed by running each fixture block inside a guard.
+ *
+ * SECOND KILL SET (the [D1] interim: a bracket refusal must say WHOSE fault it is), predicted as
+ * NAMES before its run. The two conditions are tested by their INVERSES, because each one alone
+ * produces a CONFIDENT WRONG diagnosis — worse than the anonymous error it replaced, since a named
+ * cause stops the search:
+ *   B1  drop the "this process has fed nothing yet" condition
+ *       -> `bracket:CONTROL-a-violation-after-this-process-FED-but-never-FOLDED-is-NOT-blamed-on-lost-state`
+ *   B2  drop the "the frontier is non-virgin" condition
+ *       -> `bracket:CONTROL-a-violation-on-a-MIGRATED-VIRGIN-frontier-is-NOT-blamed-on-lost-state`
+ *   B3  never diagnose; surface the raw refusal
+ *       -> `bracket:a-mid-run-restart-names-ITSELF-not-the-writer`
+ *   B4  drop the "the WAL cannot say what was open" condition (added with WAL v2)
+ *       -> `bracket:CONTROL-a-violation-after-a-RESTORED-restart-is-NOT-blamed-on-lost-state`
+ *   V1  migrate a v1 document to an EMPTY bracket state instead of UNKNOWN
+ *       -> `bracket:a-mid-run-restart-names-ITSELF-not-the-writer`
+ *   V2  do not restore the persisted machine at startup
+ *       -> `bracket:a-mid-run-restart-CONTINUES-because-the-state-was-persisted`
+ *   V3  fold does not promote the frame's frozen bracket state
+ *       -> `bracket:the-open-run-is-PERSISTED-in-the-WAL`
+ * B1 and B2 are the pair worth reading together: each one leaves the headline cell GREEN and kills
+ * only its own control, which is what a confident wrong diagnosis looks like from the inside.
+ *
+ * AND B1/B2 NAME DIFFERENT CELLS ABOVE THAN THEY DID ONE COMMIT AGO, BECAUSE WAL v2 SILENTLY
+ * INVALIDATED THEIR OLD ONES. Both were KILLED before v2 and both SURVIVED after it, on an
+ * unchanged predicate and unchanged controls. Adding the third condition (`the WAL cannot say what
+ * was open`) meant every case those controls exercised was already answered by it — each used a v2
+ * WAL, whose bracket state is non-null — so conditions 1 and 2 could be deleted with nothing
+ * noticing. That is this fleet's own rule arriving from the other side: DEFENCE IN DEPTH DEFEATS
+ * OUTCOME-BASED TESTING, and a control written against a two-term predicate does not survive a
+ * third term for free.
+ *
+ * The diagnosis was NOT "equivalent mutant" and NOT "weak assertion" — those need opposite repairs
+ * and the wrong one here would have deleted a live condition. Both conditions are REACHABLE with
+ * `brackets === null` held constant, and neither was covered:
+ *   - condition 1 is reached when a batch VALIDATES (setting `fedAnyEvent`) and then fails to PACK,
+ *     so nothing folds and the WAL still records no bracket state;
+ *   - condition 2 is reached by a MIGRATED v1 document that is also VIRGIN — nothing was ever
+ *     published, so nothing could have been lost.
+ * The two cells below hold `brackets === null` and vary one condition each. The pre-v2 controls are
+ * kept: they no longer discriminate, but they still assert real behaviour, and deleting a cell
+ * because a mutation stopped reaching it is how coverage is lost quietly.
+ *
+ * ALL SEVEN KILLED on their named cells, each with 1 mark against a baseline of 1 — so each verdict
+ * came from a suite that RAN and failed, not one that died. Instrument: `pnpm mutation-proof
+ * --config ../mut-agui-v2.json`, tree clean before and after.
+ *
+ * ONE THING NO CELL HERE CAN DISCRIMINATE, said plainly rather than left as an unproven constant:
+ * `SIZING_EXPECTATION`. Measuring at `MAX_SAFE_INTEGER` is a provable upper bound, but the real
+ * expectation is a stream sequence, and reaching a 16-digit one takes ~10^15 messages. A mutation
+ * lowering it therefore survives on any reachable fixture. It is an equivalent mutant AT THIS SCALE,
+ * not a coverage gap, and the distinction matters because the two need opposite repairs.
+ *
+ * Run: pnpm smoke:agui-emitter
+ */
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, appendFileSync, chmodSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { eventChannel, principalKey, type Part } from "@cotal-ai/core";
+import {
+  aguiFrame,
+  AguiVocabularyError,
+  runFinished,
+  runStarted,
+  textMessageContent,
+  textMessageEnd,
+  textMessageStart,
+  type AguiEvent,
+  RUN_ERROR_EGRESS_MESSAGE,
+  type AguiFrame,
+} from "../src/agui.js";
+import {
+  AguiEmitter,
+  AguiBracketStateLost,
+  AguiEmitterHalted,
+  packUnits,
+  type EmitUnit,
+} from "../src/agui-emitter.js";
+import { JsonlFileSource, type DurableSource } from "../src/durable-source.js";
+import { EventWal } from "../src/event-wal.js";
+import { memorySubjectFrontier } from "@cotal-ai/smoke-kit";
+
+let ok = 0,
+  fail = 0;
+const c = (n: string, v: boolean, extra?: unknown) => {
+  if (v) ok++;
+  else {
+    fail++;
+    console.log("  x FAIL:", n, extra ?? "");
+  }
+};
+
+/** Run and report the refusal AS A VALUE. A cell that lets the subject throw into its own assertion
+ *  stops reporting the moment the subject throws, and a cell that stops reporting is
+ *  indistinguishable from one that never ran — found by a mutation on a sibling suite, fixed at the
+ *  class here rather than after the same mutation finds it again. */
+const attempt = async <T>(fn: () => Promise<T>): Promise<{ value?: T; err?: Error }> => {
+  try {
+    return { value: await fn() };
+  } catch (e) {
+    return { err: e as Error };
+  }
+};
+
+const PRINCIPAL = { owner: "local", actor: "aaa" };
+const PRINCIPAL_KEY = "local.aaa";
+const SPACE = "main";
+const THREAD = "thread-1";
+
+interface Call {
+  id: string;
+  expectedLastSubjectSeq: number;
+  parts: Part[];
+  /** THE SUBJECT THE FRAME WENT TO. Recorded because the claim "nothing caller-supplied can select
+   *  the subject" is a claim about every publish, and a instrument that discards the channel can
+   *  testify to nothing about it. */
+  channel: string;
+}
+
+/**
+ * The broker instrument. It records; it does not pretend.
+ *
+ * `maxPayload` and `encodedSize` are deliberately a HONEST encoding of what the real endpoint does
+ * — JSON bytes plus a fixed header allowance — rather than a constant. A packer measured against a
+ * constant is not a packer.
+ */
+class FakeEndpoint {
+  readonly principal: { owner: string; actor: string };
+  readonly actorIsEphemeral: boolean;
+  constructor(o?: { principal?: { owner: string; actor: string }; actorIsEphemeral?: boolean }) {
+    this.principal = o?.principal ?? PRINCIPAL;
+    this.actorIsEphemeral = o?.actorIsEphemeral ?? false;
+  }
+  maxPayload = 4096;
+  preflightError: Error | undefined;
+  preflightCalls = 0;
+  publishes: Call[] = [];
+  /** Answers, consumed in order. A missing answer is a loud failure, never a default success. A
+   *  function answer is awaited: the publish is ON THE WIRE until it resolves. */
+  answers: ({ seq: number; duplicate: boolean } | Error | (() => Promise<{ seq: number; duplicate: boolean }>))[] = [];
+
+  async assertExpectationSemantics(): Promise<void> {
+    this.preflightCalls += 1;
+    if (this.preflightError) throw this.preflightError;
+  }
+
+  encodedSize(o: { channel: string; parts: Part[]; id: string; expectedLastSubjectSeq: number }): number {
+    return (
+      Buffer.byteLength(JSON.stringify({ channel: o.channel, parts: o.parts, id: o.id, e: o.expectedLastSubjectSeq }), "utf8") +
+      64 // a fixed stand-in for the encoded headers the real client adds
+    );
+  }
+
+  async multicastExpecting(o: {
+    channel: string;
+    parts: Part[];
+    id: string;
+    expectedLastSubjectSeq: number;
+  }): Promise<{ ack: { seq: number; duplicate: boolean } }> {
+    this.publishes.push({ id: o.id, expectedLastSubjectSeq: o.expectedLastSubjectSeq, parts: o.parts, channel: o.channel });
+    // THE INSTRUMENT ENFORCES THE CEILING, because the broker does. A fake that accepts any size
+    // cannot witness an over-packed frame, and "the packer produced N frames" is not the property —
+    // "every frame it produced could actually be sent" is.
+    const size = this.encodedSize(o);
+    if (size > this.maxPayload)
+      throw new Error(`FakeEndpoint: payload ${size} exceeds max_payload ${this.maxPayload}`);
+    const a = this.answers.shift();
+    if (a === undefined) throw new Error("FakeEndpoint: publish with no scripted answer");
+    if (a instanceof Error) throw a;
+    if (typeof a === "function") return { ack: await a() };
+    return { ack: a };
+  }
+}
+
+/** A neutral bracket snapshot for fixtures whose subject is NOT the bracket machine. Named so a
+ *  reader can see at a glance which cells are about brackets and which merely need the field. */
+const BR = { run: undefined, text: [], reasoning: [], tools: [] };
+
+// A WELL-FORMED frozen body for the cells below, which are about the WAL/CAS machinery and not
+// about frame content. They previously froze `{ kind, protocol }` with no `events` at all. No such
+// frame can exist in production: `aguiFrame()` enforces a non-empty events ARRAY at construction,
+// and the publish path iterates `frame.events` before `beginSend`. The egress fence now HALTS on a
+// frozen body whose event list it cannot read, rather than publishing it opaque onto a channel with
+// a different read ACL, so a stub that could never have been written is no longer a usable stand-in
+// for "some frozen frame".
+const frozenBody = (): Part[] => [
+  {
+    kind: "ag-ui.frame",
+    protocol: "ag-ui/0.0.57",
+    threadId: THREAD,
+    runId: "frozen-run",
+    epoch: "frozen-epoch",
+    seq: 1,
+    events: [{ type: "RUN_STARTED", threadId: THREAD, runId: "frozen-run", timestamp: 1 }],
+  } as unknown as Part,
+];
+
+const casLoss = (): Error => Object.assign(new Error("wrong last sequence"), { code: 10071 });
+
+/** One turn's worth of legal, bracketed events. */
+const turn = (runId: string, messageId: string, text: string): AguiEvent[] => [
+  runStarted({ threadId: THREAD, runId, timestamp: 1 }),
+  textMessageStart({ messageId, timestamp: 2, role: "assistant" }),
+  textMessageContent({ messageId, delta: text, timestamp: 3 }),
+  textMessageEnd({ messageId, timestamp: 4 }),
+  runFinished({ threadId: THREAD, runId, timestamp: 5 }),
+];
+
+type Rec = { run: string; msg: string; text: string } | { skip: true };
+
+const mapper = (r: Rec) => ("skip" in r ? null : { runId: r.run, events: turn(r.run, r.msg, r.text) });
+
+/**
+ * Run one fixture block, converting an UNEXPECTED CRASH into a named cell failure.
+ *
+ * A cell that reports is worth something; a suite that dies is worth nothing. When a mutation makes
+ * a read return no records, the very next line indexes into an empty array and the whole run ends
+ * with no summary and no progress marks — the harness then sees a red it cannot attribute, which is
+ * the same shape as a chain reporting zero graded lines. Guarding the CALL is not enough; a crash
+ * anywhere in a block must not silence the other blocks' cells.
+ */
+const block = async (name: string, fn: () => Promise<void>): Promise<void> => {
+  try {
+    await fn();
+  } catch (e) {
+    c(`${name} (block crashed)`, false, String(e));
+  }
+};
+
+const dir = mkdtempSync(join(tmpdir(), "agui-emitter-"));
+
+const fresh = async (name: string, opts?: { subjectMayExist?: boolean }) => {
+  const d = join(dir, name);
+  const src = join(d, "session.jsonl");
+  const walPath = join(d, "wal.json");
+  const { mkdirSync } = await import("node:fs");
+  mkdirSync(d, { recursive: true });
+  writeFileSync(src, "");
+  const wal = await EventWal.open(walPath, {
+    space: SPACE,
+    threadId: THREAD,
+    principal: PRINCIPAL_KEY,
+    subjectMayExist: opts?.subjectMayExist ?? false,
+  });
+  return { d, src, walPath, wal, source: new JsonlFileSource<Rec>(src) };
+};
+
+const append = (path: string, ...recs: Rec[]) => {
+  appendFileSync(path, recs.map((r) => JSON.stringify(r)).join("\n") + "\n");
+};
+
+try {
+  // ── THE PREFLIGHT RUNS, AND IT RUNS BEFORE ANYTHING PUBLISHES ────────────────────────────────
+  await block("THE PREFLIGHT RUNS, AND IT RUNS BEFORE ANYTHING PUBLISHES", async () => {
+    const { wal, source } = await fresh("preflight-ok");
+    const ep = new FakeEndpoint();
+    const started = await attempt(() => AguiEmitter.start({ endpoint: ep, wal, subjectFrontier: memorySubjectFrontier(), source, map: mapper }));
+    c("preflight:start-calls-it-exactly-once", ep.preflightCalls === 1 && !started.err, {
+      calls: ep.preflightCalls,
+      err: started.err?.message,
+    });
+    c("preflight:CONTROL-a-passing-preflight-does-not-block-the-emitter", started.value !== undefined, started.err?.message);
+  });
+  await block("THE PREFLIGHT RUNS, AND IT RUNS BEFORE ANYTHING PUBLISHES", async () => {
+    const { wal, source } = await fresh("preflight-fails");
+    const ep = new FakeEndpoint();
+    ep.preflightError = new Error('stream "CHAT_main" reports num_replicas=3; serialized appends require 1.');
+    const started = await attempt(() => AguiEmitter.start({ endpoint: ep, wal, subjectFrontier: memorySubjectFrontier(), source, map: mapper }));
+    c(
+      "preflight:a-refusing-preflight-refuses-the-EMITTER",
+      started.err !== undefined && /num_replicas=3/.test(started.err.message),
+      started.err?.message ?? "no throw",
+    );
+    // The refusal must assert WHICH refusal, and the emitter must not exist afterwards.
+    c("preflight:nothing-was-published", ep.publishes.length === 0, ep.publishes);
+  });
+
+  // ── THE ORDERING CELL: RECOVERY'S RE-PUBLISH IS INSIDE THE GUARD, NOT AFTER IT ────────────────
+  //
+  // A WAL holding a `sent_unacked` frame is the one state where the preflight's placement is
+  // OBSERVABLE. With no pending frame, before-recovery and after-recovery are the same program.
+  await block("THE ORDERING CELL: RECOVERY'S RE-PUBLISH IS INSIDE THE GUARD, NOT AFTE", async () => {
+    const { wal, source } = await fresh("preflight-before-recovery");
+    // The log is driven directly here, so it needs the record bound BEFORE the first transition:
+    // an unbound log has no expectation to publish and says so. The SAME instance goes to the
+    // emitter below, which rebinds it as a no-op; a different one would be two beliefs about
+    // which subject this log publishes to.
+    const sf = memorySubjectFrontier();
+    await wal.bindSubjectFrontier(sf);
+    await wal.beginSend({
+      id: "frozen-id-1",
+      E: 0,
+      seq: 1,
+      sourceCursor: "1:2:0:0000000000000000",
+      body: frozenBody(),
+      brackets: BR,
+    });
+    const ep = new FakeEndpoint();
+    ep.preflightError = new Error("cannot verify expectation semantics: stream info unavailable");
+    ep.answers = [{ seq: 9, duplicate: false }];
+    const started = await attempt(() => AguiEmitter.start({ endpoint: ep, wal, subjectFrontier: sf, source, map: mapper }));
+    c(
+      "preflight:runs-before-RECOVERY-republishes-a-frozen-frame",
+      started.err !== undefined && ep.publishes.length === 0,
+      { err: started.err?.message, publishes: ep.publishes.length },
+    );
+    // …and the frame is STILL pending on disk: a refused startup must not consume the thing it
+    // refused to handle.
+    const reread = await EventWal.open(join(dir, "preflight-before-recovery", "wal.json"), {
+      space: SPACE,
+      threadId: THREAD,
+      principal: PRINCIPAL_KEY,
+      subjectMayExist: true,
+    });
+    c(
+      "preflight:the-pending-frame-survives-a-refused-startup",
+      reread.pending?.state === "sent_unacked" && reread.pending.id === "frozen-id-1",
+      reread.pending,
+    );
+  });
+
+  // ── PENDING RECOVERY PROMOTES ITS BRACKET STATE IN MEMORY ────────────────────────────────────
+  await block("PENDING RECOVERY PROMOTES ITS BRACKET STATE IN MEMORY", async () => {
+    const { wal, source, src } = await fresh("pending-brackets-live");
+    const sf = memorySubjectFrontier();
+    await wal.bindSubjectFrontier(sf);
+    const cursor = (await source.read(undefined)).cursor;
+    const open = { run: "old-run", text: [], reasoning: [], tools: [] };
+    await wal.beginSend({
+      id: "old-start",
+      E: 0,
+      seq: 1,
+      sourceCursor: cursor,
+      body: frozenBody(),
+      brackets: open,
+    });
+    await wal.recordAck(1);
+    await wal.fold();
+    await wal.beginSend({
+      id: "old-finish",
+      E: wal.expectedTip,
+      seq: 2,
+      sourceCursor: cursor,
+      body: frozenBody(),
+      brackets: BR,
+    });
+    append(src, { run: "next-run", msg: "next-message", text: "after recovery" });
+
+    const ep = new FakeEndpoint();
+    ep.answers = [
+      { seq: 2, duplicate: false }, // retry and fold the pending terminal
+      { seq: 3, duplicate: false }, // publish the next complete run
+    ];
+    const started = await attempt(() =>
+      AguiEmitter.start({ endpoint: ep, wal, subjectFrontier: sf, source, map: mapper }),
+    );
+    const pumped = started.value === undefined ? { err: started.err } : await attempt(() => started.value!.pump());
+    c(
+      "recover:a-pending-terminal-promotes-its-brackets-before-the-next-pump",
+      started.err === undefined &&
+        pumped.err === undefined &&
+        pumped.value?.frames === 1 &&
+        ep.publishes.length === 2 &&
+        ((ep.publishes[1]?.parts[0] as unknown as AguiFrame | undefined)?.events[0] as { type?: string } | undefined)?.type === "RUN_STARTED",
+      { started: started.err?.message, pumped: pumped.err?.message, publishes: ep.publishes.length },
+    );
+  });
+
+  await block("ACKED RECOVERY PROMOTES ITS BRACKET STATE IN MEMORY", async () => {
+    const { wal, source, src } = await fresh("acked-brackets-live");
+    const sf = memorySubjectFrontier();
+    await wal.bindSubjectFrontier(sf);
+    const cursor = (await source.read(undefined)).cursor;
+    const open = { run: "old-run", text: [], reasoning: [], tools: [] };
+    await wal.beginSend({
+      id: "acked-start",
+      E: 0,
+      seq: 1,
+      sourceCursor: cursor,
+      body: frozenBody(),
+      brackets: open,
+    });
+    await wal.recordAck(1);
+    await wal.fold();
+    await wal.beginSend({
+      id: "acked-finish",
+      E: wal.expectedTip,
+      seq: 2,
+      sourceCursor: cursor,
+      body: frozenBody(),
+      brackets: BR,
+    });
+    await wal.recordAck(2); // crash after ack, before fold
+    append(src, { run: "next-run", msg: "next-message", text: "after acked recovery" });
+
+    const ep = new FakeEndpoint();
+    ep.answers = [{ seq: 3, duplicate: false }];
+    const started = await attempt(() =>
+      AguiEmitter.start({ endpoint: ep, wal, subjectFrontier: sf, source, map: mapper }),
+    );
+    const pumped = started.value === undefined ? { err: started.err } : await attempt(() => started.value!.pump());
+    c(
+      "recover:an-acked-pending-promotes-its-brackets-before-the-next-pump",
+      started.err === undefined &&
+        pumped.err === undefined &&
+        pumped.value?.frames === 1 &&
+        ep.publishes.length === 1 &&
+        ((ep.publishes[0]?.parts[0] as unknown as AguiFrame | undefined)?.events[0] as { type?: string } | undefined)?.type === "RUN_STARTED",
+      { started: started.err?.message, pumped: pumped.err?.message, publishes: ep.publishes.length },
+    );
+  });
+
+  // ── THE WAL MUST BE THIS PRINCIPAL'S ──────────────────────────────────────────────────────────
+  await block("THE WAL MUST BE THIS PRINCIPAL'S", async () => {
+    const { source } = await fresh("wrong-principal");
+    const other = await EventWal.open(join(dir, "wrong-principal", "other.json"), {
+      space: SPACE,
+      threadId: THREAD,
+      principal: "local.bbb",
+      subjectMayExist: false,
+    });
+    const ep = new FakeEndpoint();
+    const started = await attempt(() => AguiEmitter.start({ endpoint: ep, wal: other, subjectFrontier: memorySubjectFrontier(), source, map: mapper }));
+    c(
+      "identity:a-WAL-belonging-to-another-principal-is-refused",
+      started.err !== undefined && /local\.bbb/.test(started.err.message) && /local\.aaa/.test(started.err.message),
+      started.err?.message ?? "no throw",
+    );
+  });
+
+  // ── THE ORDINARY PATH: read, map, publish, fold ────────────────────────────────────────────────
+  await block("THE ORDINARY PATH: read, map, publish, fold", async () => {
+    const { wal, source, src, walPath } = await fresh("happy");
+    const ep = new FakeEndpoint();
+    const em = (await attempt(() => AguiEmitter.start({ endpoint: ep, wal, subjectFrontier: memorySubjectFrontier(), source, map: mapper }))).value!;
+
+    // A fresh adopt reads nothing — and MUST still persist where it adopted, or the next read
+    // adopts a LATER end and silently skips everything appended in between.
+    const adopt = await attempt(() => em.pump());
+    const afterAdopt = wal.frontier.sourceCursor;
+    c("cursor-only:an-adopt-persists-its-cursor", adopt.value?.frames === 0 && typeof afterAdopt === "string", {
+      pumped: adopt.value,
+      cursor: afterAdopt,
+    });
+
+    append(src, { run: "r1", msg: "m1", text: "hello" });
+    ep.answers = [{ seq: 11, duplicate: false }];
+    const p1 = await attempt(() => em.pump());
+    c("emit:one-record-becomes-one-frame", p1.value?.frames === 1 && p1.value.events === 5, { p: p1.value, err: p1.err?.message });
+    c("emit:the-frame-is-the-only-part-and-carries-the-vocabulary", (() => {
+      const parts = ep.publishes[0]?.parts;
+      const f = parts?.[0] as unknown as AguiFrame | undefined;
+      return parts?.length === 1 && f?.kind === "ag-ui.frame" && f.seq === 1 && f.runId === "r1" && f.events.length === 5;
+    })(), ep.publishes[0]?.parts);
+    c("emit:the-first-publish-expects-a-VIRGIN-subject", ep.publishes[0]?.expectedLastSubjectSeq === 0, ep.publishes[0]);
+
+    // Transition 3 happened: the ack's seq is the new tip and the cursor moved off the adopt point.
+    const disk = await EventWal.open(walPath, { space: SPACE, threadId: THREAD, principal: PRINCIPAL_KEY, subjectMayExist: true });
+    c(
+      "emit:the-ack-is-folded-ON-DISK-and-pending-is-cleared",
+      disk.pending === null && disk.frontier.seq === 1 && disk.frontier.lastSubjectSeq === 11 && disk.frontier.sourceCursor !== afterAdopt,
+      disk.frontier,
+    );
+
+    // The NEXT publish expects the sequence the broker assigned, never a re-read tip.
+    append(src, { run: "r2", msg: "m2", text: "again" });
+    ep.answers = [{ seq: 12, duplicate: false }];
+    await attempt(() => em.pump());
+    c("emit:the-next-publish-expects-the-ACK'd-sequence", ep.publishes[1]?.expectedLastSubjectSeq === 11, ep.publishes[1]);
+    c("emit:seq-advances-by-one-per-frame", (ep.publishes[1]?.parts[0] as unknown as AguiFrame | undefined)?.seq === 2, ep.publishes[1]?.parts[0]);
+  });
+
+  // ── THE CURSOR-ONLY RULE: A RECORD THAT MAPS TO NOTHING ADVANCES THE CURSOR AND NOTHING ELSE ────────────────
+  await block("THE CURSOR-ONLY RULE: A RECORD THAT MAPS TO NOTHING ADVANCES THE CURSOR", async () => {
+    const { wal, source, src, walPath } = await fresh("p7");
+    const ep = new FakeEndpoint();
+    const em = (await attempt(() => AguiEmitter.start({ endpoint: ep, wal, subjectFrontier: memorySubjectFrontier(), source, map: mapper }))).value!;
+    await em.pump(); // adopt
+    const before = wal.frontier;
+    append(src, { skip: true }, { skip: true });
+    const p = await attempt(() => em.pump());
+    const disk = await EventWal.open(walPath, { space: SPACE, threadId: THREAD, principal: PRINCIPAL_KEY, subjectMayExist: true });
+    c(
+      "cursor-only:a-dropped-range-advances-the-cursor-alone",
+      p.value?.frames === 0 &&
+        ep.publishes.length === 0 &&
+        disk.frontier.seq === before.seq &&
+        disk.frontier.lastSubjectSeq === before.lastSubjectSeq &&
+        disk.frontier.sourceCursor !== before.sourceCursor,
+      { pumped: p.value, before, after: disk.frontier },
+    );
+  });
+
+  // ── HALT: A DUPLICATE ACK ON A FIRST ATTEMPT ─────────────────────────────────────────────────
+  //
+  // We have never published this id, so a body WE DID NOT WRITE holds it. Folding its `ackSeq`
+  // would advance the frontier and the source cursor past events that were never published.
+  await block("HALT: A DUPLICATE ACK ON A FIRST ATTEMPT", async () => {
+    const { wal, source, src, walPath } = await fresh("dup-first");
+    const ep = new FakeEndpoint();
+    const em = (await attempt(() => AguiEmitter.start({ endpoint: ep, wal, subjectFrontier: memorySubjectFrontier(), source, map: mapper }))).value!;
+    await em.pump();
+    const before = wal.frontier;
+    append(src, { run: "r1", msg: "m1", text: "hello" });
+    ep.answers = [{ seq: 77, duplicate: true }];
+    const p = await attempt(() => em.pump());
+    c(
+      "halt:a-duplicate-on-a-FIRST-attempt-halts-and-says-WHY",
+      p.err instanceof AguiEmitterHalted &&
+        p.err.reason === "duplicate-ack" &&
+        /FIRST attempt/.test(p.err.message) &&
+        /never published this id/.test(p.err.message),
+      p.err?.message ?? "no throw",
+    );
+    // RE-READ FROM DISK. The claim is that nothing was persisted, and the in-memory object cannot
+    // testify to that.
+    const disk = await EventWal.open(walPath, { space: SPACE, threadId: THREAD, principal: PRINCIPAL_KEY, subjectMayExist: true });
+    c(
+      "halt:duplicate-on-a-FIRST-attempt-does-not-move-the-frontier-ON-DISK",
+      disk.frontier.seq === before.seq &&
+        disk.frontier.lastSubjectSeq === before.lastSubjectSeq &&
+        disk.frontier.sourceCursor === before.sourceCursor,
+      { before, onDisk: disk.frontier },
+    );
+    c("halt:the-frame-stays-pending-and-unacked", disk.pending?.state === "sent_unacked", disk.pending);
+    c("halt:the-emitter-refuses-to-pump-again", (await attempt(() => em.pump())).err instanceof AguiEmitterHalted, "");
+    c("halt:it-reports-itself-stopped", em.stopped === true, em.stopped);
+  });
+
+  // ── HALT: A DUPLICATE ACK ON A RETRY — THE SINGLE-REPLICA RETRY RULE VIOLATED, AND THE MESSAGE MUST SAY SO ──────────
+  //
+  // The CONTROL that makes this cell mean something is the FIRST-attempt cell above: two halts that
+  // both say "duplicate" prove nothing about which path produced them. These assert the DIFFERENT
+  // diagnosis each one is supposed to carry.
+  await block("HALT: A DUPLICATE ACK ON A RETRY — THE SINGLE-REPLICA RETRY RULE VIOLATED", async () => {
+    const { source, walPath } = await fresh("dup-retry");
+    const wal = await EventWal.open(walPath, { space: SPACE, threadId: THREAD, principal: PRINCIPAL_KEY, subjectMayExist: false });
+    // The log is driven directly here, so it needs the record bound BEFORE the first transition:
+    // an unbound log has no expectation to publish and says so. The SAME instance goes to the
+    // emitter below, which rebinds it as a no-op; a different one would be two beliefs about
+    // which subject this log publishes to.
+    const sf = memorySubjectFrontier();
+    await wal.bindSubjectFrontier(sf);
+    await wal.beginSend({
+      id: "frozen-retry",
+      E: 0,
+      seq: 1,
+      sourceCursor: "1:2:0:0000000000000000",
+      body: frozenBody(),
+      brackets: BR,
+    });
+    const ep = new FakeEndpoint();
+    ep.answers = [{ seq: 88, duplicate: true }];
+    const started = await attempt(() => AguiEmitter.start({ endpoint: ep, wal, subjectFrontier: sf, source, map: mapper }));
+    c(
+      "halt:a-duplicate-on-a-RETRY-names-the-SINGLE-REPLICA-RETRY-RULE-rather-than-a-foreign-first-publish",
+      started.err instanceof AguiEmitterHalted &&
+        started.err.reason === "duplicate-ack" &&
+        /RETRY/.test(started.err.message) &&
+        /SINGLE-REPLICA RETRY RULE/.test(started.err.message) &&
+        !/never published this id/.test(started.err.message),
+      started.err?.message ?? "no throw",
+    );
+    c("halt:the-retry-published-the-FROZEN-id-and-E", ep.publishes[0]?.id === "frozen-retry" && ep.publishes[0].expectedLastSubjectSeq === 0, ep.publishes[0]);
+    const disk = await EventWal.open(walPath, { space: SPACE, threadId: THREAD, principal: PRINCIPAL_KEY, subjectMayExist: true });
+    c("halt:the-retry-halt-leaves-the-frontier-at-zero-ON-DISK", disk.frontier.seq === 0 && disk.frontier.lastSubjectSeq === 0, disk.frontier);
+  });
+
+  // ── CONTROL: THE SAME RECOVERY PATH SUCCEEDS ON A NON-DUPLICATE ACK ──────────────────────────
+  //    A halt that fires because the guard is correct and one that fires because the path is broken
+  //    look identical from the halting side. This is the inverse of the predicate under test.
+  await block("CONTROL: THE SAME RECOVERY PATH SUCCEEDS ON A NON-DUPLICATE ACK", async () => {
+    const { source, walPath } = await fresh("retry-ok");
+    const wal = await EventWal.open(walPath, { space: SPACE, threadId: THREAD, principal: PRINCIPAL_KEY, subjectMayExist: false });
+    // The log is driven directly here, so it needs the record bound BEFORE the first transition:
+    // an unbound log has no expectation to publish and says so. The SAME instance goes to the
+    // emitter below, which rebinds it as a no-op; a different one would be two beliefs about
+    // which subject this log publishes to.
+    const sf = memorySubjectFrontier();
+    await wal.bindSubjectFrontier(sf);
+    await wal.beginSend({
+      id: "frozen-ok",
+      E: 0,
+      seq: 1,
+      sourceCursor: "1:2:0:0000000000000000",
+      body: frozenBody(),
+      brackets: BR,
+    });
+    const ep = new FakeEndpoint();
+    ep.answers = [{ seq: 5, duplicate: false }];
+    const started = await attempt(() => AguiEmitter.start({ endpoint: ep, wal, subjectFrontier: sf, source, map: mapper }));
+    const disk = await EventWal.open(walPath, { space: SPACE, threadId: THREAD, principal: PRINCIPAL_KEY, subjectMayExist: true });
+    c(
+      "halt:CONTROL-recovery-with-a-NON-duplicate-ack-folds-and-continues",
+      started.err === undefined && disk.pending === null && disk.frontier.seq === 1 && disk.frontier.lastSubjectSeq === 5,
+      { err: started.err?.message, frontier: disk.frontier },
+    );
+  });
+
+  // ── HALT: A CAS LOSS ──────────────────────────────────────────────────────────────────────────
+  await block("HALT: A CAS LOSS", async () => {
+    const { wal, source, src, walPath } = await fresh("cas");
+    const ep = new FakeEndpoint();
+    const em = (await attempt(() => AguiEmitter.start({ endpoint: ep, wal, subjectFrontier: memorySubjectFrontier(), source, map: mapper }))).value!;
+    await em.pump();
+    const before = wal.frontier;
+    append(src, { run: "r1", msg: "m1", text: "hello" });
+    ep.answers = [casLoss()];
+    const p = await attempt(() => em.pump());
+    const disk = await EventWal.open(walPath, { space: SPACE, threadId: THREAD, principal: PRINCIPAL_KEY, subjectMayExist: true });
+    c(
+      "halt:a-CAS-loss-halts-with-its-OWN-reason-and-leaves-the-frontier-ON-DISK",
+      p.err instanceof AguiEmitterHalted &&
+        p.err.reason === "cas-loss" &&
+        disk.frontier.lastSubjectSeq === before.lastSubjectSeq &&
+        disk.frontier.sourceCursor === before.sourceCursor,
+      { err: p.err?.message, before, onDisk: disk.frontier },
+    );
+  });
+
+  // ── A NETWORK ERROR IS NOT A HALT: "we do not know" is a state, and it is `sent_unacked` ──────
+  await block("A NETWORK ERROR IS NOT A HALT: 'we do not know' is a state, and it is ", async () => {
+    const { wal, source, src, walPath } = await fresh("netfail");
+    const ep = new FakeEndpoint();
+    const em = (await attempt(() => AguiEmitter.start({ endpoint: ep, wal, subjectFrontier: memorySubjectFrontier(), source, map: mapper }))).value!;
+    await em.pump();
+    append(src, { run: "r1", msg: "m1", text: "hello" });
+    ep.answers = [new Error("connection reset")];
+    const p = await attempt(() => em.pump());
+    const disk = await EventWal.open(walPath, { space: SPACE, threadId: THREAD, principal: PRINCIPAL_KEY, subjectMayExist: true });
+    c(
+      "net:a-transport-error-is-NOT-a-halt-and-leaves-the-frame-retriable",
+      p.err !== undefined && !(p.err instanceof AguiEmitterHalted) && em.stopped === false && disk.pending?.state === "sent_unacked",
+      { err: p.err?.message, stopped: em.stopped, pending: disk.pending?.state },
+    );
+  });
+
+  // ── PACKING: ONE OBSERVATION IS ONE FRAME ─────────────────────────────────────────────────────────────────────────
+  await block("PACKING: ONE OBSERVATION IS ONE FRAME", async () => {
+    const measureOf = (ep: FakeEndpoint) => (f: AguiFrame) =>
+      ep.encodedSize({ channel: "events.local.aaa", parts: [f as unknown as Part], id: "S".repeat(64), expectedLastSubjectSeq: Number.MAX_SAFE_INTEGER });
+    const ep = new FakeEndpoint();
+    const u = (runId: string, n: number, cursor: string): EmitUnit => ({ runId, events: turn(runId, `m${n}`, `t${n}`), cursor });
+
+    const roomy = packUnits({
+      threadId: THREAD,
+      epoch: "e",
+      firstSeq: 1,
+      units: [u("r1", 1, "c1"), u("r1", 2, "c2")],
+      measure: measureOf(ep),
+      limit: 100_000,
+    });
+    c("pack:two-units-of-one-run-share-a-frame-when-they-fit", roomy.length === 1 && roomy[0]?.frame.events.length === 10, roomy.map((r) => r.frame.events.length));
+    // The frame carries the LAST included unit's cursor — folding it means every record in it is
+    // consumed, which is the whole reason the cursor is per-record.
+    c("pack:a-frame-carries-its-LAST-unit's-cursor", roomy[0]?.cursor === "c2", roomy[0]?.cursor);
+
+    // A run change flushes even with room to spare: a frame's envelope names ONE run, so this
+    // is not a size decision and a size-only packer would silently mislabel the second run's events.
+    const tworuns = packUnits({
+      threadId: THREAD,
+      epoch: "e",
+      firstSeq: 1,
+      units: [u("r1", 1, "c1"), u("r2", 2, "c2")],
+      measure: measureOf(ep),
+      limit: 100_000,
+    });
+    c(
+      "pack:a-run-change-flushes-even-when-the-frame-has-room",
+      tworuns.length === 2 && tworuns[0]?.frame.runId === "r1" && tworuns[1]?.frame.runId === "r2" && tworuns[1]?.frame.seq === 2,
+      tworuns.map((r) => ({ run: r.frame.runId, seq: r.frame.seq })),
+    );
+
+    // THE UNLUCKY NEIGHBOUR: a unit that does not fit BEHIND another is not an oversized unit. The
+    // ceiling is derived from the instrument — measuring one unit alone — rather than hand-picked,
+    // because a hand-picked number is a second implementation of the sizing rule.
+    const alone = measureOf(ep)({ kind: "ag-ui.frame", protocol: "ag-ui/0.0.57", threadId: THREAD, runId: "r1", epoch: "e", seq: 1, events: turn("r1", "m1", "t1") } as AguiFrame);
+    const tight = packUnits({
+      threadId: THREAD,
+      epoch: "e",
+      firstSeq: 1,
+      units: [u("r1", 1, "c1"), u("r1", 2, "c2")],
+      measure: measureOf(ep),
+      limit: alone + 8,
+    });
+    c(
+      "pack:a-unit-that-cannot-join-a-full-frame-gets-its-own-frame",
+      tight.length === 2 && tight[0]?.frame.seq === 1 && tight[1]?.frame.seq === 2 && tight[0]?.cursor === "c1" && tight[1]?.cursor === "c2",
+      tight.map((r) => ({ seq: r.frame.seq, cursor: r.cursor, n: r.frame.events.length })),
+    );
+
+    // A single unit that cannot fit ALONE fails loud. It is never truncated at a frame
+    // boundary, because a frame ending mid-record has no cursor it can honestly store.
+    let oversized: Error | undefined;
+    try {
+      packUnits({ threadId: THREAD, epoch: "e", firstSeq: 1, units: [u("r1", 1, "c1")], measure: measureOf(ep), limit: alone - 1 });
+    } catch (e) {
+      oversized = e as Error;
+    }
+    c(
+      "pack:one-observation-one-frame-a-single-oversized-unit-FAILS-LOUD",
+      oversized instanceof AguiVocabularyError && /a single unit does not fit in one frame/.test(oversized.message) && /One unit is one frame/.test(oversized.message),
+      oversized?.message ?? "no throw",
+    );
+    // CONTROL: one byte more and the SAME unit packs. Without this, the cell above passes for a
+    // packer that refuses everything.
+    const justFits = packUnits({ threadId: THREAD, epoch: "e", firstSeq: 1, units: [u("r1", 1, "c1")], measure: measureOf(ep), limit: alone });
+    c("pack:CONTROL-the-same-unit-fits-at-exactly-its-measured-size", justFits.length === 1, justFits.length);
+  });
+
+  // ── A BRACKET REFUSAL MUST SAY WHOSE FAULT IT IS ─────────────────────────────────────────────
+  //
+  // The WAL persists epoch, frontier and the pending frame — NOT the open runs and messages. So a
+  // process that dies mid-run restarts with an empty bracket machine, resumes at events whose
+  // `RUN_STARTED` already published, and refuses the first one. That is OUR gap, not the writer's
+  // bug, and two halts that both say "unbalanced" prove nothing about which produced one.
+  //
+  // The two CONTROLS are the inverses of the two conditions, not merely different inputs. Each
+  // condition alone yields a confident WRONG diagnosis, which is worse than the anonymous error it
+  // replaced, because a named cause stops the search.
+  await block("A BRACKET REFUSAL MUST SAY WHOSE FAULT IT IS", async () => {
+    // Mid-run content with no START — what a resume after a crash actually looks like.
+    // Opens a run and never closes it — so the frame that goes out leaves the machine mid-run.
+    const openRunOnly = (r: Rec) =>
+      "skip" in r
+        ? null
+        : {
+            runId: r.run,
+            events: [
+              runStarted({ threadId: THREAD, runId: r.run, timestamp: 1 }),
+              textMessageStart({ messageId: r.msg, timestamp: 2, role: "assistant" as const }),
+            ],
+          };
+    // Closes what `openRunOnly` opened. Legal ONLY if the machine remembers the open run — which is
+    // exactly the property under test.
+    const closeRunOnly = (r: Rec) =>
+      "skip" in r
+        ? null
+        : {
+            runId: r.run,
+            events: [
+              textMessageEnd({ messageId: r.msg, timestamp: 3 }),
+              runFinished({ threadId: THREAD, runId: r.run, timestamp: 4 }),
+            ],
+          };
+    const orphan = (r: Rec) =>
+      "skip" in r
+        ? null
+        : { runId: r.run, events: [textMessageContent({ messageId: r.msg, delta: r.text, timestamp: 1 })] };
+
+    // (1) THE HEADLINE, AND IT IS THE OPPOSITE OF WHAT IT WAS ONE COMMIT AGO. Since the WAL
+    //     persists the bracket machine, a restart RESTORES it and the mid-run event is simply
+    //     accepted. This cell is what the v2 migration bought; the diagnosis below is now only for
+    //     a document that predates it.
+    {
+      const { wal, source, src, walPath } = await fresh("bracket-restart");
+      const ep = new FakeEndpoint();
+      const warm = await AguiEmitter.start({ endpoint: ep, wal, subjectFrontier: memorySubjectFrontier(), source, map: openRunOnly });
+      await warm.pump(); // adopt
+      append(src, { run: "r1", msg: "m1", text: "opens a run and leaves it open" });
+      ep.answers = [{ seq: 4, duplicate: false }];
+      await warm.pump(); // a frame goes out with the run STILL OPEN
+
+      const reopened = await EventWal.open(walPath, { space: SPACE, threadId: THREAD, principal: PRINCIPAL_KEY, subjectMayExist: true });
+      c(
+        "bracket:the-open-run-is-PERSISTED-in-the-WAL",
+        reopened.brackets?.run === "r1" && reopened.brackets.text.includes("m1"),
+        reopened.brackets,
+      );
+      // A NEW emitter over the SAME WAL is the restart: same durable state, and now the same
+      // bracket state too.
+      const restarted = await AguiEmitter.start({ endpoint: ep, wal: reopened, subjectFrontier: memorySubjectFrontier(), source: new JsonlFileSource<Rec>(src), map: closeRunOnly });
+      append(src, { run: "r1", msg: "m1", text: "mid-run" });
+      ep.answers = [{ seq: 5, duplicate: false }];
+      const p = await attempt(() => restarted.pump());
+      c(
+        "bracket:a-mid-run-restart-CONTINUES-because-the-state-was-persisted",
+        p.err === undefined && p.value?.frames === 1,
+        { err: p.err?.message, pumped: p.value },
+      );
+    }
+
+    // (1b) THE DIAGNOSIS, now reachable only through a MIGRATED v1 WAL — a document that records no
+    //      bracket state because v1 never had one. Same failure, and it must still name itself.
+    {
+      const { src, walPath } = await fresh("bracket-migrated");
+      // A REAL cursor, taken from the real source. A hand-written one is refused by the identity
+      // check (dev/ino), which would make this cell fail for a reason that has nothing to do with
+      // brackets — a refusal for the wrong reason is the failure mode this suite keeps finding.
+      const adopted = (await new JsonlFileSource<Rec>(src).read(undefined)).cursor;
+      writeFileSync(
+        walPath,
+        JSON.stringify({
+          v: 1, // the whole point: a document written before brackets were persisted
+          space: SPACE, epoch: "ep-v1", threadId: THREAD, principal: PRINCIPAL_KEY,
+          frontier: { seq: 3, lastSubjectSeq: 9, sourceCursor: adopted },
+          pending: null,
+        }),
+      );
+
+      const wal = await EventWal.open(walPath, { space: SPACE, threadId: THREAD, principal: PRINCIPAL_KEY, subjectMayExist: true });
+      c("bracket:the-migrated-document-records-NO-bracket-state", wal.brackets === null, wal.brackets);
+      const ep = new FakeEndpoint();
+      const em = await AguiEmitter.start({ endpoint: ep, wal, subjectFrontier: memorySubjectFrontier(), source: new JsonlFileSource<Rec>(src), map: orphan });
+      append(src, { run: "r1", msg: "m1", text: "mid-run" });
+      const p = await attempt(() => em.pump());
+      c(
+        "bracket:a-mid-run-restart-names-ITSELF-not-the-writer",
+        p.err instanceof AguiBracketStateLost &&
+          /LOST ACROSS A RESTART/.test(p.err.message) &&
+          /not a protocol violation by the writer/.test(p.err.message) &&
+          /migrated from v1/.test(p.err.message),
+        p.err?.message ?? "no throw",
+      );
+      c(
+        "bracket:the-diagnosis-carries-the-underlying-refusal-rather-than-replacing-it",
+        p.err instanceof AguiBracketStateLost && p.err.cause instanceof AguiVocabularyError && /run/i.test(p.err.cause.message),
+        p.err instanceof AguiBracketStateLost ? p.err.cause?.message : "not diagnosed",
+      );
+    }
+
+    // (1c) CONTROL FOR THE THIRD CONDITION — a restart whose state WAS persisted, hitting a genuine
+    //      violation. Non-virgin frontier, nothing fed in this process: the first two conditions both
+    //      hold, so only "the WAL can say what was open" keeps this from being misdiagnosed. Without
+    //      this cell the third condition could be deleted and nothing would notice.
+    {
+      const { wal, source, src, walPath } = await fresh("bracket-restored-but-writer-wrong");
+      const ep = new FakeEndpoint();
+      const warm = await AguiEmitter.start({ endpoint: ep, wal, subjectFrontier: memorySubjectFrontier(), source, map: openRunOnly });
+      await warm.pump();
+      append(src, { run: "r1", msg: "m1", text: "opens a run" });
+      ep.answers = [{ seq: 4, duplicate: false }];
+      await warm.pump();
+
+      const reopened = await EventWal.open(walPath, { space: SPACE, threadId: THREAD, principal: PRINCIPAL_KEY, subjectMayExist: true });
+      // The run IS open and IS remembered — so content for a message that was never started is the
+      // writer being wrong, not us having forgotten.
+      const restarted = await AguiEmitter.start({ endpoint: ep, wal: reopened, subjectFrontier: memorySubjectFrontier(), source: new JsonlFileSource<Rec>(src), map: orphan });
+      append(src, { run: "r1", msg: "NEVER-STARTED", text: "x" });
+      const p = await attempt(() => restarted.pump());
+      c(
+        "bracket:CONTROL-a-violation-after-a-RESTORED-restart-is-NOT-blamed-on-lost-state",
+        p.err instanceof AguiVocabularyError && !(p.err instanceof AguiBracketStateLost),
+        p.err?.message ?? "no throw",
+      );
+    }
+
+    // (1d) AND (1e) — THE TWO CONTROLS THAT WAL v2 QUIETLY INVALIDATED.
+    //
+    // B1 and B2 were KILLED before v2 and SURVIVED after it, and the reason is the exact hazard this
+    // fleet already has a rule for: DEFENCE IN DEPTH DEFEATS OUTCOME-BASED TESTING. Adding the third
+    // condition meant every case the old controls exercised was ALREADY answered by it — both used a
+    // v2 WAL, whose `brackets` is non-null, so conditions 1 and 2 could be deleted with nothing
+    // noticing. The old controls did not become wrong; they stopped discriminating.
+    //
+    // The repair is to hold `brackets === null` CONSTANT and vary only the condition under test.
+    // Both cases below are reachable and neither was covered.
+    {
+      // (1d) Migrated v1, NON-virgin, and this process HAS fed events — because its first batch
+      //      validated and then failed to PACK (an oversized unit), so nothing folded and `brackets`
+      //      is still null. A violation now is this stream's, not a ghost of the previous process.
+      const { src, walPath } = await fresh("bracket-fed-but-unfolded");
+      const adopted = (await new JsonlFileSource<Rec>(src).read(undefined)).cursor;
+      writeFileSync(walPath, JSON.stringify({
+        v: 1, space: SPACE, epoch: "ep-v1", threadId: THREAD, principal: PRINCIPAL_KEY,
+        frontier: { seq: 3, lastSubjectSeq: 9, sourceCursor: adopted }, pending: null,
+      }));
+      const wal = await EventWal.open(walPath, { space: SPACE, threadId: THREAD, principal: PRINCIPAL_KEY, subjectMayExist: true });
+      const ep = new FakeEndpoint();
+      // r1 opens a run and validates; r2 then finishes a run that was never started. The batch
+      // therefore VALIDATES on the first pump (r1 alone) and VIOLATES on the second (r1 re-read,
+      // then r2) — which is exactly the shape needed to reach a violation with `fedAnyEvent` set.
+      const openThenViolate = (r: Rec) =>
+        "skip" in r
+          ? null
+          : r.run === "r1"
+            ? openRunOnly(r)
+            : { runId: "rZ", events: [runFinished({ threadId: THREAD, runId: "rZ", timestamp: 9 })] };
+      const em = await AguiEmitter.start({ endpoint: ep, wal, subjectFrontier: memorySubjectFrontier(), source: new JsonlFileSource<Rec>(src), map: openThenViolate });
+      ep.maxPayload = 80; // smaller than any single unit: validation succeeds, packing refuses
+      append(src, { run: "r1", msg: "m1", text: "hello" });
+      const packFailed = await attempt(() => em.pump());
+      c(
+        "bracket:SETUP-a-batch-can-validate-and-then-fail-to-PACK-leaving-nothing-folded",
+        packFailed.err instanceof AguiVocabularyError && wal.brackets === null,
+        { err: packFailed.err?.message, brackets: wal.brackets },
+      );
+      ep.maxPayload = 4096;
+      append(src, { run: "r2", msg: "m2", text: "mid-run" });
+      const p = await attempt(() => em.pump());
+      c(
+        "bracket:CONTROL-a-violation-after-this-process-FED-but-never-FOLDED-is-NOT-blamed-on-lost-state",
+        p.err instanceof AguiVocabularyError && !(p.err instanceof AguiBracketStateLost),
+        p.err?.message ?? "no throw",
+      );
+    }
+    {
+      // (1e) Migrated v1 with a VIRGIN frontier: the document cannot say what was open AND nothing
+      //      was ever published, so nothing could have been lost. The writer really is wrong.
+      const { src, walPath } = await fresh("bracket-migrated-virgin");
+      writeFileSync(walPath, JSON.stringify({
+        v: 1, space: SPACE, epoch: "ep-v1", threadId: THREAD, principal: PRINCIPAL_KEY,
+        frontier: { seq: 0, lastSubjectSeq: 0 }, pending: null,
+      }));
+      const wal = await EventWal.open(walPath, { space: SPACE, threadId: THREAD, principal: PRINCIPAL_KEY, subjectMayExist: true });
+      c("bracket:SETUP-a-migrated-VIRGIN-document-also-records-no-bracket-state", wal.brackets === null, wal.brackets);
+      const ep = new FakeEndpoint();
+      const em = await AguiEmitter.start({ endpoint: ep, wal, subjectFrontier: memorySubjectFrontier(), source: new JsonlFileSource<Rec>(src), map: orphan });
+      await em.pump(); // adopt
+      append(src, { run: "r1", msg: "m1", text: "mid-run" });
+      const p = await attempt(() => em.pump());
+      c(
+        "bracket:CONTROL-a-violation-on-a-MIGRATED-VIRGIN-frontier-is-NOT-blamed-on-lost-state",
+        p.err instanceof AguiVocabularyError && !(p.err instanceof AguiBracketStateLost),
+        p.err?.message ?? "no throw",
+      );
+    }
+
+    // (2) CONTROL — VIRGIN frontier: nothing was ever published, so nothing could have been lost.
+    //     The writer really is wrong and must be told so.
+    {
+      const { wal, source, src } = await fresh("bracket-virgin");
+      const ep = new FakeEndpoint();
+      const em = await AguiEmitter.start({ endpoint: ep, wal, subjectFrontier: memorySubjectFrontier(), source, map: orphan });
+      await em.pump(); // adopt
+      append(src, { run: "r1", msg: "m1", text: "mid-run" });
+      const p = await attempt(() => em.pump());
+      c(
+        "bracket:CONTROL-a-violation-on-a-VIRGIN-frontier-is-NOT-blamed-on-a-restart",
+        p.err instanceof AguiVocabularyError && !(p.err instanceof AguiBracketStateLost),
+        p.err?.message ?? "no throw",
+      );
+    }
+
+    // (3) CONTROL — MID-STREAM in this very process: the machine is in the state we put it in, so a
+    //     refusal now is the writer's, however long ago the process started.
+    {
+      const { wal, source, src } = await fresh("bracket-midstream");
+      const ep = new FakeEndpoint();
+      const em = await AguiEmitter.start({ endpoint: ep, wal, subjectFrontier: memorySubjectFrontier(),
+        source,
+        map: (r: Rec) => ("skip" in r ? null : r.text === "bad" ? orphan(r) : mapper(r)),
+      });
+      await em.pump(); // adopt
+      append(src, { run: "r1", msg: "m1", text: "good" });
+      ep.answers = [{ seq: 6, duplicate: false }];
+      await em.pump(); // a legal turn goes through the machine in THIS process
+      append(src, { run: "r2", msg: "m2", text: "bad" });
+      const p = await attempt(() => em.pump());
+      c(
+        "bracket:CONTROL-a-violation-AFTER-this-process-has-emitted-is-NOT-blamed-on-a-restart",
+        p.err instanceof AguiVocabularyError && !(p.err instanceof AguiBracketStateLost),
+        p.err?.message ?? "no throw",
+      );
+    }
+  });
+
+  // ── SIZING IS AN UPPER BOUND, NOT AN ESTIMATE ────────────────────────────────────────────────
+  //    The emitter measures at the longest admissible id and the widest admissible expectation,
+  //    because neither is known while packing. This cell asserts the direction of the inequality:
+  //    what is published must never be LARGER than what was measured.
+  await block("SIZING IS AN UPPER BOUND, NOT AN ESTIMATE", async () => {
+    const { wal, source, src } = await fresh("sizing");
+    const ep = new FakeEndpoint();
+    const em = (await attempt(() => AguiEmitter.start({ endpoint: ep, wal, subjectFrontier: memorySubjectFrontier(), source, map: mapper }))).value!;
+    await em.pump();
+    append(src, { run: "r1", msg: "m1", text: "x".repeat(200) });
+    ep.answers = [{ seq: 3, duplicate: false }];
+    await attempt(() => em.pump());
+    const call = ep.publishes[0];
+    if (!call) return c("sizing:a-frame-was-published-to-measure", false, ep.publishes);
+    const published = ep.encodedSize({ channel: em.channel, parts: call.parts, id: call.id, expectedLastSubjectSeq: call.expectedLastSubjectSeq });
+    const measured = ep.encodedSize({
+      channel: em.channel,
+      parts: call.parts,
+      id: "S".repeat(64),
+      expectedLastSubjectSeq: Number.MAX_SAFE_INTEGER,
+    });
+    c("sizing:what-is-published-is-never-larger-than-what-was-measured", published <= measured, { published, measured });
+    c("sizing:and-the-bound-is-not-vacuous", measured > published, { published, measured });
+  });
+
+  // ── THE UPPER BOUND EARNS ITS KEEP AT THE CEILING, WHICH IS THE ONLY PLACE IT CAN ────────────
+  //
+  // Sizing with the id we EXPECT to use is the natural thing to write and is wrong by exactly the
+  // difference between that id and the one actually minted. It is invisible everywhere except
+  // within a few dozen bytes of `max_payload`, so the ceiling here is DERIVED FROM THE INSTRUMENT
+  // — the real encoded size of the frame the emitter would build — and then set just below it.
+  // A hand-picked number would be a second implementation of the sizing rule and would drift.
+  //
+  // Correct behaviour: the upper-bound measurement says the two units do not fit together, so two
+  // frames go out and both are under the ceiling. Under-measure by even the id difference and the
+  // packer emits ONE frame that the broker instrument then REFUSES — which is the real failure,
+  // because a refused publish after a durable `beginSend` is a wedged emitter, not a retry.
+  await block("THE UPPER BOUND EARNS ITS KEEP AT THE CEILING, WHICH IS THE ONLY PLACE", async () => {
+    const { wal, source, src } = await fresh("ceiling");
+    const ep = new FakeEndpoint();
+    const em = (await attempt(() => AguiEmitter.start({ endpoint: ep, wal, subjectFrontier: memorySubjectFrontier(), source, map: mapper }))).value!;
+    await em.pump(); // adopt
+
+    const bothUnits = aguiFrame({
+      threadId: THREAD,
+      runId: "r1",
+      epoch: wal.epoch,
+      seq: 1,
+      events: [...turn("r1", "m1", "t1"), ...turn("r1", "m2", "t2")],
+    });
+    // A real minted id is a UUID: 36 characters. The expectation on a virgin subject is `0`.
+    const realBytes = ep.encodedSize({
+      channel: em.channel,
+      parts: [bothUnits as unknown as Part],
+      id: "0".repeat(36),
+      expectedLastSubjectSeq: 0,
+    });
+    ep.maxPayload = realBytes - 10;
+
+    append(src, { run: "r1", msg: "m1", text: "t1" }, { run: "r1", msg: "m2", text: "t2" });
+    ep.answers = [
+      { seq: 1, duplicate: false },
+      { seq: 2, duplicate: false },
+    ];
+    const p = await attempt(() => em.pump());
+    c(
+      "sizing:the-UPPER-BOUND-keeps-a-packed-frame-under-the-REAL-ceiling",
+      p.err === undefined && p.value?.frames === 2,
+      { err: p.err?.message, pumped: p.value, ceiling: ep.maxPayload, realBytes },
+    );
+    c(
+      "sizing:CONTROL-the-two-units-really-would-have-fitted-under-a-naive-measure",
+      realBytes <= ep.maxPayload + 10,
+      { realBytes, ceiling: ep.maxPayload },
+    );
+  });
+
+  // ── THE SUBJECT COMES FROM THE ALLOCATED PRINCIPAL AND FROM NOTHING ELSE ─────────────────────
+  //
+  // The plane is defined to carry tool inputs and outputs, so "which subject does a session publish
+  // to" is an authorization question, not a routing detail: the manager mints a publish grant for
+  // exactly one channel, and a session that could be talked into publishing somewhere else would
+  // either be silently unauthorized or, worse, authorized onto a channel a reader trusts to name
+  // its author.
+  //
+  // WHAT IS ASSERTED IS AN ABSENCE, so the instrument records every publish's channel rather than
+  // only its parts. `AguiEmitter.start` takes an endpoint, a WAL, a subject frontier, a source and a
+  // mapper, and NONE of the last four name a subject: the channel is derived once by
+  // `eventChannelForSession(ep)` from `ep.principal`. That the subject frontier is per PRINCIPAL is
+  // the same fact from the other side, and it does not name a channel either. These cells hold that
+  // derivation to it against inputs that try to say otherwise.
+  await block("THE SUBJECT COMES FROM THE ALLOCATED PRINCIPAL AND FROM NOTHING ELSE", async () => {
+    const { wal, source, src } = await fresh("subject-derivation");
+    const ep = new FakeEndpoint();
+    const em = (await attempt(() => AguiEmitter.start({ endpoint: ep, wal, subjectFrontier: memorySubjectFrontier(), source, map: mapper }))).value!;
+    await em.pump(); // adopt
+    c("subject:the-emitter-derives-its-channel-from-the-ENDPOINT-principal", em.channel === eventChannel(PRINCIPAL), {
+      channel: em.channel,
+      expected: eventChannel(PRINCIPAL),
+    });
+    // The mapped RECORD carries a channel-shaped string in its own content. A mapper is caller code
+    // reading a file the session's harness wrote, so this is the closest thing to caller-supplied
+    // input the emitter has, and it must not reach the subject.
+    append(src, { run: "r1", msg: "m1", text: "events.local.somebody_else" }, { run: "r2", msg: "m2", text: "channel: events.other.victim" });
+    ep.answers = [
+      { seq: 1, duplicate: false },
+      { seq: 2, duplicate: false },
+    ];
+    const pumped = await attempt(() => em.pump());
+    c("subject:content-that-NAMES-another-channel-does-not-move-the-publish", pumped.err === undefined && ep.publishes.length > 0, {
+      err: pumped.err?.message,
+      publishes: ep.publishes.length,
+    });
+    c(
+      "subject:EVERY-publish-went-to-the-principal-channel-and-to-no-other",
+      ep.publishes.length > 0 && ep.publishes.every((call) => call.channel === eventChannel(PRINCIPAL)),
+      ep.publishes.map((call) => call.channel),
+    );
+  });
+
+  // A DIFFERENT principal, identical WAL/source/mapper inputs: the subject moves with the principal
+  // and with nothing else. Without this the cell above is satisfied by a hard-coded constant.
+  await block("A DIFFERENT PRINCIPAL PUBLISHES SOMEWHERE ELSE, FROM THE SAME INPUTS", async () => {
+    const OTHER = { owner: "local", actor: "bbb" };
+    const d = join(dir, "subject-other");
+    const src = join(d, "session.jsonl");
+    const { mkdirSync } = await import("node:fs");
+    mkdirSync(d, { recursive: true });
+    writeFileSync(src, "");
+    const wal = await EventWal.open(join(d, "wal.json"), {
+      space: SPACE,
+      threadId: THREAD,
+      principal: principalKey(OTHER.owner, OTHER.actor).key,
+      subjectMayExist: false,
+    });
+    const ep = new FakeEndpoint({ principal: OTHER });
+    const em = (await attempt(() => AguiEmitter.start({ endpoint: ep, wal, subjectFrontier: memorySubjectFrontier(), source: new JsonlFileSource<Rec>(src), map: mapper }))).value!;
+    c("subject:CONTROL-the-channel-tracks-the-principal-rather-than-being-a-constant", em.channel === eventChannel(OTHER) && em.channel !== eventChannel(PRINCIPAL), {
+      channel: em.channel,
+    });
+  });
+
+  // The WAL is the one input that carries a principal of its own, and it is the one that could put
+  // a session's frames under another identity. It is cross-checked, and the refusal is the cell.
+  await block("A WAL BELONGING TO ANOTHER PRINCIPAL IS REFUSED, NOT ADOPTED", async () => {
+    const { wal, source } = await fresh("subject-wal-mismatch");
+    const ep = new FakeEndpoint({ principal: { owner: "local", actor: "ccc" } });
+    const started = await attempt(() => AguiEmitter.start({ endpoint: ep, wal, subjectFrontier: memorySubjectFrontier(), source, map: mapper }));
+    c("subject:a-WAL-from-another-principal-REFUSES-rather-than-publishing-under-two-identities", started.err !== undefined && /refusing to/.test(started.err.message), started.err?.message);
+    c("subject:...and-nothing-was-published-on-the-way-to-that-refusal", ep.publishes.length === 0, ep.publishes.length);
+  });
+
+  // The mode with no stable identity at all. A fallback here would put the fused-name channel back
+  // on the one path that has no credential to grade it against, so the refusal is load-bearing.
+  await block("A SELF-MINTED IDENTITY IS REFUSED RATHER THAN DEFAULTED", async () => {
+    const { wal, source } = await fresh("subject-ephemeral");
+    const ep = new FakeEndpoint({ actorIsEphemeral: true });
+    const started = await attempt(() => AguiEmitter.start({ endpoint: ep, wal, subjectFrontier: memorySubjectFrontier(), source, map: mapper }));
+    c("subject:an-EPHEMERAL-actor-refuses-events-rather-than-inventing-a-channel", started.err !== undefined && /self-minted identity/.test(started.err.message), started.err?.message);
+    c("subject:...and-that-refusal-publishes-nothing-either", ep.publishes.length === 0, ep.publishes.length);
+  });
+
+  // A line the source could not read is a GAP on the read, and the pump's answer to it is decided
+  // here. The shape is the one a full disk leaves in a transcript: part of one record glued to the
+  // next on a single line. With a reporter the gap is named and the records after it publish; with
+  // none the pump refuses before the frontier moves, so the gap is never stepped over in silence.
+  await block("A SOURCE GAP IS REPORTED AND STEPPED OVER, OR REFUSED, NEVER SILENT", async () => {
+    const { wal, src, source } = await fresh("gap-reported");
+    const ep = new FakeEndpoint();
+    ep.answers = [{ seq: 1, duplicate: false }];
+    const gaps: { offset: number; bytes: number; reason: string }[] = [];
+    const em = (await attempt(() => AguiEmitter.start({ endpoint: ep, wal, subjectFrontier: memorySubjectFrontier(), source, map: mapper, onUnreadable: (g) => gaps.push(g) }))).value!;
+    await em.pump(); // adopt
+    const torn = '{"run":"r-cut","msg":"m-cut","text":"cut sho{"run":"r-glued","msg":"m-glued","text":"glued"}';
+    appendFileSync(src, torn + "\n");
+    append(src, { run: "r1", msg: "m1", text: "after the gap" });
+    const pumped = await attempt(() => em.pump());
+    c("gap:a-reported-gap-reaches-the-reporter-and-the-records-after-it-publish",
+      pumped.err === undefined && gaps.length === 1 && gaps[0]?.offset === 0 && gaps[0]?.bytes === Buffer.byteLength(torn) && ep.publishes.length === 1,
+      { err: pumped.err?.message, gaps, publishes: ep.publishes.length });
+    c("gap:the-frontier-moved-past-the-gap", Number(wal.frontier.sourceCursor?.split(":")[2]) === Buffer.byteLength(torn) + 1 + Buffer.byteLength(JSON.stringify({ run: "r1", msg: "m1", text: "after the gap" })) + 1, wal.frontier.sourceCursor);
+  });
+  // A terminal reported at the source's end, with a line the source cannot read landing past it
+  // before the next pump: the shape a full disk leaves when the seat's turn ends during the outage.
+  // The gap is past the position, so the terminal is placed after every record before it, on the
+  // run those records opened; it is not held for a record after the gap that never comes (Sol,
+  // round 13 of 2026-10-13, through the built MCP entry point: the owed error was never published
+  // and the settle pumped without end).
+  await block("A TERMINAL REPORTED AHEAD OF A GAP IS PLACED, NOT HELD", async () => {
+    const { wal, src, source } = await fresh("gap-terminal");
+    const ep = new FakeEndpoint();
+    ep.answers = [{ seq: 1, duplicate: false }];
+    const gaps: { offset: number; bytes: number; reason: string }[] = [];
+    const open = (r: Rec) => ("skip" in r ? null : { runId: r.run, events: [runStarted({ threadId: THREAD, runId: r.run, timestamp: 1 })] });
+    const em = await AguiEmitter.start({ endpoint: ep, wal, subjectFrontier: memorySubjectFrontier(), source, map: open, onUnreadable: (g) => gaps.push(g) });
+    await em.pump(); // adopt
+    append(src, { run: "r1", msg: "m1", text: "open" });
+    await em.pump();
+    c("gap:SETUP-r1-is-open-on-the-wire", em.openRunId === "r1", em.openRunId);
+    const at = source.end();
+    await at;
+    em.queueTerminal({ terminal: { timestamp: 9, error: { message: "rate_limit", code: "rate_limit" } }, at });
+    appendFileSync(src, 'X"cut"\n'); // a line the source cannot read, past the position
+    const pumped = await attempt(() => em.pump());
+    const owed = em.takeOwed("r1");
+    c("gap:a-terminal-reported-ahead-of-a-torn-line-is-placed-on-the-run-the-records-before-it-opened",
+      pumped.err === undefined && gaps.length === 1 && em.waitingTerminals === 0 && owed?.terminal.error?.code === "rate_limit",
+      { err: pumped.err?.message, gaps, waiting: em.waitingTerminals, owed });
+    // The same with a blank separator line, which the source steps over without reporting a gap.
+    const b = await fresh("gap-terminal-blank");
+    const ep2 = new FakeEndpoint();
+    ep2.answers = [{ seq: 1, duplicate: false }];
+    const gaps2: { offset: number; bytes: number; reason: string }[] = [];
+    const em2 = await AguiEmitter.start({ endpoint: ep2, wal: b.wal, subjectFrontier: memorySubjectFrontier(), source: b.source, map: open, onUnreadable: (g) => gaps2.push(g) });
+    await em2.pump(); // adopt
+    append(b.src, { run: "r1", msg: "m1", text: "open" });
+    await em2.pump();
+    const at2 = b.source.end();
+    await at2;
+    em2.queueTerminal({ terminal: { timestamp: 10, error: { message: "overloaded", code: "overloaded" } }, at: at2 });
+    appendFileSync(b.src, "  \n");
+    const pumped2 = await attempt(() => em2.pump());
+    const owed2 = em2.takeOwed("r1");
+    c("gap:a-terminal-reported-ahead-of-a-blank-line-is-placed-the-same-way",
+      pumped2.err === undefined && gaps2.length === 0 && em2.waitingTerminals === 0 && owed2?.terminal.error?.code === "overloaded",
+      { err: pumped2.err?.message, gaps2, waiting: em2.waitingTerminals, owed2 });
+    // A record the source counts in its end but answers in no read: an OpenCode part still filling
+    // when the turn died never gets its end mark, the source's reads stop before it, and a terminal
+    // reported past it waited for a read that never came while the settle pumped without end (Sol,
+    // round 15 of 2026-10-13: 934 reads of the session in 500 ms). The source here is the shape,
+    // not the file: a read answers the settled records after its cursor and stops at the first
+    // that is not, and the end counts them all.
+    const u = await fresh("gap-terminal-unsettled");
+    const rows: { value: Rec; settled: boolean }[] = [];
+    const pending: DurableSource<Rec> = {
+      kind: "memory",
+      async read(cursor) {
+        if (cursor === undefined) return { records: [], cursor: rows.length ? String(rows.length - 1) : "" };
+        const records: { value: Rec; cursor: string }[] = [];
+        for (let i = cursor === "" ? 0 : Number(cursor) + 1; i < rows.length && rows[i]!.settled; i++) records.push({ value: rows[i]!.value, cursor: String(i) });
+        return { records, cursor: records.length ? records[records.length - 1]!.cursor : cursor };
+      },
+      async end() { return rows.length ? String(rows.length - 1) : ""; },
+    };
+    const ep3 = new FakeEndpoint();
+    ep3.answers = [{ seq: 1, duplicate: false }];
+    const em3 = await AguiEmitter.start({ endpoint: ep3, wal: u.wal, subjectFrontier: memorySubjectFrontier(), source: pending, map: open, onUnreadable: () => {} });
+    await em3.pump(); // adopt
+    rows.push({ value: { run: "r1", msg: "m1", text: "open" }, settled: true });
+    await em3.pump();
+    c("gap:SETUP-r1-is-open-on-the-unsettled-source", em3.openRunId === "r1", em3.openRunId);
+    rows.push({ value: { run: "r1", msg: "m1", text: "still filling" }, settled: false });
+    const at3 = pending.end();
+    await at3;
+    em3.queueTerminal({ terminal: { timestamp: 11, error: { message: "stream closed", code: "stream_closed" } }, at: at3 });
+    const pumped3 = await attempt(() => em3.pump());
+    const owed3 = em3.takeOwed("r1");
+    c("gap:a-terminal-reported-past-a-record-no-read-answers-is-placed-on-the-run-the-records-before-it-opened",
+      pumped3.err === undefined && em3.waitingTerminals === 0 && owed3?.terminal.error?.code === "stream_closed",
+      { err: pumped3.err?.message, waiting: em3.waitingTerminals, owed3 });
+  });
+  await block("A SOURCE GAP WITH NO REPORTER REFUSES BEFORE THE FRONTIER MOVES", async () => {
+    const { wal, src, source } = await fresh("gap-unreported");
+    const ep = new FakeEndpoint();
+    ep.answers = [{ seq: 1, duplicate: false }];
+    const em = (await attempt(() => AguiEmitter.start({ endpoint: ep, wal, subjectFrontier: memorySubjectFrontier(), source, map: mapper }))).value!;
+    await em.pump(); // adopt
+    const before = wal.frontier.sourceCursor;
+    appendFileSync(src, '{"run":"r-cut","msg":"m-cut","text":"cut sho{"run":"r-glued","msg":"m-glued","text":"glued"}\n');
+    append(src, { run: "r1", msg: "m1", text: "after the gap" });
+    const pumped = await attempt(() => em.pump());
+    c("gap:without-a-reporter-the-pump-refuses-naming-the-offset",
+      pumped.err !== undefined && /unreadable record at offset 0 \(/.test(pumped.err.message) && /no gap reporter/.test(pumped.err.message),
+      pumped.err?.message ?? "no throw");
+    c("gap:...and-neither-the-frontier-nor-the-broker-moved", wal.frontier.sourceCursor === before && ep.publishes.length === 0, { before, after: wal.frontier.sourceCursor, publishes: ep.publishes.length });
+  });
+  // ---- A REPORTED TERMINAL ------------------------------------------------------------------------
+  // The holder queues a terminal with the position the source had reached when the connector
+  // reported it. The pump places it on the turn the source had begun by that position: the open
+  // run takes it as a debt, and an owed error is published in place of the FIRST finish the mapper
+  // produces for that run, the finish a later prompt synthesizes when it finds the run still open.
+  // Sol, review of 2026-10-13, through the built MCP entry point: a failed turn whose next prompt
+  // was written before the plane came back was closed as a finish.
+  const envelopeOf = (p: Call) => { const f = p.parts[0] as unknown as { runId: string; events: AguiEvent[] }; return f.runId + ":" + f.events.map((e) => e.type).join("+"); };
+  await block("owed", async () => {
+    const { src, wal, source } = await fresh("owed-terminal");
+    const ep = new FakeEndpoint();
+    ep.answers.push({ seq: 1, duplicate: false }, { seq: 2, duplicate: false }, { seq: 3, duplicate: false }, { seq: 4, duplicate: false }, { seq: 5, duplicate: false });
+    // r1 opens a run and leaves it open; r2 is the next prompt: it finishes r1 and starts r2.
+    const nextPrompt = (r: Rec) =>
+      "skip" in r
+        ? null
+        : r.run === "r1"
+          ? { runId: "r1", events: [runStarted({ threadId: THREAD, runId: "r1", timestamp: 1 })] }
+          : { runId: "r2", events: [runFinished({ threadId: THREAD, runId: "r1", timestamp: 2 }), runStarted({ threadId: THREAD, runId: "r2", timestamp: 3 })] };
+    const em = await AguiEmitter.start({ endpoint: ep, wal, subjectFrontier: memorySubjectFrontier(), source, map: nextPrompt });
+    await em.pump(); // adopt
+    append(src, { run: "r1", msg: "m1", text: "open" });
+    await em.pump();
+    c("owed:SETUP-r1-is-open-on-the-wire", em.openRunId === "r1", em.openRunId);
+    // r1's turn ends, twice over: the connector repeats the terminal. Both are reported at the same
+    // position, after r1's records and before the next prompt.
+    em.queueTerminal({ terminal: { timestamp: 9, error: { message: "rate_limit", code: "rate_limit" } }, at: source.end() });
+    em.queueTerminal({ terminal: { timestamp: 9 }, at: source.end() });
+    c("owed:terminals-wait-for-the-pump-that-reads-up-to-them", em.waitingTerminals === 2, em.waitingTerminals);
+    append(src, { run: "r2", msg: "m2", text: "next prompt" });
+    await em.pump();
+    const frames = ep.publishes.map((p) => p.parts[0] as unknown as { runId: string; events: AguiEvent[] });
+    const published = frames.flatMap((f) => f.events);
+    const types = published.map((e) => e.type + (e.type === "RUN_STARTED" || e.type === "RUN_FINISHED" ? ":" + (e as { runId: string }).runId : ""));
+    c("owed:the-owed-error-is-published-in-place-of-the-synthesized-finish", types.join(",") === "RUN_STARTED:r1,RUN_ERROR,RUN_STARTED:r2", types);
+    // `RUN_ERROR` names no run: the frame's envelope is its only attribution, so the error must
+    // travel in a frame of the FAILED run, not in the next prompt's frame (Sol, round 6 of review,
+    // through the built MCP entry point: the only error for the failed run was labelled as the next run's).
+    const envelopes = frames.map((f) => f.runId + ":" + f.events.map((e) => e.type).join("+"));
+    c("owed:the-error-frame-NAMES-the-failed-run-and-the-next-runs-frame-carries-only-its-own", envelopes.join(",") === "r1:RUN_STARTED,r1:RUN_ERROR,r2:RUN_STARTED", envelopes);
+    c("owed:the-published-error-carries-the-fixed-egress-message", published.some((e) => e.type === "RUN_ERROR" && (e as { message: string }).message === RUN_ERROR_EGRESS_MESSAGE), published.find((e) => e.type === "RUN_ERROR"));
+    // The second terminal at the same position is the connector repeating itself: it replaces
+    // nothing, and it is not carried on to r2's turn (Sol, round 11 of 2026-10-13, through the
+    // built MCP entry point: a repeated terminal, queued for the next turn, closed the next failed
+    // turn as a finish).
+    c("owed:a-repeated-terminal-replaces-nothing-and-is-not-carried-to-the-next-turn", types.join(",") === "RUN_STARTED:r1,RUN_ERROR,RUN_STARTED:r2" && em.unsettled().terminals.length === 0 && em.openRunId === "r2", { types, left: em.unsettled(), open: em.openRunId });
+    // A terminal reported after the last record is the open run's, taken back for the close the
+    // holder makes, since no later prompt will synthesize that run's finish yet.
+    em.queueTerminal({ terminal: { timestamp: 10, error: { message: "overloaded", code: "overloaded" } }, at: source.end() });
+    await em.pump();
+    const owedToR2 = em.takeOwed("r2");
+    c("owed:a-terminal-after-the-last-record-is-the-open-runs-and-is-taken-for-its-close", owedToR2?.terminal.error?.code === "overloaded" && em.unsettled().terminals.length === 0, { owedToR2: owedToR2?.terminal, left: em.unsettled() });
+    const closed = await em.closeRun({ timestamp: 10, error: owedToR2?.terminal.error });
+    c("owed:a-close-settles-the-run", closed === "r2" && em.openRunId === undefined && envelopeOf(ep.publishes[ep.publishes.length - 1]!) === "r2:RUN_ERROR", { closed, open: em.openRunId });
+    // A terminal for a run the wire has closed is dropped, as a close after a close is refused live.
+    em.queueTerminal({ terminal: { timestamp: 11 }, at: source.end() });
+    await em.pump();
+    c("owed:a-terminal-for-a-run-the-wire-has-closed-is-dropped", em.unsettled().terminals.length === 0 && ep.publishes.length === 4, { left: em.unsettled(), publishes: ep.publishes.length });
+  });
+
+  await block("owed-late", async () => {
+    // A TERMINAL REPORTED WHILE A PUMP IS PUBLISHING is reported past that pump's read, so it waits
+    // for the next pump, which places it on the turn the source had begun by then. Here the read
+    // held the next prompt already, so the turn begun by then is r2's: the terminal is r2's, and r1
+    // keeps the finish the prompt synthesized. The connector reports a turn's terminal before the
+    // next turn's records exist, so a terminal reported after the next prompt belongs to it.
+    const { src, wal, source } = await fresh("owed-late");
+    const ep = new FakeEndpoint();
+    let openRun: string | undefined;
+    const late = (r: Rec) => {
+      if ("skip" in r) return null;
+      if (r.text === "open") {
+        openRun = r.run;
+        return { runId: r.run, events: [runStarted({ threadId: THREAD, runId: r.run, timestamp: 1 })] };
+      }
+      if (r.text === "next prompt") {
+        const prev = openRun as string;
+        openRun = r.run;
+        return { runId: r.run, events: [runFinished({ threadId: THREAD, runId: prev, timestamp: 5 }), runStarted({ threadId: THREAD, runId: r.run, timestamp: 6 })] };
+      }
+      return { runId: r.run, events: [textMessageStart({ messageId: r.msg, timestamp: 2, role: "assistant" }), textMessageContent({ messageId: r.msg, delta: r.text, timestamp: 3 }), textMessageEnd({ messageId: r.msg, timestamp: 4 })] };
+    };
+    const em = await AguiEmitter.start({ endpoint: ep, wal, subjectFrontier: memorySubjectFrontier(), source, map: late });
+    await em.pump(); // adopt
+    ep.answers.push({ seq: 1, duplicate: false });
+    append(src, { run: "r1", msg: "m1", text: "open" });
+    await em.pump();
+    // Two records unread: r1's last answer, a frame of its own, and the next prompt, which finishes r1 and starts r2.
+    append(src, { run: "r1", msg: "m1b", text: "last answer" }, { run: "r2", msg: "m2", text: "next prompt" });
+    // The wire gate is WAITED FOR, not slept for: a fixed wait is a race against the log write and
+    // the publish under host load (Gemini, round 9 of 2026-10-13), and a cell that then awaits a
+    // pump nobody releases hangs the suite. The wait is bounded so a mutant that never publishes
+    // reddens instead.
+    const onWire = async (w: { release?: () => void }) => {
+      const deadline = Date.now() + 10_000;
+      while (w.release === undefined && Date.now() < deadline) await new Promise((r) => setTimeout(r, 5));
+      return w.release !== undefined;
+    };
+    const wire: { release?: () => void } = {};
+    ep.answers.push(() => new Promise((res) => (wire.release = () => res({ seq: 2, duplicate: false }))), { seq: 3, duplicate: false });
+    const pumping = em.pump();
+    const held = await onWire(wire); // the first frame is on the wire
+    c("owed-late:SETUP-the-first-frame-is-on-the-wire-and-r1-is-still-open", held && em.openRunId === "r1" && ep.publishes.length === 2, { held, open: em.openRunId, publishes: ep.publishes.length });
+    em.queueTerminal({ terminal: { timestamp: 9, error: { message: "rate_limit", code: "rate_limit" } }, at: source.end() }); // reported with the first frame on the wire
+    wire.release?.();
+    if (held) await pumping;
+    const after = ep.publishes.slice(1).map(envelopeOf);
+    c("owed-late:a-terminal-reported-while-a-frame-is-on-the-wire-waits-for-the-next-pump", after.join(",") === "r1:TEXT_MESSAGE_START+TEXT_MESSAGE_CONTENT+TEXT_MESSAGE_END,r2:RUN_FINISHED+RUN_STARTED" && em.waitingTerminals === 1 && em.openRunId === "r2", { after, waiting: em.waitingTerminals, open: em.openRunId });
+    await em.pump();
+    const owedToR2 = em.takeOwed("r2");
+    c("owed-late:the-next-pump-places-it-on-the-turn-the-source-had-begun-by-then", owedToR2?.terminal.timestamp === 9 && em.waitingTerminals === 0, { owedToR2: owedToR2?.terminal, waiting: em.waitingTerminals });
+    c("owed-late:the-log-agrees-with-the-wire", wal.pending === null && wal.frontier.seq === 3 && wal.frontier.lastSubjectSeq === 3, wal.frontier);
+  });
+
+  await block("queued", async () => {
+    // TERMINALS HELD THROUGH AN OUTAGE ARE PLACED BY POSITION. Each is reported once its turn's
+    // records are in the source: the open run's after its last answer, a notification turn's after
+    // the notification the mapper opens no run for, the next run's after its prompt and answer.
+    // The pump reads all of it and places each terminal on the turn begun before its position: the
+    // notification takes its terminal and does nothing with it (Sol, round 10 of 2026-10-13,
+    // through the built MCP entry point: a second turn ending during one outage lost its terminal,
+    // and the next prompt closed that failed run as a finish).
+    const { src, wal, walPath, source } = await fresh("queued");
+    const ep = new FakeEndpoint();
+    let openRun: string | undefined;
+    const turns = (r: Rec) => {
+      if ("skip" in r) return null;
+      if (r.text === "notification") return { turn: true as const }; // a turn the mapper opens no run for
+      if (r.text === "open") {
+        openRun = r.run;
+        return { runId: r.run, events: [runStarted({ threadId: THREAD, runId: r.run, timestamp: 1 })] };
+      }
+      if (r.text === "next prompt") {
+        const prev = openRun as string;
+        openRun = r.run;
+        return { runId: r.run, events: [runFinished({ threadId: THREAD, runId: prev, timestamp: 5 }), runStarted({ threadId: THREAD, runId: r.run, timestamp: 6 })] };
+      }
+      return { runId: r.run, events: [textMessageStart({ messageId: r.msg, timestamp: 2, role: "assistant" }), textMessageContent({ messageId: r.msg, delta: r.text, timestamp: 3 }), textMessageEnd({ messageId: r.msg, timestamp: 4 })] };
+    };
+    const em = await AguiEmitter.start({ endpoint: ep, wal, subjectFrontier: memorySubjectFrontier(), source, map: turns });
+    await em.pump(); // adopt
+    const atAdopt = wal.frontier.sourceCursor as string;
+    ep.answers.push({ seq: 1, duplicate: false });
+    append(src, { run: "r1", msg: "m1", text: "open" });
+    await em.pump();
+    // The outage: r1's turn fails, a notification turn finishes, r2's turn fails, all before the
+    // plane reads any of it.
+    append(src, { run: "r1", msg: "m1b", text: "last answer" });
+    em.queueTerminal({ terminal: { timestamp: 7, error: { message: "rate_limit", code: "rate_limit" } }, at: source.end() });
+    append(src, { run: "n", msg: "n1", text: "notification" });
+    em.queueTerminal({ terminal: { timestamp: 8 }, at: source.end() });
+    append(src, { run: "r2", msg: "m2", text: "next prompt" }, { run: "r2", msg: "m2b", text: "answer" });
+    em.queueTerminal({ terminal: { timestamp: 9, error: { message: "overloaded", code: "overloaded" } }, at: source.end() });
+    ep.answers.push({ seq: 2, duplicate: false }, { seq: 3, duplicate: false });
+    await em.pump();
+    const after = ep.publishes.slice(1).map(envelopeOf);
+    c("queued:the-open-runs-terminal-closes-it-and-the-next-run-opens-clean", after.join(",") === "r1:TEXT_MESSAGE_START+TEXT_MESSAGE_CONTENT+TEXT_MESSAGE_END+RUN_ERROR,r2:RUN_STARTED+TEXT_MESSAGE_START+TEXT_MESSAGE_CONTENT+TEXT_MESSAGE_END" && em.openRunId === "r2", { after, open: em.openRunId });
+    const owedToR2 = em.takeOwed("r2");
+    c("queued:the-notification-turn-took-its-terminal-and-the-run-after-it-is-owed-its-own-error", owedToR2?.terminal.error?.code === "overloaded" && owedToR2.terminal.timestamp === 9, { owedToR2: owedToR2?.terminal, left: em.unsettled() });
+    // The run's own close carries the terminal taken back, as the holder does once the pump has read on.
+    ep.answers.push({ seq: 4, duplicate: false });
+    const closed = await em.closeRun({ timestamp: owedToR2!.terminal.timestamp, error: owedToR2!.terminal.error });
+    const last = envelopeOf(ep.publishes[ep.publishes.length - 1]!);
+    c("queued:the-taken-terminal-closes-the-run-as-a-failure", closed === "r2" && last === "r2:RUN_ERROR", { closed, last });
+    // CONTROL: placed by count instead of position, the finish would have closed r2 and the error
+    // would be waiting for a run that never comes.
+    c("queued:CONTROL-nothing-is-left-waiting", em.unsettled().terminals.length === 0, em.unsettled());
+    // A terminal reported PAST the pump's read waits: its position is read after the pump read the
+    // source, and the records before it are not in that read. The next pump reads them and places
+    // it.
+    ep.answers.push({ seq: 5, duplicate: false });
+    em.queueTerminal({
+      terminal: { timestamp: 10, error: { message: "server_error", code: "server_error" } },
+      at: (async () => {
+        append(src, { run: "r3", msg: "m3", text: "open" });
+        return source.end();
+      })(),
+    });
+    const readBefore = await source.read(wal.frontier.sourceCursor);
+    await em.pump();
+    c("queued:a-terminal-reported-past-the-read-waits", readBefore.records.length === 0 ? em.waitingTerminals === 1 && em.openRunId === "r3" : em.waitingTerminals === 0, { before: readBefore.records.length, waiting: em.waitingTerminals, open: em.openRunId });
+    await em.pump();
+    const owedToR3 = em.takeOwed("r3");
+    c("queued:the-next-pump-places-it-on-the-turn-begun-before-it", em.waitingTerminals === 0 && owedToR3?.terminal.error?.code === "server_error" && em.unsettled().terminals.length === 0, { owedToR3: owedToR3?.terminal, left: em.unsettled() });
+    // A terminal reported before any record the pump reads is the last turn's, which a close settles:
+    // after a live close of r3, a terminal at the end is dropped, as a close after a close is live.
+    ep.answers.push({ seq: 6, duplicate: false });
+    await em.closeRun({ timestamp: 11 });
+    em.queueTerminal({ terminal: { timestamp: 12 }, at: source.end() });
+    await em.pump();
+    c("queued:a-terminal-reported-after-a-live-close-is-dropped", em.unsettled().terminals.length === 0 && ep.publishes.length === 6, { left: em.unsettled(), publishes: ep.publishes.length });
+    // The dying emitter hands back what it holds, each with its position, and the last turn it
+    // began: r4 opens, its terminal is placed as its debt, a fifth terminal is reported past the read.
+    append(src, { run: "r4", msg: "m4", text: "open" });
+    ep.answers.push({ seq: 7, duplicate: false });
+    await em.pump();
+    em.queueTerminal({ terminal: { timestamp: 13, error: { message: "again", code: "again" } }, at: source.end() });
+    await em.pump();
+    em.queueTerminal({ terminal: { timestamp: 14 }, at: new Promise<string>(() => {}) });
+    const left = em.unsettled();
+    c("queued:unsettled-hands-back-the-owed-and-the-waiting-terminals-and-the-last-turn", left.terminals.map((t) => t.terminal.timestamp).join(",") === "13,14" && left.lastTurn === "r4", { terminals: left.terminals.map((t) => t.terminal), lastTurn: left.lastTurn });
+    // A fresh emitter on the same log, seeded with the last turn the one it replaces had begun: a
+    // turn that opened no run. The seed is taken before anything is pumped, and refused after.
+    const em2 = await AguiEmitter.start({ endpoint: ep, wal: await EventWal.open(walPath, { space: SPACE, threadId: THREAD, principal: PRINCIPAL_KEY, subjectMayExist: true }), subjectFrontier: memorySubjectFrontier(), source: new JsonlFileSource<Rec>(src), map: turns });
+    em2.seedLastTurn(null);
+    // A position that cannot be read drops its terminal and fails the pump ONCE: the next pump
+    // goes on without it.
+    em2.queueTerminal({ terminal: { timestamp: 15 }, at: Promise.reject(new Error("EACCES: the transcript is unreadable")) });
+    const failed = await attempt(() => em2.pump());
+    c("queued:a-terminal-whose-position-cannot-be-read-is-dropped-and-the-pump-fails-once", failed.err !== undefined && /dropping the turn terminal reported at 15/.test(failed.err.message) && /EACCES/.test(failed.err.message) && em2.waitingTerminals === 0, { err: failed.err?.message, waiting: em2.waitingTerminals });
+    const again = await attempt(() => em2.pump());
+    c("queued:the-next-pump-goes-on-without-it", again.err === undefined, again.err?.message);
+    // A position this emitter has already read past is one no pump will read up to: the terminal
+    // is dropped the same way, rather than waited for forever.
+    em2.queueTerminal({ terminal: { timestamp: 17 }, at: Promise.resolve(atAdopt) });
+    const behind = await attempt(() => em2.pump());
+    c("queued:a-terminal-at-a-position-already-read-past-is-dropped-and-the-pump-fails-once", behind.err !== undefined && /dropping the turn terminal reported at 17/.test(behind.err.message) && /already read past/.test(behind.err.message) && em2.waitingTerminals === 0, { err: behind.err?.message, waiting: em2.waitingTerminals });
+    c("queued:the-pump-after-that-goes-on-too", (await attempt(() => em2.pump())).err === undefined);
+    // THE SEEDED LAST TURN decides where a terminal reported before any record goes: placed on the
+    // notification turn the seed names, it is consumed, and the run the log has open keeps its
+    // own terminal to come.
+    em2.queueTerminal({ terminal: { timestamp: 16, error: { message: "late", code: "late" } }, at: source.end() });
+    await em2.pump();
+    c("queued:the-seeded-last-turn-takes-a-terminal-reported-before-any-record", em2.unsettled().terminals.length === 0 && em2.openRunId === "r4", { left: em2.unsettled(), open: em2.openRunId });
+    // A NOTIFICATION TURN BEGUN AFTER A RUN, in one read: the next prompt opens r5, a notification
+    // follows it, and the notification's terminal is reported after both. Counted as a turn, the
+    // notification takes it and r5 owes nothing; not counted, it would be r5's and close r5.
+    append(src, { run: "r5", msg: "m5", text: "next prompt" }, { run: "n", msg: "n2", text: "notification" });
+    em2.queueTerminal({ terminal: { timestamp: 18 }, at: source.end() });
+    ep.answers.push({ seq: 8, duplicate: false });
+    await em2.pump();
+    c("queued:a-notification-turn-begun-after-a-run-takes-its-terminal-and-the-run-owes-nothing", em2.openRunId === "r5" && em2.takeOwed("r5") === undefined && em2.unsettled().terminals.length === 0, { open: em2.openRunId, left: em2.unsettled() });
+    const sealed = await attempt(async () => em2.seedLastTurn("r4"));
+    c("queued:the-last-turn-cannot-be-seeded-once-something-was-pumped", sealed.err !== undefined && /before the first pump/.test(sealed.err.message), sealed.err?.message);
+  });
+
+  await block("owed-cursor", async () => {
+    // THE OWED FRAME'S CURSOR STAYS AHEAD OF THE PROMPT. If the owed frame is acknowledged and the
+    // prompt's frame is not, the prompt must be read again; a cursor past it would skip the record
+    // that opens the next run, and every record of that run after it would be dropped.
+    const { src, wal, walPath, source } = await fresh("owed-cursor");
+    const ep = new FakeEndpoint();
+    ep.answers.push({ seq: 1, duplicate: false });
+    const nextPrompt = (r: Rec) =>
+      "skip" in r
+        ? null
+        : r.run === "r1"
+          ? { runId: "r1", events: [runStarted({ threadId: THREAD, runId: "r1", timestamp: 1 })] }
+          : { runId: "r2", events: [runFinished({ threadId: THREAD, runId: "r1", timestamp: 2 }), runStarted({ threadId: THREAD, runId: "r2", timestamp: 3 })] };
+    const em = await AguiEmitter.start({ endpoint: ep, wal, subjectFrontier: memorySubjectFrontier(), source, map: nextPrompt });
+    await em.pump(); // adopt
+    append(src, { run: "r1", msg: "m1", text: "open" });
+    await em.pump();
+    const beforePrompt = wal.frontier.sourceCursor;
+    em.queueTerminal({ terminal: { timestamp: 9, error: { message: "rate_limit" } }, at: source.end() });
+    append(src, { run: "r2", msg: "m2", text: "next prompt" });
+    ep.answers.push(new Error("network: reset before the owed frame was accepted"));
+    const failed = await attempt(() => em.pump());
+    c("owed-cursor:SETUP-the-owed-frame-failed-on-the-wire-and-is-frozen-pending", failed.err !== undefined && wal.pending?.state === "sent_unacked" && wal.pending.brackets.run === undefined, { err: failed.err?.message, pending: wal.pending?.state });
+    c("owed-cursor:the-frozen-owed-frame-stores-the-cursor-AHEAD-of-the-prompt", wal.pending?.sourceCursor === beforePrompt, { frozen: wal.pending?.sourceCursor, beforePrompt });
+    // The debt is settled by the freeze: the frozen frame carries the terminal, and the holder that
+    // drops this emitter must not hold it again for the fresh one.
+    c("owed-cursor:a-debt-whose-frame-is-frozen-is-settled", em.unsettled().terminals.length === 0, em.unsettled());
+    // The re-establish: a fresh start on the same log settles the frozen frame, and its mapper is
+    // rebuilt from the log's brackets, with no run open, so the prompt maps to its own start alone.
+    const wal2 = await EventWal.open(walPath, { space: SPACE, threadId: THREAD, principal: PRINCIPAL_KEY, subjectMayExist: true });
+    const ep2 = new FakeEndpoint();
+    ep2.answers.push({ seq: 2, duplicate: false }, { seq: 3, duplicate: false });
+    const rebuilt = (r: Rec) => ("skip" in r ? null : { runId: r.run, events: [runStarted({ threadId: THREAD, runId: r.run, timestamp: 3 })] });
+    const em2 = await AguiEmitter.start({ endpoint: ep2, wal: wal2, subjectFrontier: memorySubjectFrontier(), source: new JsonlFileSource<Rec>(src), map: rebuilt });
+    await em2.pump();
+    const envelopes = ep2.publishes.map(envelopeOf);
+    c("owed-cursor:the-prompt-is-read-again-and-opens-the-next-run-after-the-settled-error", envelopes.join(",") === "r1:RUN_ERROR,r2:RUN_STARTED" && em2.openRunId === "r2", { envelopes, open: em2.openRunId });
+  });
+
+  await block("freeze", async () => {
+    // THE FREEZE IS THE COMMIT, for the bracket state and for a debt. A frame whose log write fails
+    // before the freeze leaves the wire as it was: the run it opened is not open, and a terminal
+    // placed on it is still owed, to be placed again when the records are read again (Sol, round
+    // 11 of 2026-10-13, through the built MCP entry point: a first turn whose frame never froze
+    // was reported as open and its terminal dropped; a log write refused once while the owed
+    // error was being written closed the failed run as a finish).
+    const { d, src, wal, source } = await fresh("freeze");
+    const ep = new FakeEndpoint();
+    const nextPrompt = (r: Rec) =>
+      "skip" in r
+        ? null
+        : r.run === "r1"
+          ? { runId: "r1", events: [runStarted({ threadId: THREAD, runId: "r1", timestamp: 1 })] }
+          : { runId: "r2", events: [runFinished({ threadId: THREAD, runId: "r1", timestamp: 2 }), runStarted({ threadId: THREAD, runId: "r2", timestamp: 3 })] };
+    const em = await AguiEmitter.start({ endpoint: ep, wal, subjectFrontier: memorySubjectFrontier(), source, map: nextPrompt });
+    await em.pump(); // adopt
+    append(src, { run: "r1", msg: "m1", text: "open" });
+    chmodSync(d, 0o500); // the log's temp file cannot be written: the freeze fails
+    const unfrozen = await attempt(() => em.pump());
+    c("freeze:SETUP-the-first-frames-log-write-failed-before-the-freeze", unfrozen.err !== undefined && wal.pending === null && ep.publishes.length === 0, { err: unfrozen.err?.message, pending: wal.pending });
+    c("freeze:a-run-whose-start-never-froze-is-not-open-on-the-wire", em.openRunId === undefined, em.openRunId);
+    chmodSync(d, 0o700);
+    ep.answers.push({ seq: 1, duplicate: false });
+    await em.pump();
+    c("freeze:CONTROL-the-same-frame-frozen-opens-the-run", em.openRunId === "r1" && wal.frontier.seq === 1, { open: em.openRunId, seq: wal.frontier.seq });
+    // The debt: r1's terminal, then the next prompt; the owed error's frame fails before the freeze.
+    em.queueTerminal({ terminal: { timestamp: 9, error: { message: "rate_limit", code: "rate_limit" } }, at: source.end() });
+    append(src, { run: "r2", msg: "m2", text: "next prompt" });
+    chmodSync(d, 0o500);
+    const refused = await attempt(() => em.pump());
+    c("freeze:a-debt-whose-frame-fails-before-the-freeze-is-still-owed", refused.err !== undefined && em.unsettled().terminals.length === 1 && em.openRunId === "r1", { err: refused.err?.message, left: em.unsettled().terminals.map((t) => t.terminal), open: em.openRunId });
+    chmodSync(d, 0o700);
+    ep.answers.push({ seq: 2, duplicate: false }, { seq: 3, duplicate: false });
+    await em.pump();
+    const envelopes = ep.publishes.map(envelopeOf);
+    c("freeze:the-next-pump-publishes-the-owed-error-in-the-finishs-place", envelopes.join(",") === "r1:RUN_STARTED,r1:RUN_ERROR,r2:RUN_STARTED" && em.unsettled().terminals.length === 0, { envelopes, left: em.unsettled() });
+  });
+  await block("trailing", async () => {
+    // A TRAILING TURN RIDES ON THE FRAME THAT CONSUMES IT. A notification turn after the run's last
+    // answer maps to no unit; its cursor folds onto that answer's frame, and so must the turn: the
+    // frame freezes and the publish fails after it. The emitter dies with the frozen frame past the
+    // notification; the last turn it hands back must be the notification, or the fresh emitter
+    // places the notification's terminal on the run before it and closes that run (Sol, round 12
+    // of 2026-10-13, through the built MCP entry point: a log fold refused once after the frame
+    // was acknowledged, another failure after the freeze, made the notification's stop publish
+    // RUN_FINISHED for the human run).
+    const { src, wal, walPath, source } = await fresh("trailing");
+    const ep = new FakeEndpoint();
+    const turns = (r: Rec) => {
+      if ("skip" in r) return null;
+      if (r.text === "notification") return { turn: true as const };
+      if (r.text === "open") return { runId: r.run, events: [runStarted({ threadId: THREAD, runId: r.run, timestamp: 1 })] };
+      return { runId: r.run, events: [textMessageStart({ messageId: r.msg, timestamp: 2, role: "assistant" }), textMessageContent({ messageId: r.msg, delta: r.text, timestamp: 3 }), textMessageEnd({ messageId: r.msg, timestamp: 4 })] };
+    };
+    const em = await AguiEmitter.start({ endpoint: ep, wal, subjectFrontier: memorySubjectFrontier(), source, map: turns });
+    await em.pump(); // adopt
+    ep.answers.push({ seq: 1, duplicate: false });
+    append(src, { run: "r1", msg: "m1", text: "open" });
+    await em.pump();
+    append(src, { run: "r1", msg: "m1b", text: "last answer" }, { run: "n", msg: "n1", text: "notification" });
+    // The frame freezes, and the publish fails on the wire after it.
+    ep.answers.push(new Error("network: reset after the frame was frozen"));
+    const failed = await attempt(() => em.pump());
+    c("trailing:SETUP-the-frame-carrying-the-notification-froze-and-failed-after", failed.err !== undefined && wal.pending?.state === "sent_unacked", { err: failed.err?.message, pending: wal.pending?.state });
+    c("trailing:the-last-turn-handed-back-is-the-notification-the-frozen-frame-consumed", em.unsettled().lastTurn === null, em.unsettled());
+    // The fresh emitter settles the acked frame, is seeded with that turn, and the notification's
+    // terminal reported before any record is consumed by it: r1 owes nothing and stays open.
+    const wal2 = await EventWal.open(walPath, { space: SPACE, threadId: THREAD, principal: PRINCIPAL_KEY, subjectMayExist: true });
+    ep.answers.push({ seq: 2, duplicate: false }); // the start republishes the frozen frame
+    const em2 = await AguiEmitter.start({ endpoint: ep, wal: wal2, subjectFrontier: memorySubjectFrontier(), source: new JsonlFileSource<Rec>(src), map: turns });
+    em2.seedLastTurn(em.unsettled().lastTurn);
+    em2.queueTerminal({ terminal: { timestamp: 9 }, at: source.end() });
+    await em2.pump();
+    c("trailing:the-notifications-terminal-is-consumed-and-the-run-before-it-stays-open-owing-nothing", em2.openRunId === "r1" && em2.takeOwed("r1") === undefined && em2.unsettled().terminals.length === 0 && wal2.pending === null, { open: em2.openRunId, left: em2.unsettled(), pending: wal2.pending });
+  });
+
+  await block("settle", async () => {
+    // THE DEBT A FREEZE SETTLES IS THE RUN THE TERMINAL CLOSES, not the run the frame is labelled
+    // with. The finish the next prompt synthesizes for its predecessor travels in the successor's
+    // frame; a debt placed on the successor before that frame freezes must survive it, or the
+    // successor's own terminal is lost and the prompt after it closes the failed run as a finish.
+    const { src, wal, source } = await fresh("settle");
+    const ep = new FakeEndpoint();
+    ep.answers.push({ seq: 1, duplicate: false }, { seq: 2, duplicate: false });
+    const nextPrompt = (r: Rec) =>
+      "skip" in r
+        ? null
+        : r.run === "r1"
+          ? { runId: "r1", events: [runStarted({ threadId: THREAD, runId: "r1", timestamp: 1 })] }
+          : { runId: "r2", events: [runFinished({ threadId: THREAD, runId: "r1", timestamp: 2 }), runStarted({ threadId: THREAD, runId: "r2", timestamp: 3 })] };
+    const em = await AguiEmitter.start({ endpoint: ep, wal, subjectFrontier: memorySubjectFrontier(), source, map: nextPrompt });
+    await em.pump(); // adopt
+    append(src, { run: "r1", msg: "m1", text: "open" });
+    await em.pump();
+    em.queueTerminal({ terminal: { timestamp: 9 }, at: source.end() }); // r1's finish, after its records
+    append(src, { run: "r2", msg: "m2", text: "next prompt" });
+    em.queueTerminal({ terminal: { timestamp: 10, error: { message: "rate_limit", code: "rate_limit" } }, at: source.end() }); // r2's failure, after its records
+    await em.pump();
+    const envelopes = ep.publishes.map(envelopeOf);
+    c("settle:SETUP-the-prompts-frame-carried-the-predecessors-finish-and-opened-the-successor", envelopes.some((e) => e.includes("RUN_FINISHED")) && em.openRunId === "r2", { envelopes, open: em.openRunId });
+    const owedToR2 = em.takeOwed("r2");
+    c("settle:the-successors-debt-survives-the-freeze-of-the-frame-carrying-the-predecessors-finish", owedToR2?.terminal.error?.code === "rate_limit" && em.unsettled().terminals.length === 0, { owed: owedToR2?.terminal, left: em.unsettled() });
+  });
+} finally {
+  rmSync(dir, { recursive: true, force: true });
+}
+
+console.log(`agui-emitter smoke: ${ok} passed, ${fail} failed`);
+process.exit(fail ? 1 : 0);

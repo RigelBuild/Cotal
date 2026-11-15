@@ -1,0 +1,116 @@
+{
+  "suite": [
+    "implementations/runtime/smoke/migrate-run.smoke.ts"
+  ],
+  "guard": "The commit that files a migration: refused when inadmissible, records who applied it, carries what the check found, and computes the target hash rather than taking the caller word for it.",
+  "command": "pnpm smoke:runtime-migrate",
+  "completionMarker": "migrate-run.smoke:",
+  "proveWith": "pnpm mutation-proof --config implementations/runtime/smoke/mutations/migration-commit.json   # --config resolves against the repo root, never the cwd",
+  "mutations": [
+    {
+      "name": "an inadmissible report is committed anyway",
+      "file": "implementations/runtime/src/migrate.ts",
+      "find": "  if (!report.admissible) {\n    throw new MigrationNotAdmissible(report);\n  }",
+      "replace": "  if (!report.admissible && false) {\n    throw new MigrationNotAdmissible(report);\n  }",
+      "expectRed": "committing it is refused BEFORE anything is written",
+      "cell": "committing it is refused BEFORE anything is written"
+    },
+    {
+      "name": "the commit files the report but never records who applied it",
+      "file": "implementations/runtime/src/migrate.ts",
+      "find": "  await markRunMigrationApplied(kv, endpoint, report.run, migrationId, driver, report.at);",
+      "replace": "  void markRunMigrationApplied;",
+      "expectRed": "the APPLICATION is a separate fact naming the driver that made it",
+      "cell": "the APPLICATION is a separate fact naming the driver that made it"
+    },
+    {
+      "name": "the filed record drops the orphan rows",
+      "file": "implementations/runtime/src/migrate.ts",
+      "find": "    orphans: report.orphans.map((o) => ({",
+      "replace": "    orphans: report.orphans.slice(0, 0).map((o) => ({",
+      "expectRed": "including the orphan rows, so a reader is never told the work did not happen",
+      "cell": "including the orphan rows, so a reader is never told the work did not happen"
+    },
+    {
+      "name": "the target hash is the caller's claim rather than computed",
+      "file": "implementations/runtime/src/migrate.ts",
+      "find": "    toHash: programHashOf(req.source),",
+      "replace": "    toHash: req.fromHash ?? programHashOf(req.source),",
+      "expectRed": "it carries the hash of the source it would move TO, computed rather than claimed",
+      "cell": "and it carries the hash of the source it would move TO, computed rather than claimed"
+    },
+    {
+      "name": "fromHash is invented from the new source instead of left absent",
+      "file": "implementations/runtime/src/migrate.ts",
+      "find": "    ...(req.fromHash !== undefined ? { fromHash: req.fromHash } : {}),",
+      "replace": "    fromHash: programHashOf(req.source),",
+      "expectRed": "while fromHash is carried as the caller's claim, because nothing here pins one",
+      "cell": "while fromHash is carried as the caller's claim, because nothing here pins one"
+    },
+    {
+      "name": "the walk's `branch missing` refusal is not translated into the report",
+      "file": "implementations/runtime/src/migrate.ts",
+      "find": "    } else if (e instanceof UnwalkableScope || e instanceof ScopeBranchMissing) {",
+      "replace": "    } else if (e instanceof UnwalkableScope) {",
+      "expectRed": "and the missing branch is reported, not consumed",
+      "cell": "and the missing branch is reported, not consumed",
+      "note": "The half a lang-side cell cannot see. The THROW is asserted in migrate.smoke; what nothing watched was this file TRANSLATING it into `unwalkable`, and an untranslated one falls through to the rethrow and reaches the caller as a raw exception instead of a report. The seat's earlier finding on this suite was exactly a translation branch nothing watched."
+    },
+    {
+      "name": "consumedThrough mixes the raw append log with the folded orphan count",
+      "file": "implementations/runtime/src/migrate.ts",
+      "find": "    consumedThrough: journal.entries().length - orphans.length,",
+      "replace": "    consumedThrough: req.entries.length - orphans.length,",
+      "expectRed": "the SAME decision off the raw append log counts the same steps and files the same id",
+      "cell": "the SAME decision off the raw append log counts the same steps and files the same id",
+      "note": "req.entries is the replayed APPEND LOG, where a completed step is a pending row and then its settle; orphans() reads the folded keyed view. The difference is neither count, and it is filed in a durable record and in that record's content-derived id, so one decision replayed at a different shape files twice."
+    },
+    {
+      "name": "--adopt clears the row on any name, not the spawned handle",
+      "file": "implementations/runtime/src/migrate.ts",
+      "find": "      const adopt = o?.adopt?.includes(handle) === true;",
+      "replace": "      const adopt = (o?.adopt?.length ?? 0) > 0;",
+      "expectRed": "--adopt naming something other than the spawned handle does not clear the row",
+      "cell": "--adopt naming something other than the spawned handle does not clear the row",
+      "note": "A loosely matched override hands over a seat the caller never named."
+    },
+    {
+      "name": "a seat named under both overrides is handed over",
+      "file": "implementations/runtime/src/migrate.ts",
+      "find": "      if (adopt && release)\n        return reject(\"L5003\", `${handle} is named by both --adopt and --release; one agent is reassigned or torn down, never both`);\n",
+      "replace": "",
+      "expectRed": "naming one seat under both overrides is refused: it is reassigned or torn down, never both",
+      "cell": "naming one seat under both overrides is refused: it is reassigned or torn down, never both",
+      "note": "Adopt wins silently and the release the caller also asked for never happens."
+    },
+    {
+      "name": "a commit with no discharger files a --release migration anyway",
+      "file": "implementations/runtime/src/migrate.ts",
+      "find": "  if (seats === undefined && report.overrides.some((o) => o.startsWith(\"--release \")))\n    throw new Error(`migration of run ${report.run} releases a seat, and a commit with no journal and no discharger cannot tear one down; nothing was written`);\n",
+      "replace": "",
+      "expectRed": "a commit that releases a seat but has no discharger is refused before anything is filed",
+      "cell": "a commit that releases a seat but has no discharger is refused before anything is filed",
+      "note": "The record would claim a release nothing performed."
+    },
+    {
+      "name": "a failed spawn is treated as a live seat",
+      "file": "implementations/runtime/src/migrate.ts",
+      "find": "  if (e.kind !== \"spawn\" || e.state !== \"settled\" || e.status !== \"ok\") return undefined;\n  const agent = (e.result as { agent?: unknown } | undefined)?.agent;\n  return typeof agent === \"string\" && agent.length > 0 ? agent : undefined;",
+      "replace": "  if (e.kind !== \"spawn\") return undefined;\n  const agent = (e.result as { agent?: unknown } | undefined)?.agent;\n  return typeof agent === \"string\" && agent.length > 0 ? agent : e.name;",
+      "expectRed": "a spawn that never produced an agent is ignored: nothing outlives it",
+      "cell": "a spawn that never produced an agent is ignored: nothing outlives it",
+      "note": "A spawn that failed left no seat; refusing the migration over it blocks an edit for a leak that does not exist."
+    }
+  ],
+  "why": [
+    "SPECIFIER BOUNDARY, and it is one config away rather than absent. Every mutation config in",
+    "this lane mutates a module its suite imports through a RELATIVE `../src/*.js` path, and no",
+    "command carries a build step -- all are bare `tsx` -- so the mutated bytes are the bytes the",
+    "suite loads. The suites in THIS directory nonetheless boot `@cotal-ai/core` and `@cotal-ai/lang`",
+    "through package specifiers that resolve to `dist`. So a future config that targets",
+    "`packages/lang/src` or `packages/core/src` under a `pnpm smoke:runtime-*` command would be VOID",
+    "ON ARRIVAL: the mutant would sit in `src` while the suite graded an untouched `dist`, and the",
+    "kill rate would measure module resolution rather than the guard. Either mutate the module the",
+    "suite imports relatively, or put a build between the mutation and the run."
+  ]
+}

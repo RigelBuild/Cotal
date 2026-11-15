@@ -1,0 +1,218 @@
+{
+  "suite": [
+    "implementations/manager/smoke/manager-reconcile-startup.smoke.ts"
+  ],
+  "guard": "A manager starts startup static lifecycle reconciliation, then overlaps the remaining sweep with control-service registration; every alias in the collected reconcile plan is refused for spawn until its own terminal attempt returns.",
+  "command": "pnpm smoke:manager-reconcile-startup",
+  "completionMarker": "MANAGER RECONCILE STARTUP SMOKE",
+  "proveWith": "pnpm mutation-proof --config implementations/manager/smoke/mutations/reconcile-startup.json",
+  "why": [
+    "The live fixture creates real durable ACTIVE orphan rows against a real JWT broker before the",
+    "manager starts. It waits for an observed terminal transition, then calls the registered status",
+    "service while later rows are still ACTIVE. This is the entrypoint and outage shape, not a",
+    "hand-constructed call to reconcileStaticLifecycles.",
+    "",
+    "The second cell invokes spawn for a later planned alias. It must reach the manager service and",
+    "be refused by the alias fence before lifecycle provisioning. That catches both moving the fence",
+    "behind an await and dropping the startAgent guard.",
+    "Batch B2 (2026-09-03): the seat's turn relay had the same boot window as spawn-as-action, and",
+    "an empty answer is worse than a refusal: the seat reads `{turns: []}` as `you hold nothing` and",
+    "a not-found yield as `drop it`, while a refusal means `keep what you hold`."
+  ],
+  "mutations": [
+    {
+      "name": "serve last again, recreating startup-wide manager unavailability",
+      "file": "implementations/manager/src/manager.ts",
+      "find": "    const startupReconcile = this.auth && !this.userMode ? this.reconcileStaticLifecycles() : undefined;\n    if (startupReconcile)",
+      "replace": "    const startupReconcile = this.auth && !this.userMode ? await this.reconcileStaticLifecycles() : undefined;\n    if (startupReconcile)",
+      "expectRed": "status serves while later orphan rows remain ACTIVE",
+      "cell": "status serves while later orphan rows remain ACTIVE",
+      "afterRestore": "pnpm --filter @cotal-ai/manager... build"
+    },
+    {
+      "name": "drop the alias admission guard",
+      "file": "implementations/manager/src/manager.ts",
+      "find": "    if (this.reconcilingAliases.has(identityName))\n      return { ok: false, error: `the name \"${identityName}\" is still reconciling at manager startup; its prior lifecycle terminal owns this alias until it completes. Retry shortly.` };",
+      "replace": "    void this.reconcilingAliases;",
+      "expectRed": "spawn for an alias still reconciling is refused by its reconcile gate before lifecycle provisioning",
+      "cell": "spawn for an alias still reconciling is refused by its reconcile gate before lifecycle provisioning",
+      "afterRestore": "pnpm --filter @cotal-ai/manager... build"
+    },
+    {
+      "name": "the seat's turn pull answers during the boot window",
+      "file": "implementations/manager/src/manager.ts",
+      "find": "  private turnPendingFor(c: { owner: string; actor: string; uid: string }): { turns: { goalId: string; payload: string; acceptedAt: number; deadlineAt?: number; once?: true }[]; notices: true; stop?: true } {\n",
+      "replace": "  private turnPendingFor(c: { owner: string; actor: string; uid: string }): { turns: { goalId: string; payload: string; acceptedAt: number; deadlineAt?: number; once?: true }[]; notices: true; stop?: true } {\n    if (!this.goalReconcileDone) return { turns: [], notices: true };\n",
+      "expectRed": "a seat pulling turns before the goal index is rebuilt is REFUSED, never told it holds none",
+      "cell": "a seat pulling turns before the goal index is rebuilt is REFUSED, never told it holds none",
+      "note": "Measured 2026-09-03: KILLED. MANAGER RECONCILE STARTUP SMOKE FAILED  (5 passed, 1 failed) Named cell red: a seat pulling turns before the goal index is rebuilt is REFUSED, never told it holds none"
+    },
+    {
+      "name": "the seat's yield answers not-found during the boot window",
+      "file": "implementations/manager/src/manager.ts",
+      "find": "      throw new EpEnvelopeError(\"unavailable\", \"the manager is still reconciling accepted goals at boot; this yield's turn may not be indexed yet, retry (SPEC 13.6)\");",
+      "replace": "      void 0;",
+      "expectRed": "and a yield in the same window is refused rather than answered not-found",
+      "cell": "and a yield in the same window is refused rather than answered not-found",
+      "note": "Measured 2026-09-03: KILLED. MANAGER RECONCILE STARTUP SMOKE FAILED  (5 passed, 1 failed) Named cell red: and a yield in the same window is refused rather than answered not-found"
+    },
+    {
+      "name": "the boot sweep stamps every adopted turn's seat dead",
+      "file": "implementations/manager/src/manager.ts",
+      "find": "    const key = goalKey(p.ref);\n    this.pendingTurns.set(key, p);\n",
+      "replace": "    const key = goalKey(p.ref);\n    this.pendingTurns.set(key, p);\n    if (this.agents.get(p.seat.name)?.lifecycleUid !== p.seat.uid) this.failSeatTurns(p.seat.name, p.seat.uid);\n",
+      "expectRed": "and NOT marked as addressing a dead seat",
+      "cell": "and NOT marked as addressing a dead seat: an empty agents map at boot is not evidence of death",
+      "note": "The agents map is EMPTY during reconcile: seats re-register later, so 'not in the map' meant 'not yet re-registered' and every adopted turn's deadline terminal carried `agentDownAt`, raising L4002 where the reference says L4003."
+    },
+    {
+      "name": "an adopted turn is stamped with the boot instant",
+      "file": "implementations/manager/src/manager.ts",
+      "find": "      acceptedAt: spec.value.acceptedAt,",
+      "replace": "      acceptedAt: Date.now(),",
+      "expectRed": "stamped with the acceptance time its goal RECORDS, never the instant the manager booted",
+      "cell": "stamped with the acceptance time its goal RECORDS, never the instant the manager booted",
+      "note": "`acceptedAt` orders a seat's queue. A turn stamped at boot sorts behind every turn accepted since: a predecessor's oldest turn served last, by a queue whose whole job is oldest-first."
+    },
+    {
+      "name": "an elapsed turn is still the head of its seat's queue",
+      "file": "implementations/manager/src/manager.ts",
+      "find": "      .filter((p) => (p.deadlineAt === undefined || now < p.deadlineAt) && p.once?.deliverable !== false)\n      .sort((x, y) => x.acceptedAt - y.acceptedAt)",
+      "replace": "      .filter((p) => p.once?.deliverable !== false)\n      .sort((x, y) => x.acceptedAt - y.acceptedAt)",
+      "expectRed": "an ELAPSED turn is not served and does not dam the seat's queue",
+      "cell": "an ELAPSED turn is not served and does not dam the seat's queue: the live one behind it surfaces",
+      "note": "Only the oldest unsettled turn is served, so an expired one at the head buys the seat work whose yield is refused and hides every turn behind it."
+    },
+    {
+      "name": "a retried yield hears not-found for work that committed",
+      "file": "implementations/manager/src/manager.ts",
+      "find": "    const settled = this.turnAcceptances.get(key);\n    if (settled !== undefined) {",
+      "replace": "    const settled = this.turnAcceptances.get(key);\n    if (false && settled !== undefined) {",
+      "expectRed": "a retried yield is served the answer the lost reply carried, never `not-found`",
+      "cell": "a retried yield is served the answer the lost reply carried, never `not-found`",
+      "note": "The commit deletes the pending turn, so a retry after a lost reply found nothing and the seat read `not-found` as 'drop it': failure reported for work the run already has."
+    },
+    {
+      "name": "a settled answer is served to anyone who asks",
+      "file": "implementations/manager/src/manager.ts",
+      "find": "      if (a.goalId === goalId && a.owner === c.owner && a.actor === c.actor && a.uid === c.uid) return key;",
+      "replace": "      if (a.goalId === goalId) return key;",
+      "expectRed": "and only to the addressee it was addressed to",
+      "cell": "and only to the addressee it was addressed to",
+      "note": "A yield is the addressee's own, and so is the answer a retry of it is served."
+    },
+    {
+      "name": "settled answers are kept for the process lifetime",
+      "file": "implementations/manager/src/manager.ts",
+      "find": "      if (at !== undefined && now - at >= TURN_ANSWER_RETENTION_MS) this.turnAcceptances.delete(key);",
+      "replace": "      if (e.settled !== undefined && at !== undefined && now - at >= TURN_ANSWER_RETENTION_MS) void key;",
+      "expectRed": "the sweep drops a settled answer once its retry window has passed",
+      "cell": "the sweep drops a settled answer once its retry window has passed, and keeps a fresh one",
+      "note": "The map had no eviction at all: one entry per turn for the life of the process. The mutant keeps the loop and its scope intact and only removes the delete; a first draft replaced the whole if with statements that referenced the loop bindings OUTSIDE the loop, which is a ReferenceError every sweep tick and graded WRONG-RED about nothing."
+    },
+    {
+      "name": "an unsettled leftover acceptance is kept for the process lifetime",
+      "file": "implementations/manager/src/manager.ts",
+      "find": "      const at = e.settled?.at ?? e.leftoverSince;\n      if (at !== undefined && now - at >= TURN_ANSWER_RETENTION_MS) this.turnAcceptances.delete(key);",
+      "replace": "      const at = e.settled?.at ?? e.leftoverSince;\n      if (e.settled !== undefined && at !== undefined && now - at >= TURN_ANSWER_RETENTION_MS) this.turnAcceptances.delete(key);",
+      "expectRed": "the sweep drops a stale unsettled acceptance once its retry window has passed",
+      "cell": "the sweep drops a stale unsettled acceptance once its retry window has passed, and keeps a fresh one",
+      "note": "#1262 follow-through. maybeStopTurnSweep used to wipe the map the moment pending was empty, which is the in-flight deadline window. After that wipe was removed, an acceptance whose deadline commit never remembered would pin the 5s sweep forever."
+    },
+    {
+      "name": "an unsettled leftover ages off the original deadline, not the latch-drop stamp",
+      "file": "implementations/manager/src/manager.ts",
+      "find": "      const at = e.settled?.at ?? e.leftoverSince;",
+      "replace": "      const at = e.settled?.at ?? e.acceptance.deadlineAt;",
+      "expectRed": "the sweep drops a stale unsettled acceptance once its retry window has passed",
+      "cell": "the sweep drops a stale unsettled acceptance once its retry window has passed, and keeps a fresh one",
+      "note": "Aging off deadlineAt drops a leftover immediately after a long outage (deadline already elapsed) and keeps one whose deadline is still in the future. leftoverSince is when the pending latch dropped; the cell inverts the two clocks so this mutant cannot hide."
+    },
+    {
+      "name": "commitTurnDeadline never stamps leftoverSince",
+      "file": "implementations/manager/src/manager.ts",
+      "find": "    if (!this.pendingTurns.delete(key)) return;\n    this.noticeSeatTurns(p.seat);\n    this.markTurnLatchDropped(key);",
+      "replace": "    if (!this.pendingTurns.delete(key)) return;\n    this.noticeSeatTurns(p.seat);",
+      "expectRed": "commitTurnDeadline stamps leftoverSince when the pending latch drops",
+      "cell": "commitTurnDeadline stamps leftoverSince when the pending latch drops, not the original deadline",
+      "note": "Without this stamp a failed deadline commit leaves an acceptance with no settled and no leftoverSince, so the sweep never ages it off."
+    },
+    {
+      "name": "the idle check never stops the sweep, so it runs on after the prune leaves nothing",
+      "file": "implementations/manager/src/manager.ts",
+      "find": "    if (this.turnAcceptances.size > 0) return;\n    this.stopTurnSweep();\n  }",
+      "replace": "    if (this.turnAcceptances.size > 0) return;\n  }",
+      "expectRed": "and stops itself once the prune leaves it nothing to do: no pending turn, no answer to serve",
+      "cell": "and stops itself once the prune leaves it nothing to do: no pending turn, no answer to serve",
+      "note": "maybeStopTurnSweep's callers run at settle time, when an answer has just been remembered, so the map is never empty when they look. The prune inside the sweep is the one event after which nothing is owed; without that call the 5s interval ran for the process lifetime over two empty maps. The sweep's own call sits between two comments and the bare call occurs four times, so the mutation removes the stop inside maybeStopTurnSweep, which only the sweep's call ever reaches."
+    },
+    {
+      "name": "a turn with no minted hold is adopted as pending anyway",
+      "file": "implementations/manager/src/manager.ts",
+      "find": "    if (p.holdToken !== undefined && (await readCheckpointSpec(gw.ctx.kv, { endpoint: p.ref.endpoint, token: p.holdToken })) === undefined) {\n",
+      "replace": "    if (false) {\n",
+      "expectRed": "a turn whose hold was never minted is not adopted as pending",
+      "cell": "a turn whose hold was never minted is not adopted as pending: nothing could settle it",
+      "note": "The hold is minted after the index entry and the goal record. A crash between them leaves a goal nothing can settle; adopted, the sweep would try to expire a pause that was never minted on every tick and the seat could never yield it."
+    },
+    {
+      "name": "adoption rebuilds the pending relay and not the acceptance its answer is remembered against",
+      "file": "implementations/manager/src/manager.ts",
+      "find": "    this.turnAcceptances.set(key, {\n      acceptance: {\n        name: p.seat.name, owner: p.seat.owner, actor: p.seat.actor, uid: p.seat.uid, goalId: p.goalId,",
+      "replace": "    if (false) this.turnAcceptances.set(key, {\n      acceptance: {\n        name: p.seat.name, owner: p.seat.owner, actor: p.seat.actor, uid: p.seat.uid, goalId: p.goalId,",
+      "expectRed": "an adopted turn yields, and a retry of that yield is served the answer it earned, never `not-found`",
+      "cell": "an adopted turn yields, and a retry of that yield is served the answer it earned, never `not-found`",
+      "note": "rememberSettledTurn writes only against an acceptance this incarnation holds. Adoption rebuilt pendingTurns alone, so a yield whose reply was lost after a restart still heard not-found on the one path adoption exists for."
+    },
+    {
+      "name": "a late yield after the deadline committed hears not-found instead of the deny",
+      "file": "implementations/manager/src/manager.ts",
+      "find": "      if (settled.ref !== undefined && this.goalWriter) {\n        const ended = await readGoalResult(this.goalWriter.ctx, settled.ref);\n        if (ended !== undefined) {\n          this.rememberSettledTurn(key, ended.state, ended.ts);\n          return { goalId, state: ended.state };\n        }\n      }",
+      "replace": "      if (settled.ref !== undefined && this.goalWriter) {\n        void settled.ref;\n      }",
+      "expectRed": "a yield after the deny committed, before the index drop, is told the turn ended failed, never `not-found`",
+      "cell": "a yield after the deny committed, before the index drop, is told the turn ended failed, never `not-found`",
+      "note": "#1262. After commitTurnDeadline deletes pending (the latch, before the terminal CAS) the only in-memory answer a late yield could find was turnAcceptances.settled. When that field was not yet written, or a concurrent sweep dropped it, the yield heard not-found for a deny the run already has. The durable terminal is the answer; the index drop is not the cause (the yield path never consults it)."
+    },
+    {
+      "name": "the manager trusts the answerer's lease claim (the row-holder comparison dropped)",
+      "file": "implementations/manager/src/manager.ts",
+      "find": "    const holder = await this.ep.deliveryLeaseHolder(Manager.DELIVERY_SHARD);\n    if (holder === undefined)\n      throw new Error(\n        \"this manager could not read the delivery lease row, so it cannot verify that the answering \" +\n          \"responder is the process that reloads the standing credentials - nothing reminted\",\n      );\n    if (holder !== answer.responder)\n      throw new Error(\n        `the delivery-admin rail was answered by ${answer.responder}, which is not the holder of ` +\n          `this space's delivery lease (${holder}), so its SecretStore is not the store the daemon ` +\n          `reloads from - nothing reminted`,\n      );",
+      "replace": "    void this.ep;",
+      "expectRed": "a NON-HOLDER answer with the manager's own store is REFUSED: the manager does not take the renewal lease (#1694)",
+      "cell": "a NON-HOLDER answer with the manager's own store is REFUSED: the manager does not take the renewal lease (#1694)",
+      "note": "#1694 half 1, the binding test. The cell's non-holder DISHONESTLY claims holdsDeliveryLease:true (the issue's actual attack: a responder that does not hold the lease can assert that it does), so the claim check passes and only the row-holder comparison can refuse. Dropping the comparison lets the pass read shared off the non-holder's matching store and take the renewal lease.",
+      "afterRestore": "pnpm --filter @cotal-ai/manager... build"
+    },
+    {
+      "name": "a no-responder rail reads absent again (the row read dropped)",
+      "file": "implementations/manager/src/manager.ts",
+      "find": "      if (isAbsentDeliveryAdmin(msg)) return this.absentByLeaseRow(isUnansweredDeliveryAdmin(e));",
+      "replace": "      if (isAbsentDeliveryAdmin(msg)) return \"absent\";",
+      "expectRed": "a no-responder rail while the row names a holder REFUSES (undetermined, never absent) and the manager holds no renewal lease",
+      "cell": "a no-responder rail while the row names a holder REFUSES (undetermined, never absent) and the manager holds no renewal lease",
+      "note": "#1694 half 2. With absence read straight off the rail again, the no-responder pass in the cell reads absent, the manager takes the renewal lease, and both the log-line refusal and daemonRenewalOwner===false go.",
+      "afterRestore": "pnpm --filter @cotal-ai/manager... build"
+    },
+    {
+      "name": "the lease reader folds an unparseable row into absent (the parse throw dropped)",
+      "file": "packages/core/src/endpoint.ts",
+      "find": "    try { return { info: e.json<DeliveryLeaseInfo>(), revision: e.revision }; }\n    catch (err) { throw new Error(`delivery lease row \"${leaseKey(shardIndex)}\" exists but does not parse as a lease record (${(err as Error).message}) - it is unreadable, not absent`); }",
+      "replace": "    try { return { info: e.json<DeliveryLeaseInfo>(), revision: e.revision }; } catch { return undefined; }",
+      "expectRed": "a lease row that EXISTS but does not parse is UNREADABLE, not absent: the pass refuses and the manager holds no renewal lease",
+      "cell": "a lease row that EXISTS but does not parse is UNREADABLE, not absent: the pass refuses and the manager holds no renewal lease",
+      "note": "Round 2, blocker 1. @cotal-ai/core resolves to dist/ for this suite, so the command builds core+manager from the mutated source before running (the rig's documented pattern for a core-src mutant under implementations/*). With the parse throw folded back into undefined, the corrupt-row cell reads no-row -> absent -> the manager takes/keeps the renewal lease, and both the refusal text and daemonRenewalOwner===false go.",
+      "afterRestore": "pnpm --filter @cotal-ai/core... build && pnpm --filter @cotal-ai/manager... build",
+      "command": "pnpm --filter @cotal-ai/core... build && pnpm --filter @cotal-ai/manager... build && pnpm smoke:manager-reconcile-startup"
+    },
+    {
+      "name": "a refused pass keeps the held renewal lease (the catch-path release dropped)",
+      "file": "implementations/manager/src/manager.ts",
+      "find": "    } catch (e) {\n      this.daemonRenewalEligible = false;\n      if (this.daemonRenewalOwner) await this.ep.releaseDaemonRenewalLease().catch(() => {});\n      this.daemonRenewalOwner = false;\n      throw e;\n    }",
+      "replace": "    } catch (e) {\n      this.daemonRenewalEligible = false;\n      this.daemonRenewalOwner = false;\n      this.daemonRenewalOwner = true;\n      throw e;\n    }",
+      "expectRed": "a no-responder rail while the row names a holder REFUSES (undetermined, never absent) and the manager holds no renewal lease",
+      "cell": "a no-responder rail while the row names a holder REFUSES (undetermined, never absent) and the manager holds no renewal lease",
+      "note": "Round 2, blocker 2. The cell now stages a HELD lease first (the holder answers the manager's store, a pass takes the lease), then drives the no-responder refusal. Reverting the release on the throw path leaves the lease held until its TTL lapses, so daemonRenewalOwner===false fails even though the refusal text is logged. The release call is deleted and the flag restored, keeping the mutant type-valid and behaviour-equivalent to the pre-fix code.",
+      "afterRestore": "pnpm --filter @cotal-ai/manager... build"
+    }
+  ]
+}

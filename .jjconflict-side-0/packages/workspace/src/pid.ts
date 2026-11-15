@@ -1,0 +1,820 @@
+/**
+ * THE pid-attribution contract for machine-local pidfiles, in ONE place.
+ *
+ * A gap between a guard's pid validity predicate and what `process.kill` accepts lets a live
+ * process be misread as dead and its pidfile be deleted under a clean-stop report. One bounded
+ * parser (`parsePid`) and one tri-state probe (`probeLiveness` / `livenessFromErrno`) keep every
+ * surface that decides "is this record a live process, a dead one, or unattributable" on the same
+ * rules: only an actual `ESRCH` proves a process gone, `EPERM` (another user's process) is alive,
+ * and anything else is `unknown`, never dead; CALLERS MUST PICK A DIRECTION (`!== "dead"` to
+ * preserve on doubt, `=== "alive"` to require proof of presence).
+ *
+ * This lives in `workspace` (machine-local operator tooling), the widest tier that may hold a
+ * local-process concept: the CLI, the manager, the auth service and the web surface all depend on
+ * it. `extensions/*` peer-depend `core` ONLY, and a pid probe is not a wire concept, so moving it
+ * into core to reach them would leak a local concern into the standard. The two extension-side
+ * probes (`connector-opencode`, `connector-hermes`) therefore keep their own copies; if they need
+ * this contract, the fix is a shared local-process module they may depend on, never a core export.
+ */
+
+import { spawnSync } from "node:child_process";
+import { nativeWin32CreationToken } from "./win32-process.js";
+import { darwinProcessBinding, type DarwinProcessBinding } from "./darwin-process.js";
+import { randomBytes } from "node:crypto";
+import { existsSync, readFileSync, readdirSync, readlinkSync, renameSync, rmSync } from "node:fs";
+import { createPrivateRecord, writePrivateRecord } from "@cotal-ai/core";
+import { acquireLock, processStartToken as posixStartToken } from "./advisory-lock.js";
+import { probeLiveness, type LivenessProbe } from "./liveness.js";
+
+export { livenessFromErrno, probeLiveness, type LivenessProbe } from "./liveness.js";
+
+/** A Node/POSIX-signalable pid: a positive INTEGER within the signed 32-bit range `process.kill`
+ *  accepts (it throws `ERR_INVALID_ARG_TYPE`/`ERR_OUT_OF_RANGE` outside it). Anything else -
+ *  fractional, non-numeric, non-positive, oversized - is undefined: UNATTRIBUTABLE, never a pid to
+ *  probe or delete a record against. */
+export function parsePid(raw: string): number | undefined {
+  const n = Number(raw.trim());
+  return Number.isInteger(n) && n > 0 && n <= 0x7fffffff ? n : undefined;
+}
+
+/** A pidfile's trimmed content, or undefined when there is no pidfile. Read once, never behind an
+ *  existence check: the owner removes its record on exit, so a file that existed a moment ago can be
+ *  gone at the read. Only ENOENT means absent; any other read error throws, naming the path because
+ *  an error raised at the read rather than the open (EISDIR) carries none. */
+export function readPidfile(path: string): string | undefined {
+  try {
+    return readFileSync(path, "utf8").trim();
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw new Error(`cannot read ${path}: ${(e as Error).message}`, { cause: e });
+  }
+}
+
+/** Whether `pid` is stopped by a signal such as SIGSTOP, read from its `/proc` state, or on macOS from
+ *  its kernel entry. Elsewhere this is `false`, and callers keep their unanswered-broker path. */
+export function processStopped(pid: number): boolean {
+  if (process.platform === "darwin") {
+    const native = darwinProcessBinding();
+    try { return native.processInfo(pid)?.stopped === true; } catch { return false; }
+  }
+  if (process.platform !== "linux") return false;
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    return stat.slice(stat.lastIndexOf(")") + 2, stat.lastIndexOf(")") + 3) === "T";
+  } catch { return false; }
+}
+
+/** The listening sockets a loopback `server` dials, as the `socket:[inode]` links a holder's
+ *  descriptors show, or `undefined` for a host that is not loopback. An `http:` address without a
+ *  port is on 80, and any other on 4222. Linux reads `/proc/net/tcp{,6}`. */
+function loopbackListenSockets(server: string): Set<string> | undefined {
+  let host: string, port: number;
+  try {
+    const url = new URL(server.includes("://") ? server : `nats://${server}`);
+    host = url.hostname.replace(/^\[|\]$/g, "");
+    port = url.port ? Number(url.port) : url.protocol === "http:" ? 80 : 4222;
+  } catch { return undefined; }
+  if (!(host === "localhost" || host === "::1" || /^127\.\d+\.\d+\.\d+$/.test(host))) return undefined;
+  const sockets = new Set<string>();
+  for (const table of ["/proc/net/tcp", "/proc/net/tcp6"]) {
+    let text: string;
+    try { text = readFileSync(table, "utf8"); } catch { continue; }
+    for (const line of text.split("\n").slice(1)) {
+      const field = line.trim().split(/\s+/);
+      // `0A` is TCP_LISTEN; the local address ends in the port in hex.
+      if (field[3] === "0A" && parseInt(field[1]?.split(":").pop() ?? "", 16) === port && field[9]) sockets.add(`socket:[${field[9]}]`);
+    }
+  }
+  return sockets;
+}
+
+/** Whether `pid` has a descriptor on one of `sockets`. A process this account cannot read has none. */
+function holdsSocket(pid: number, sockets: ReadonlySet<string>): boolean {
+  let fds: string[];
+  try { fds = readdirSync(`/proc/${pid}/fd`); } catch { return false; }
+  for (const fd of fds) {
+    try { if (sockets.has(readlinkSync(`/proc/${pid}/fd/${fd}`))) return true; } catch { /* the descriptor closed */ }
+  }
+  return false;
+}
+
+/** The stopped process of this account that holds the listening socket a loopback `server` dials,
+ *  or `undefined`. A stopped broker still takes connections, because the kernel completes them, and
+ *  never greets, so a dial waits out its whole budget. Linux reads `/proc/net/tcp{,6}` and the
+ *  stopped processes' descriptors; elsewhere this is `undefined`. */
+export function stoppedLoopbackListener(server: string): number | undefined {
+  if (process.platform !== "linux") return undefined;
+  const sockets = loopbackListenSockets(server);
+  if (!sockets?.size) return undefined;
+  for (const entry of readdirSync("/proc")) {
+    const pid = parsePid(entry);
+    if (pid !== undefined && processStopped(pid) && holdsSocket(pid, sockets)) return pid;
+  }
+  return undefined;
+}
+
+/** Every process of this account that listens where a loopback `server` dials, so a report can name
+ *  what holds an address. Linux only; elsewhere, and for a host that is not loopback, none. */
+export function loopbackListeners(server: string): number[] {
+  if (process.platform !== "linux") return [];
+  const sockets = loopbackListenSockets(server);
+  if (!sockets?.size) return [];
+  return readdirSync("/proc").flatMap((entry) => {
+    const pid = parsePid(entry);
+    return pid !== undefined && holdsSocket(pid, sockets) ? [pid] : [];
+  });
+}
+
+/** The state, ppid and pgrp fields of `/proc/<pid>/stat`, which follow the parenthesised name, or
+ *  `undefined` when the process is gone. */
+function statFields(pid: number): string[] | undefined {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    return stat.slice(stat.lastIndexOf(")") + 2).split(" ", 3);
+  } catch { return undefined; }
+}
+
+/** The process group `pid` belongs to, or `undefined` when it is gone or this is neither Linux nor
+ *  macOS. A macOS read that fails throws, so a group stop never narrows to one process unnoticed. */
+export function processGroupOf(pid: number): number | undefined {
+  if (process.platform === "darwin") return darwinProcessBinding().processInfo(pid)?.pgid;
+  if (process.platform !== "linux") return undefined;
+  return parsePid(statFields(pid)?.[2] ?? "");
+}
+
+/** The live processes in process group `pgid`. A zombie has exited and holds nothing, so it is not
+ *  one. Linux and macOS; elsewhere none. A macOS read that fails throws rather than read as empty. */
+export function processGroupMembers(pgid: number): number[] {
+  if (process.platform === "darwin") {
+    const members = darwinProcessBinding().groupMembers(pgid);
+    if (members === undefined) throw new Error(`process group ${pgid} is not a readable process group ID`);
+    return members;
+  }
+  if (process.platform !== "linux") return [];
+  return readdirSync("/proc").flatMap((entry) => {
+    const pid = parsePid(entry);
+    const fields = pid === undefined ? undefined : statFields(pid);
+    return fields && fields[0] !== "Z" && fields[0] !== "X" && parsePid(fields[2] ?? "") === pgid ? [pid!] : [];
+  });
+}
+
+// Runtime pidfile templates (`MANAGER_PIDFILE`, `MANAGER_DELIVERY_AWARE_MARKER`) live in
+// `local-process.ts`, which owns `{space}` template expansion and path resolution.
+
+// ---- ATTRIBUTION: is the live process behind this record actually ours? -------------------------
+
+/** What was read about ONE pid's command line, three-valued for the same reason liveness is:
+ *  "it is something else" and "its command line could not be read" are different facts and only
+ *  the first may be acted on. */
+export type ProcessCommand =
+  /** The process's argv, as the OS reports it. */
+  | { kind: "command"; command: string }
+  /** No such process — the pid died between the liveness probe and this read, or never existed. */
+  | { kind: "gone" }
+  /** This platform, sandbox, or permission set cannot answer. NOT "it is foreign". */
+  | { kind: "unreadable"; why: string };
+
+/** The command-line reader as a DEPENDENCY, for the same reason {@link LivenessProbe} is one: a
+ *  test cannot conjure a live foreign process at a chosen pid, and `unreadable` is reachable only
+ *  on platforms the test host may not be. */
+export type CommandReader = (pid: number) => ProcessCommand;
+
+/**
+ * Read one pid's command line.
+ *
+ * `/proc` on Linux (no subprocess, no PATH dependency, NUL-separated argv); `ps -p <pid> -o
+ * command=` elsewhere on POSIX. Windows has neither and is `unreadable`, because of the asymmetry
+ * the callers enforce: attribution may only ever DOWNGRADE a record on affirmative evidence that
+ * the live process is something else, so a platform that cannot read argv leaves a live pid
+ * trusted.
+ */
+export function readProcessCommand(pid: number): ProcessCommand {
+  if (process.platform === "win32") return { kind: "unreadable", why: "no process-argv source on win32" };
+  if (process.platform === "linux") {
+    try {
+      // argv is NUL-separated and NUL-terminated; the trailing empty field is dropped by the trim.
+      return { kind: "command", command: readFileSync(`/proc/${pid}/cmdline`, "utf8").replace(/\0/g, " ").trim() };
+    } catch (e) {
+      const code = (e as NodeJS.ErrnoException).code;
+      if (code === "ENOENT" || code === "ESRCH") return { kind: "gone" };
+      return { kind: "unreadable", why: `/proc/${pid}/cmdline: ${code ?? (e as Error).message}` };
+    }
+  }
+  const r = spawnSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf8" });
+  if (r.error) return { kind: "unreadable", why: `ps: ${r.error.message}` };
+  const out = (r.stdout ?? "").trim();
+  if (r.status === 0 && out !== "") return { kind: "command", command: out };
+  if (r.status === 1) return { kind: "gone" }; // ps exits 1 when no process matches
+  return { kind: "unreadable", why: `ps exited ${String(r.status)}${out ? `: ${out}` : ""}` };
+}
+
+/**
+ * Does this command line belong to a Cotal manager?
+ *
+ * The test is the `supervise`, hidden `__daemon-manager` or hidden `__service-manager` ARGV TOKEN, which is the manager daemon's own subcommand and is
+ * present however it was started — by `cotal up`'s detached re-exec, by a container entrypoint, by
+ * cron, or typed by hand. Matching the token rather than a path keeps it true across a global
+ * install, a `tsx bin/cotal.ts` dev run, and a bundled binary, none of which agree on argv[0].
+ *
+ * IT FAILS TOWARD "OURS". A process whose argv merely mentions the word reads as a manager, so a
+ * live pid stays trusted. The cost of the opposite error - calling a real manager foreign - is a
+ * second manager launched onto a live one, so the loose direction is the safe one.
+ */
+export function commandIsCotalSupervisor(command: string): boolean {
+  return /(^|\s)(?:supervise|__daemon-manager|__service-manager)(\s|$)/.test(command);
+}
+
+/** The controller-owned manager child must never take a legacy signal/escalation path. */
+export function commandIsCotalServiceManager(command: string): boolean {
+  return /(^|\s)__service-manager(\s|$)/.test(command);
+}
+
+
+/**
+ * Does this command line belong to a Cotal delivery daemon?
+ *
+ * Same rule and same direction as {@link commandIsCotalSupervisor}, one component over: the test is
+ * the `deliver`, hidden `__daemon-deliver` or hidden `__service-delivery` ARGV TOKEN, which is the daemon's own entry and
+ * is present however it was started — `cotal up`'s detached re-exec, a container entrypoint, systemd, or an operator typing
+ * `cotal deliver --space …`. A token, not a substring, so `delivery-thing` and a `--creds
+ * .../delivery.creds` path are not mistaken for the daemon.
+ *
+ * IT FAILS TOWARD "OURS" for the reason the manager's does: a live pid whose argv cannot be read
+ * stays trusted. Only affirmative evidence that the live process is something else may downgrade a
+ * record.
+ */
+export function commandIsCotalDelivery(command: string): boolean {
+  return /(^|\s)(deliver|__daemon-deliver|__service-delivery)(\s|$)/.test(command);
+}
+
+/** A process record's state. THREE-VALUED liveness plus absent, because both ways of collapsing it
+ *  to a boolean are silent and both are wrong:
+ *    `!== "dead"`  -> an `unknown` reports UP forever; no retry clears it and nothing starts.
+ *    `=== "alive"` -> an `unknown` reports DOWN and a second process launches onto a possibly-live one.
+ *  `unknown` is REACHABLE on a real kernel (see {@link LivenessProbe}), so the caller has to SEE it
+ *  and refuse.
+ *
+ *  `foreign` is the fifth: the recorded pid is ALIVE and is provably NOT the recorded component. A
+ *  record outliving its process is eventually re-pointed at an unrelated process by pid reuse, and
+ *  from `kill(pid, 0)` alone that reads as a healthy component forever. */
+export type ProcessRecordState = "alive" | "dead" | "unknown" | "absent" | "unattributable" | "foreign";
+
+/** A process record with the evidence behind its verdict. Each state carries the fields
+ *  `readProcessRecord` sets for it and no others. A missing or empty record is `absent` and
+ *  carries nothing: nothing was read. Every other state names the file it read, so a refusal never
+ *  resolves the record again. A record that held a pid carries that pid. Only `unattributable`
+ *  carries the content that was not a pid, and only a live process whose command line was read carries
+ *  that command. */
+export type ProcessRecord =
+  | { state: "absent" }
+  | { state: "unattributable"; path: string; content: string }
+  | { state: "dead" | "unknown"; path: string; pid: number }
+  | { state: "alive" | "foreign"; path: string; pid: number; command?: string };
+
+/** Read + attribute one process record, so every component decides on the same evidence by the
+ *  same rule; only `isOwnCommand` differs between them.
+ *
+ *  ATTRIBUTION MAY ONLY DOWNGRADE ON PROOF. A live pid is demoted to `foreign` when its command line
+ *  was READ and `isOwnCommand` rejects it - never when the read failed, never on a platform that
+ *  cannot look, never on a process that died during the read. Absence of evidence leaves the live
+ *  record trusted, because the opposite error starts a second process on top of a live one. */
+export function readProcessRecord(
+  path: string,
+  isOwnCommand: (command: string) => boolean,
+  probe: LivenessProbe = probeLiveness,
+  readCommand: CommandReader = readProcessCommand,
+): ProcessRecord {
+  const raw = readPidfile(path);
+  if (!raw) return { state: "absent" }; // no record, or a pre-protocol husk: nothing is behind it
+  const pid = parsePid(raw);
+  // NOT `absent`. Folding non-empty corrupt content into "nothing recorded" is what let the ensure
+  // paths OVERWRITE it and launch a replacement, which is the same defect as deleting it: that
+  // record may front a live process nobody can identify. Every action path must refuse on it.
+  if (pid === undefined) return { state: "unattributable", path, content: raw };
+  const liveness = probe(pid);
+  if (liveness !== "alive") return { state: liveness, path, pid };
+  const cmd = readCommand(pid);
+  if (cmd.kind !== "command") return { state: "alive", path, pid }; // gone/unreadable: established nothing
+  return { state: isOwnCommand(cmd.command) ? "alive" : "foreign", path, pid, command: cmd.command };
+}
+
+// ---- CREATION IDENTITY: one stable scheme across launch, record, status and teardown (#969) ----
+
+/**
+ * A process identity record, as a pidfile's CONTENT. The pid alone is not a stable identity on any
+ * OS: PIDs are recycled (aggressively on Windows, eventually on POSIX), and a teardown that signals
+ * a recorded pid therefore signals "whatever holds that number now". The record pins the pid to the
+ * process START that claimed it, which is the strongest identity a fresh process can establish
+ * without holding a kernel capability (#969 design shape (a)): the start time of a pid is fixed for
+ * the life of that pid and changes the moment the number is reused.
+ *
+ * FORMAT: the `pid`, one space, then the `token` to the end of the line. The token is opaque here
+ * (see {@link ProcessStartTokenReader} for what produces it) and may itself hold spaces: macOS
+ * `ps -o lstart=` gives `Thu Oct 15 21:16:51 2026`, and pads a one-digit day with a second space.
+ * A record carrying only a pid is a LEGACY record (pre-identity build) and every consumer must
+ * treat it as such, loud.
+ */
+export type ProcessIdentityRecord = { pid: number; token: string };
+
+/** What a pidfile's content resolves to. `legacy` is a bare pid (a pre-identity build's record);
+ *  `husk` is an empty pre-protocol file; `unattributable` is anything parsePid rejects — the same
+ *  three-valued rule the rest of this module applies, so "cannot read the record" is never folded
+ *  into "nothing recorded". */
+export type ReadRecord = { kind: "record"; record: ProcessIdentityRecord } | { kind: "legacy"; pid: number } | { kind: "husk" } | { kind: "unattributable"; raw: string };
+
+export function parseRecord(raw: string): ReadRecord {
+  const trimmed = raw.trim();
+  if (trimmed === "") return { kind: "husk" };
+  if (/[\r\n]/.test(trimmed)) return { kind: "unattributable", raw: trimmed };
+  // The first field is the pid and everything after the first space is the token, kept byte for byte:
+  // a macOS start token has spaces of its own, and the live token it is compared with keeps them too.
+  const gap = trimmed.search(/\s/);
+  if (gap === -1) {
+    const pid = parsePid(trimmed);
+    return pid === undefined ? { kind: "unattributable", raw: trimmed } : { kind: "legacy", pid };
+  }
+  const pid = parsePid(trimmed.slice(0, gap));
+  const token = trimmed.slice(gap + 1);
+  if (pid !== undefined && token !== "" && token.trim() === token) return { kind: "record", record: { pid, token } };
+  return { kind: "unattributable", raw: trimmed };
+}
+
+/** Serialize a record. Exactly the inverse of {@link parseRecord}; writing is centralized so a
+ *  future format change is one edit, not a fifth copy of `String(pid)`. */
+export function formatRecord(record: ProcessIdentityRecord): string {
+  return `${record.pid} ${record.token}`;
+}
+
+/**
+ * The creation-identity token of a live pid: on Linux `/proc/<pid>/stat` field 22 (starttime —
+ * ticks since boot, fixed for the life of the pid); on macOS its start time in microseconds, through
+ * the shipped Node-API binding; on other BSDs `ps -o lstart=`; on Windows
+ * the process creation FILETIME (GetProcessTimes through the shipped Node-API binding). A pid whose token is
+ * `undefined` can still be recorded — the record then carries no start pin, and teardown warns that
+ * it is proceeding without the identity check. That pid-only shape is for a record that predates
+ * pinning, or a host that could not read a start at all. It is not the Windows steady state.
+ */
+export type ProcessStartTokenReader = (pid: number) => string | undefined;
+
+/**
+ * Parse the Windows creation-time reader's decimal string into a pin token. Accepts only a bare
+ * unsigned FILETIME integer so a MSYS `ps` date string cannot become a "token" that drifts
+ * between launch and teardown (the original reason the lock reader refuses win32 `ps`).
+ */
+export function parseWin32CreationToken(raw: string): string | undefined {
+  const token = raw.trim();
+  return /^\d{1,20}$/.test(token) ? token : undefined;
+}
+
+/**
+ * Windows creation FILETIME through the shipped Node-API binding. No subprocess or runtime
+ * discovery is involved. An inaccessible process is unverified; a missing binding throws.
+ * The reader parameter exercises validation off Windows; native suites execute the real binding.
+ */
+export function win32ProcessCreationToken(pid: number, read: ProcessStartTokenReader = nativeWin32CreationToken): string | undefined {
+  if (!Number.isInteger(pid) || pid <= 0 || pid > 0x7fffffff) return undefined;
+  const out = read(pid);
+  return typeof out === "string" ? parseWin32CreationToken(out) : undefined;
+}
+
+/**
+ * macOS start time in microseconds through the shipped Node-API binding. No subprocess is involved,
+ * and the second-precision `ps -o lstart=` text is not used. A process that cannot be read is
+ * unverified; a missing binding throws. The binding parameter exercises validation off macOS.
+ */
+export function darwinProcessStartToken(pid: number, binding: () => Pick<DarwinProcessBinding, "processInfo"> = darwinProcessBinding): string | undefined {
+  if (!Number.isInteger(pid) || pid <= 0 || pid > 0x7fffffff) return undefined;
+  const native = binding();
+  let token: unknown;
+  try { token = native.processInfo(pid)?.token; } catch { return undefined; }
+  return typeof token === "string" && /^\d{1,20}$/.test(token) ? token : undefined;
+}
+
+/** Identity's start-token reader: Linux uses the same `/proc` implementation as the advisory lock so
+ *  launch and teardown cannot drift; win32 uses {@link win32ProcessCreationToken} instead of the
+ *  lock's `undefined`, and macOS {@link darwinProcessStartToken} instead of the lock's second-precision
+ *  `ps` text. `platform` is a parameter so the win32 and macOS branches are executable elsewhere: a
+ *  mutation that returns `undefined` there must redden without that kernel. */
+export function identityStartToken(
+  pid: number,
+  platform: string = process.platform,
+  win32: ProcessStartTokenReader = win32ProcessCreationToken,
+  posix: ProcessStartTokenReader = posixStartToken,
+  darwin: ProcessStartTokenReader = darwinProcessStartToken,
+): string | undefined {
+  if (platform === "win32") return win32(pid);
+  if (platform === "darwin") return darwin(pid);
+  return posix(pid);
+}
+
+export function defaultStartToken(pid: number): string | undefined {
+  return identityStartToken(pid);
+}
+
+/** The start token for a pid THIS PROCESS is about to record. Prefer the reader passed by the
+ *  caller (tests inject divergence), fall back to {@link defaultStartToken}. `undefined` (a
+ *  ps-less host, or a Windows pid the OS could not read) records a pid-only LEGACY record —
+ *  visible as such to every reader, never silently. */
+export function identityRecord(pid: number, tokenAt: ProcessStartTokenReader = defaultStartToken): ProcessIdentityRecord | { pid: number } {
+  const token = tokenAt(pid);
+  return token === undefined ? { pid } : { pid, token };
+}
+
+/** The reader that verifies a recorded start token. A macOS pin written before the native reader holds
+ *  `ps -o lstart=` text, which no microsecond token equals, so the default reader verifies it with that
+ *  same `ps` reader and it keeps the guarantee it was written with. A reader the caller passes is used as given. */
+export function startTokenReaderFor(token: string, tokenAt: ProcessStartTokenReader = defaultStartToken, platform: string = process.platform): ProcessStartTokenReader {
+  return tokenAt === defaultStartToken && platform === "darwin" && !/^\d+$/.test(token) ? posixStartToken : tokenAt;
+}
+
+/** The verdict of {@link assertRecordIdentity}: does the live process behind `pid` still carry the
+ *  start this record pinned? `unreadable` is deliberately NOT a variant: the reader signature
+ *  returns `undefined` for "cannot look" and that folds into `unpinned` (refuse). This differs from
+ *  a legacy record with no pin at all: legacy records warn and proceed for upgrade compatibility,
+ *  while a pin that exists but cannot be checked is preserved rather than silently weakened. */
+export type IdentityVerdict =
+  | { kind: "match" }
+  | { kind: "mismatch"; liveToken: string }
+  | { kind: "gone" }
+  | { kind: "unpinned" };
+
+/**
+ * THE identity check a teardown must pass before signalling (#969). This is the "open, verify,
+ * terminate" step: verify BEFORE any signal. A record pins a start token; if the pid's CURRENT
+ * start differs, the pid was REUSED and the live process is a stranger — refuse, never signal.
+ *
+ * FAILS CLOSED ON THE CHECK ITSELF: `gone` (the pid is ESRCH-dead; the record is stale and
+ * clearable) and `unpinned` (no token could be established for a live pid - a platform that
+ * cannot pin, or the process died between the token read and the liveness probe) are both
+ * distinct from `match`, and it is the CALLER's rule which of them may clear a record. Only
+ * `gone` is ever a safe clear here, because only ESRCH-equivalent evidence proves the recorded
+ * process itself gone.
+ */
+export function assertRecordIdentity(record: ProcessIdentityRecord, tokenAt: ProcessStartTokenReader = defaultStartToken): IdentityVerdict {
+  const live = startTokenReaderFor(record.token, tokenAt)(record.pid);
+  if (live === undefined) {
+    // Distinguish "cannot look" from "looked and it is gone": the token readers return undefined
+    // BOTH when the platform cannot answer and when the process does not exist, and those must not
+    // share a verdict — a platform that cannot pin must refuse, a dead pid may be cleared.
+    const liveness = probeLiveness(record.pid);
+    if (liveness === "dead") return { kind: "gone" };
+    return { kind: "unpinned" };
+  }
+  if (live !== record.token) return { kind: "mismatch", liveToken: live };
+  // Windows keeps an exited process's creation time readable while any handle to it stays open, as a
+  // job custodian keeps its program's. Only its exit status says whether it still runs.
+  if (process.platform === "win32" && probeLiveness(record.pid) === "dead") return { kind: "gone" };
+  return { kind: "match" };
+}
+
+/** One shared refusal message, so every teardown names the same rule in the same words (#969
+ *  acceptance: manager, delivery, auth and broker teardown use the SAME identity rule). */
+export function identityRefusal(label: string, path: string, record: ProcessIdentityRecord, live: string): Error {
+  return new Error(
+    `refusing to stop ${label} (pid ${record.pid}) at ${path}: the pid has been reused (recorded start ${record.token}, the live process started ${live}). Signalling it would kill an unrelated process. The record is preserved.\n` +
+    `NEXT: inspect pid ${record.pid} with \`ps -p ${record.pid}\`. If that process should be stopped, stop it, then rerun this command; once the pid is dead the stale record clears automatically.`,
+  );
+}
+
+/** Warning for the one deliberately reduced-guarantee path: a live pre-pin record. Upgrades must be
+ * able to stop the stack that was launched by the previous version. The next launch writes a pin,
+ * after which mismatch and torn-pin protection applies in full. */
+export function identityLegacyWarning(label: string, pidfilePath: string): string {
+  return `! ${label} at ${pidfilePath} predates process identity pinning; signalling it without an identity check. A relaunch will pin the process identity.`;
+}
+
+// ---- THE SIBLING IDENTITY PIN: launch writes it, teardown verifies it (#969) ---------------------
+
+/**
+ * The pidfile format stays a BARE PID. Every reader of `.cotal/*.pid` across the tree - status,
+ * clean, meshes, the web dashboard, smoke suites, and any operator script - keeps working, and a
+ * bare-pid pidfile remains a LEGACY record this change must handle with a loud warning, not break. The creation
+ * identity therefore lives in a SIBLING file `<pidfile>.identity` (the `manager.delivery-aware`
+ * marker pattern), holding the {@link formatRecord} two-field pin, one line per record. Missing
+ * sibling = legacy record; present-but-garbled = torn write, refuse; no line for the pidfile's pid =
+ * torn pairing, refuse.
+ */
+export function identityPinPath(pidfilePath: string): string {
+  return `${pidfilePath}.identity`;
+}
+
+/** Write the sibling pin for a pid this launch just spawned. Called AFTER the pidfile write, with
+ *  the same pid, so a reader that sees a pidfile with no pin yet is reading either a legacy record
+ *  or a launch mid-pairing - both are visible below, never silent. `undefined` token (ps-less host,
+ *  or a pid whose creation time could not be read) writes NO pin. Windows writes a pin whenever
+ *  {@link win32ProcessCreationToken} returns a FILETIME (#1437). */
+export function writeIdentityPin(pidfilePath: string, pid: number, tokenAt: ProcessStartTokenReader = defaultStartToken): void {
+  const rec = identityRecord(pid, tokenAt);
+  if (!("token" in rec)) return; // no start could be established: leave the legacy bare-pid shape, loud
+  writePrivateRecord(identityPinPath(pidfilePath), formatRecord(rec));
+}
+
+/** One step of {@link writePidPair}'s publish, passed to `onStep` right after it completes. Production
+ *  passes no `onStep`; tests use it to plant a crash between two named steps and read what survives. */
+export type PidPairStep = "temporaries" | "bridge-pin" | "publish-pid" | "publish-pin";
+
+/** A pin's records, one per line. A settled pin holds one line; only {@link writePidPair}'s bridge
+ *  holds two, the old record's and the new one's. `undefined` when the pin is empty or any line is
+ *  not a record: a torn or tampered write. */
+function parsePinLines(raw: string): ProcessIdentityRecord[] | undefined {
+  const records: ProcessIdentityRecord[] = [];
+  for (const line of raw.split("\n")) {
+    if (line.trim() === "") continue;
+    const parsed = parseRecord(line);
+    if (parsed.kind !== "record") return undefined;
+    records.push(parsed.record);
+  }
+  return records.length === 0 ? undefined : records;
+}
+
+/** The token of a bridge line for a record in the legacy shape: a pid published with no start token,
+ *  or an old pidfile that had no pin. The line reads as legacy, never as a torn pairing. */
+const NO_START_TOKEN = "-";
+
+/** The pin line of the pid the pidfile names right now. The pidfile is read through
+ *  {@link readPidfile}, so only a missing pidfile is a first start and any other read error throws. A
+ *  pidfile with no pin at all is a legacy record, so its line carries {@link NO_START_TOKEN} and the
+ *  bridge keeps it legacy. A pin that is unreadable or has no line for that pid has nothing to carry. */
+function currentPinLine(pidfilePath: string): ProcessIdentityRecord | undefined {
+  const raw = readPidfile(pidfilePath);
+  if (raw === undefined) return undefined; // no pidfile: a first start, there is no old line to carry
+  const current = parsePid(raw);
+  if (current === undefined) return undefined;
+  let rawPin: string;
+  try {
+    rawPin = readFileSync(identityPinPath(pidfilePath), "utf8");
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === "ENOENT" ? { pid: current, token: NO_START_TOKEN } : undefined;
+  }
+  return parsePinLines(rawPin)?.find((r) => r.pid === current);
+}
+
+/** The lock that serializes every writer of one pid record: {@link writePidPair} and {@link removePidPair}. */
+function lockPidRecord(pidfilePath: string): { release(): void } {
+  return acquireLock(`${pidfilePath}.publish.lock`, { label: `the publish lock for ${pidfilePath}`, waitMs: 30_000, pollMs: 20 });
+}
+
+/** How {@link writePidPair} moves a temporary over the record. Production passes none; tests inject a
+ *  rename that refuses, a sleep that records and the platform, to drive the Windows retry without
+ *  Windows or a real wait. */
+export interface RecordReplaceIo {
+  rename?: (from: string, to: string) => void;
+  sleep?: (ms: number) => void;
+  platform?: NodeJS.Platform;
+}
+
+/** The codes Windows gives a rename over a file another handle holds open, until that handle closes. */
+const WIN32_HELD_RENAME_CODES = new Set(["EPERM", "EACCES", "EBUSY"]);
+
+/** The total backoff one publish may spend across all its renames. The wait is synchronous and taken
+ *  under the publish lock, so it blocks the publishing process and any writer queued for the lock;
+ *  5 s keeps both far inside the lock's 30 s wait. */
+const PUBLISH_REPLACE_BUDGET_MS = 5_000;
+
+/** The rename one publish uses to move each temporary over the record. On Windows a rename fails with
+ *  EPERM, EACCES or EBUSY while another handle holds either file open, such as a reader of the record,
+ *  which the publish lock does not serialize, or a virus scanner (#4168). As graceful-fs does for
+ *  `fs.rename` on Windows, those codes are retried with a backoff that grows from 0 by 10 ms to 100 ms.
+ *  graceful-fs gives up when the destination exists; here the destination is always the record being
+ *  replaced, so the retry goes on until the publish has spent {@link PUBLISH_REPLACE_BUDGET_MS} of
+ *  backoff, counted across every rename it makes, and then the last error is thrown. Any other error,
+ *  and any error on another platform, is thrown at once. */
+function publishRenamer(io: RecordReplaceIo = {}): (from: string, to: string) => void {
+  const rename = io.rename ?? renameSync;
+  const sleep = io.sleep ?? sleepSync;
+  const platform = io.platform ?? process.platform;
+  let spent = 0;
+  return (from, to) => {
+    for (let backoff = 0; ; backoff = Math.min(backoff + 10, 100)) {
+      try {
+        rename(from, to);
+        return;
+      } catch (e) {
+        const code = (e as NodeJS.ErrnoException).code;
+        if (platform !== "win32" || code === undefined || !WIN32_HELD_RENAME_CODES.has(code) || spent + backoff > PUBLISH_REPLACE_BUDGET_MS) throw e;
+        sleep(backoff);
+        spent += backoff;
+      }
+    }
+  };
+}
+
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/** Publish the pidfile and its identity pin as ONE transition (issue #1238). The pidfile rename is the
+ *  single commit point. Just before it, a BRIDGE pin is renamed into place holding the old record's
+ *  line and the new one, so whichever pid the pidfile names at any instant, the pin carries that pid's
+ *  own line and {@link verifyIdentityPin} checks it as the complete record it belongs to. After the
+ *  commit, the settled pin (the new line alone) replaces the bridge.
+ *
+ *  Reachable on-disk states, in order: before `bridge-pin`, the OLD complete record (or nothing, on a
+ *  first start). After `bridge-pin`, the OLD pid checked against its own line, so a pin that was
+ *  refusing a reused pid keeps refusing it. After `publish-pid`, the NEW pid checked against its own
+ *  line. After `publish-pin`, the NEW complete record. No state is torn and none drops to the unpinned
+ *  legacy shape. A legacy old record (a pidfile with no pin) is carried as a {@link NO_START_TOKEN}
+ *  line, so it stays legacy until the commit. An old pin that is torn or has no line for the old pid
+ *  has nothing to carry, so until the commit it refuses as a torn pairing, as it already did. A
+ *  pidfile that exists but cannot be read is not a first start: the publish throws before its first
+ *  rename, leaving the record as it was.
+ *
+ *  When `identityRecord` cannot establish a token (ps-less host, or a pid whose start could not be
+ *  read - same rule as {@link writeIdentityPin}), the new line carries {@link NO_START_TOKEN} and
+ *  `publish-pin` removes the pin, leaving the legacy shape `writeIdentityPin` would have left. A crash
+ *  after the commit reads that same legacy record, never the new pid paired with the old pin.
+ *
+ *  Writers of one path are serialized by an advisory lock (`${path}.publish.lock`) held from the read
+ *  of the old line to the settled pin: the launcher and the daemon it starts both publish the same
+ *  record, and an unserialized bridge or settle could overwrite a newer publish. Teardown removes a
+ *  record under the same lock ({@link removePidPair}). A crashed holder's lock is reclaimed by the
+ *  next writer.
+ *
+ *  Its renames go through one {@link publishRenamer}, which retries the brief refusal Windows gives a
+ *  rename over a record another handle holds open, on one backoff budget for the whole publish. A
+ *  refusal that outlasts the budget throws like any other step, leaving the state the previous step
+ *  reached.
+ *
+ *  On any throw, the temporaries are removed (`finally`, best-effort) and the error rethrown; the
+ *  temporary names are never read by any reader (`${path}.publish.<pid>.<hex>`, the same claim-file
+ *  pattern {@link claimAuthPidSlot} uses for `.claim.`). */
+export function writePidPair(
+  pidfilePath: string,
+  pid: number,
+  opts: { tokenAt?: ProcessStartTokenReader; onStep?: (step: PidPairStep) => void; replaceIo?: RecordReplaceIo } = {},
+): void {
+  const tokenAt = opts.tokenAt ?? defaultStartToken;
+  const onStep = opts.onStep ?? (() => {});
+  const pinPath = identityPinPath(pidfilePath);
+  const suffix = `${process.pid}.${randomBytes(4).toString("hex")}`;
+  const pidTemp = `${pidfilePath}.publish.${suffix}`;
+  const pinTemp = `${pinPath}.publish.${suffix}`;
+  const bridgeTemp = `${pinPath}.publish.${suffix}.bridge`;
+  const rec = identityRecord(pid, tokenAt);
+  const line: ProcessIdentityRecord = "token" in rec ? rec : { pid, token: NO_START_TOKEN };
+  const replace = publishRenamer(opts.replaceIo);
+  // Each temporary is created owner-private and exclusively, never through a symlink, then renamed
+  // onto a record under `.cotal`. Only the names this call created are removed afterwards: an EEXIST
+  // means the name belongs to someone else.
+  const created: string[] = [];
+  const create = (path: string, data: string): void => {
+    createPrivateRecord(path, data);
+    created.push(path);
+  };
+  try {
+    create(pidTemp, String(pid));
+    if ("token" in rec) create(pinTemp, formatRecord(rec));
+    const held = lockPidRecord(pidfilePath);
+    try {
+      const old = currentPinLine(pidfilePath);
+      create(bridgeTemp, (old !== undefined && old.pid !== pid ? [old, line] : [line]).map(formatRecord).join("\n"));
+      onStep("temporaries");
+      replace(bridgeTemp, pinPath);
+      onStep("bridge-pin");
+      replace(pidTemp, pidfilePath);
+      onStep("publish-pid");
+      if ("token" in rec) replace(pinTemp, pinPath);
+      else rmSync(pinPath, { force: true });
+      onStep("publish-pin");
+    } finally {
+      held.release();
+    }
+  } finally {
+    for (const path of created) rmSync(path, { force: true });
+  }
+}
+
+/** What {@link verifyIdentityPin} found for one pidfile. */
+export type PinVerdict =
+  | { kind: "no-pid" }        // the pidfile is absent, empty or holds no pid: there is nothing to verify
+  | { kind: "legacy" }        // no sibling: a pre-identity record. Windows launches write a sibling (#1437)
+  | { kind: "match"; record: ProcessIdentityRecord } // pinned, and the live process carries the recorded start
+  | { kind: "gone" }          // pinned, and the pid is ESRCH-dead: the recorded process is gone
+  | { kind: "mismatch"; record: ProcessIdentityRecord; liveToken: string } // PID REUSE: refuse
+  | { kind: "torn-pin"; raw: string }        // sibling exists but is not a record
+  | { kind: "torn-pairing"; pinPid: number } // sibling names a DIFFERENT pid than the pidfile holds
+  | { kind: "unreadable-pin"; why: string } // sibling exists but could not be read
+  | { kind: "unpinned" };     // live pid, but no start token could be established for it
+
+/**
+ * THE open-verify step every teardown runs BEFORE signalling (#969). Read the pidfile's bare pid,
+ * then the sibling pin, and adjudicate the pairing:
+ *   - no-pid              -> no pid is recorded, so there is no process to verify or signal
+ *   - legacy              -> the caller warns and signals for upgrade compatibility
+ *   - match               -> safe to signal; the process behind the pid is the recorded one
+ *   - gone                -> ESRCH-proven dead; the caller may clear the record
+ *   - mismatch            -> PID REUSE: the pid now fronts a DIFFERENT start; NEVER signal
+ *   - torn-pin/torn-pairing/unreadable-pin/unpinned -> cannot establish identity on a live pid; refuse, preserve
+ *
+ * The pidfile argument is the SIBLING'S base path (the pidfile itself), and the bare pid is read
+ * from it here so the pairing check cannot drift from however the caller read the pid.
+ */
+export function verifyIdentityPin(pidfilePath: string, tokenAt: ProcessStartTokenReader = defaultStartToken): PinVerdict {
+  const rawPid = readPidfile(pidfilePath);
+  const pidRead = rawPid === undefined ? undefined : parsePid(rawPid);
+  if (pidRead === undefined) return { kind: "no-pid" };
+  let rawPin: string;
+  try {
+    rawPin = readFileSync(identityPinPath(pidfilePath), "utf8");
+  } catch (e) {
+    // Only a missing pin is a LEGACY record, which warns and is signalable for upgrade compatibility.
+    // A pin that exists but cannot be read proves nothing about the live process, so it refuses. A
+    // pid that is ESRCH-dead needs no identity proof, so either way it reports `gone` and the caller
+    // clears the stale record. kill(pid, 0) only: this probe signals nothing.
+    if (probeLiveness(pidRead) === "dead") return { kind: "gone" };
+    const code = (e as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return { kind: "legacy" };
+    return { kind: "unreadable-pin", why: code ?? (e as Error).message };
+  }
+  // The TORN shapes below refuse when the pid is live or unknown - identity cannot be proven.
+  // When the pid is ESRCH-dead there is nothing to signal, so the record is clearable whatever
+  // state the pin is in: a torn pin must not wedge the cleanup of a process that no longer exists.
+  const dead = probeLiveness(pidRead) === "dead";
+  // The pidfile's pid is checked against its OWN line, so a bridge a crashed publish left behind
+  // adjudicates as the complete record whose pid the pidfile names (#1238).
+  const lines = parsePinLines(rawPin);
+  if (lines === undefined) return dead ? { kind: "gone" } : { kind: "torn-pin", raw: rawPin.trim() };
+  const own = lines.find((r) => r.pid === pidRead);
+  if (own === undefined) return dead ? { kind: "gone" } : { kind: "torn-pairing", pinPid: lines[0]!.pid };
+  if (own.token === NO_START_TOKEN) return dead ? { kind: "gone" } : { kind: "legacy" }; // a no-token publish's line
+  const verdict = assertRecordIdentity(own, tokenAt);
+  if (verdict.kind === "match") return { kind: "match", record: own };
+  if (verdict.kind === "gone") return { kind: "gone" };
+  if (verdict.kind === "mismatch") return { kind: "mismatch", record: own, liveToken: verdict.liveToken };
+  return { kind: "unpinned" };
+}
+
+/** Remove a record whose process is PROVEN gone: the pin, then the pidfile. Never called on a refused
+ *  stop: the preserved record keeps its pin so the next attempt re-adjudicates. It holds the lock
+ *  {@link writePidPair} holds and removes only while the pidfile still reads `recorded` (trimmed), the
+ *  record the caller adjudicated. A publish that committed a successor meanwhile is left whole, never
+ *  stripped to a pidfile with no pin (#1238). With no pidfile, a stray pin is removed. */
+export function removePidPair(pidfilePath: string, recorded: string): void {
+  const pinPath = identityPinPath(pidfilePath);
+  if (!existsSync(pidfilePath) && !existsSync(pinPath)) return; // nothing recorded: take no lock, create no directory
+  const held = lockPidRecord(pidfilePath);
+  try {
+    let now: string | undefined;
+    try {
+      now = readFileSync(pidfilePath, "utf8").trim();
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+    }
+    if (now !== undefined && now !== recorded) return; // a successor's record: not this removal's
+    try {
+      rmSync(pinPath, { force: true });
+    } catch (e) {
+      // No publish writes a directory here, and a recursive removal could delete a tree this
+      // module did not write, so the record is refused whole.
+      if ((e as NodeJS.ErrnoException).code !== "ERR_FS_EISDIR") throw e;
+      throw new Error(
+        `refusing to remove the record at ${pidfilePath}: its identity pin ${pinPath} is a directory, which no publish writes. The record is preserved.\n` +
+        `NEXT: inspect that directory and remove it if nothing in it is needed; the next stop then clears the record.`,
+        { cause: e },
+      );
+    }
+    rmSync(pidfilePath, { force: true });
+  } finally {
+    held.release();
+  }
+}
+
+/** The loud torn/unreadable/unpinned refusal, in the same shape as {@link identityRefusal}: name the component,
+ *  the file, what was found, and the operator's next step. Legacy records do not reach this helper:
+ *  callers emit {@link identityLegacyWarning} and proceed. Match and gone signal or clear, and mismatch
+ *  refuses through {@link identityRefusal}. A reread that finds no pid is the caller's own refusal:
+ *  the pid it parsed is no longer the record, so it is not signalled. */
+export function identityUncertaintyRefusal(
+  label: string,
+  pidfilePath: string,
+  verdict: Extract<PinVerdict, { kind: "torn-pin" | "torn-pairing" | "unreadable-pin" | "unpinned" }>,
+): Error {
+  const pin = identityPinPath(pidfilePath);
+  switch (verdict.kind) {
+    case "torn-pin":
+      return new Error(
+        `refusing to stop ${label} at ${pidfilePath}: its identity pin ${pin} holds unattributable content ${JSON.stringify(verdict.raw)} - a torn or tampered write. The record is preserved.\n` +
+        `NEXT: inspect the recorded process with \`ps\`. If it should be stopped, stop it, then rerun this command; once the pid is dead the stale record clears automatically.`,
+      );
+    case "torn-pairing":
+      return new Error(
+        `refusing to stop ${label} at ${pidfilePath}: its identity pin ${pin} names pid ${verdict.pinPid}, not the pidfile's pid. The record is preserved.\n` +
+        `NEXT: inspect both the pidfile pid and the pin pid with \`ps\`. Automatic cleanup follows proven death of the pidfile target. If that process should be stopped, stop it, then rerun this command; do not delete the identity pin.`,
+      );
+    case "unreadable-pin":
+      return new Error(
+        `refusing to stop ${label} at ${pidfilePath}: its identity pin ${pin} exists but could not be read (${verdict.why}), so target identity cannot be proven. The record is preserved.\n` +
+        `NEXT: make the identity pin readable, then rerun this command; do not delete it. Once the pid is dead the stale record clears automatically.`,
+      );
+    case "unpinned":
+      return new Error(
+        `refusing to stop ${label} at ${pidfilePath}: its process is live but no creation identity could be established for it, so target identity cannot be proven. The record is preserved.\n` +
+        `NEXT: stop the process, then rerun this command; once the pid is dead the stale record clears automatically.`,
+      );
+    default: {
+      const unreachable: never = verdict;
+      void unreachable;
+      throw new Error("identityUncertaintyRefusal: verdict outside torn-pin, torn-pairing, unreadable-pin and unpinned");
+    }
+  }
+}

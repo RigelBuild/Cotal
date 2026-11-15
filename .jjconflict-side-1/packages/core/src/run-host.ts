@@ -1,0 +1,351 @@
+/**
+ * The RUN HOST contract (SPEC 14.3): what a daemon that hosts workflow runs asks of the language
+ * runtime, as an {@link Extension} of kind `"run-host"`.
+ *
+ * The manager hosts a run's driver, and `@cotal-ai/runtime` is the driver; `implementations/*`
+ * never import each other, so the seam between them is this contract, registered by the runtime
+ * on import and resolved by the manager by name, the same way a `RuntimeProvider` reaches the
+ * manager. Everything here is expressed in core terms: planes over one broker connection, the
+ * lease a takeover holds, the rows a listing and a journal view render. Nothing about the
+ * language itself (its entries, its errors) crosses this boundary typed; a validation refusal is
+ * carried as the runtime's own JSON, opaque to the host, and handed to the caller verbatim.
+ */
+import type { NatsConnection } from "@nats-io/transport-node";
+import type { JetStreamClient, JetStreamManager } from "@nats-io/jetstream";
+import type { KV } from "@nats-io/kv";
+import type { Extension } from "./registry.js";
+import type { RunSpecValue, RunStatusValue } from "./run-record.js";
+import type { RunAdmissionView } from "./run-admission.js";
+
+/** The kind every run host registers under. */
+export const RUN_HOST_KIND = "run-host";
+/** The one language this tree ships a host for. */
+export const COTAL_LANG_RUN_HOST = "cotal-lang";
+/** The `error.details[].kind` a hosting daemon's validation refusal carries one language problem
+ *  under (SPEC 13.3 extension detail): the record is the validator's own `LangErrorJson`. */
+export const LANG_PROBLEM_DETAIL_KIND = "ai.cotal.lang.problem";
+/** How long a hosting daemon waits for a launched drive's status record before answering a
+ *  start or resume. A client's invoke deadline for those two commands MUST exceed this, or the
+ *  daemon's "still launching" refusal can never reach the caller (it would time out first and
+ *  read as no manager answering). */
+export const RUN_ACTIVATION_WAIT_MS = 15_000;
+/** The invoke deadline a `run-start` / `run-resume` client uses: the activation wait plus the
+ *  round trips around it. */
+export const RUN_LAUNCH_DEADLINE_MS = RUN_ACTIVATION_WAIT_MS + 10_000;
+
+/** The planes a drive, an answer or a read rides: ONE broker connection and what hangs off it.
+ *  The host that opens the connection knows whose credential it carries; the run host does not. */
+export interface RunHostPlanes {
+  readonly nc: NatsConnection;
+  readonly js: JetStreamClient;
+  readonly jsm: JetStreamManager;
+  readonly kv: KV;
+  readonly space: string;
+}
+
+/** What one drive attempt holds (SPEC 14.4). `takeoverId` names the replay durable the attempt's
+ *  credential was minted for, which is why it arrives with the lease rather than being chosen by
+ *  the driver. */
+export interface RunHostLease {
+  readonly holder: string;
+  readonly epoch: number;
+  readonly fencingToken: number;
+  readonly takeoverId: string;
+}
+
+export interface RunHostDriveRequest {
+  /** `new` starts a run that has never been driven; `existing` takes a recorded run over. */
+  readonly mode: "new" | "existing";
+  readonly endpoint: string;
+  readonly runId: string;
+  readonly source: string;
+  readonly file?: string;
+  readonly lease: RunHostLease;
+  /** The process holding the run, as a checkpoint's holder-bound resume will name it. */
+  readonly holder: { readonly id: string; readonly lifecycleUid: string };
+  /** The driving instance and epoch: the coordinates its timer schedules are addressed by. */
+  readonly instanceId: string;
+  readonly epoch: number;
+  readonly defaultCheckpointTimeout: string;
+  /** The most bytes a settled result may take, from the connection's own `max_payload`. */
+  readonly resultBytes?: number;
+  /** The run's ADMISSION (SPEC 14.8), read by the hosting runtime before the drive and re-read at
+   *  every channel effect. A drive without one performs no channel effect: the host refuses at
+   *  the boundary rather than running the effect under the mediator's own authority. */
+  readonly admission: RunAdmissionView;
+  /** The host's observed local cancellation intent. Classification only: this does not signal
+   *  the root or replace the current-holder check before calling the drive's cancel handle. */
+  readonly cancellationObserved?: () => string | undefined;
+  /** Each `log(...)` line the program writes, as one line of text. The language does not journal a
+   *  log line, so this is the only place it goes. A resumed run replays its program and writes its
+   *  earlier lines again. */
+  readonly onLog?: (text: string) => void;
+}
+
+/** How a drive attempt ended. `released` is the driver saying the run is not its to continue (a
+ *  takeover won, a step was refused on this host, the host asked it to stop, the run was never
+ *  resumable); `failed` is the program's own failure. Both leave the journal where it is; a later
+ *  attempt resumes from there. */
+export type RunHostOutcome =
+  | { readonly status: "completed"; readonly steps: number; readonly value?: unknown }
+  | { readonly status: "released"; readonly reason: { readonly name: string; readonly message: string } }
+  | { readonly status: "failed"; readonly error: { readonly name: string; readonly message: string; readonly code?: string } };
+
+/** A drive in flight. `release` asks the driver to stop at its next effect boundary and record the
+ *  run `released` for the host's reason, never the program's; a drive parked inside a long pause
+ *  reaches no boundary until the pause settles, so a host that must stop sooner closes the
+ *  connection under it and the journal is the recovery. */
+export interface RunHostDrive {
+  readonly done: Promise<RunHostOutcome>;
+  release(reason: string): void;
+  /** Cooperatively cancel the root and in-flight effect contexts after the host establishes authority. */
+  cancel(reason: string): void;
+}
+
+/** The READ half of an answer: which pause, addressed by its step. */
+export interface RunHostLocateRequest {
+  readonly endpoint: string;
+  readonly runId: string;
+  /** The takeover id the journal replay of this call is named by: the one the caller's credential
+   *  was minted for, so the replay durable the resolver creates is the row the caller holds. */
+  readonly takeoverId: string;
+  /** The step's canonical key string, as `journal` renders it. */
+  readonly stepKey: string;
+}
+
+/** An open pause, located: its run, its token and the holder that armed it. What a hosting daemon
+ *  mints the answering credential for, so the answer's writes are pinned to this one pause. */
+export interface RunHostOpenPause {
+  readonly runId: string;
+  readonly token: string;
+  readonly holder: { readonly id: string; readonly lifecycleUid: string };
+}
+
+/** The WRITE half of an answer: the located pause and what to file on it. */
+export interface RunHostAnswerRequest {
+  readonly endpoint: string;
+  readonly open: RunHostOpenPause;
+  /** The answerer as the host's authorization knows them (SPEC 14.5): derived by the host from
+   *  the caller's authenticated principal, never taken from the request body. */
+  readonly by: string;
+  readonly value?: unknown;
+  readonly artifact?: string;
+  readonly now: number;
+}
+
+/** A settled pause's accepted answer, located: the token it settled under, the id its settle named,
+ *  and who gave it. What an amendment is filed beside, and what a host authorizes an amend on. */
+export interface RunHostAcceptedAnswer {
+  readonly token: string;
+  readonly answerId: string;
+  readonly by: string;
+}
+
+/** An amendment of a settled pause's answer (SPEC 14.5): filed beside the accepted answer, never
+ *  presented, so the pause stays settled and the run never reads it. */
+export interface RunHostAmendRequest {
+  readonly endpoint: string;
+  readonly accepted: RunHostAcceptedAnswer;
+  /** The amender as the host's authorization knows them, as for an answer. */
+  readonly by: string;
+  readonly value?: unknown;
+  readonly artifact?: string;
+  readonly now: number;
+}
+
+/** One row of `cotal run ps`. Absent status means a spec with no status yet. */
+export interface RunListRow {
+  readonly runId: string;
+  readonly endpoint: string;
+  readonly state?: RunStatusValue["state"];
+  readonly holder?: string;
+  readonly epoch?: number;
+  readonly journalHigh?: number;
+  /** A failed run's cause, as its status records it. */
+  readonly failure?: RunStatusValue["failure"];
+  readonly forkedFrom?: { readonly run: string; readonly step: string };
+  /** The run's pinned `startedAt`: the logical epoch its program's `run()` reports. */
+  readonly startedAt: number;
+  /** The language's hash of the program the run records, which is the `programHash` its `run()`
+   *  reports, since every resume runs the recorded source. Absent for a run with no recorded program. */
+  readonly programHash?: string;
+  /** The run's revocation marker as the host read it beside the record (SPEC 14.8). Display only:
+   *  `state` stays what the record holds, since a revoke writes no terminal state. */
+  readonly revoked?: { readonly by: string; readonly reason: string };
+  /** Why the host could not read the run's revocation marker. The row is then not known to be
+   *  unrevoked, and a renderer must not print the record's state as if it were. */
+  readonly revocationUnreadable?: string;
+}
+
+/** Opt-in diagnostic inventory. A cursor is continuation data, not authority or absence proof. */
+export interface RunListPageOptions {
+  readonly limit?: number;
+  readonly cursor?: string;
+}
+
+export interface RunListRequest {
+  readonly endpoint?: string;
+  readonly page?: RunListPageOptions;
+}
+
+export interface RunListPageRow {
+  readonly endpoint: string;
+  readonly runId: string;
+  readonly specRevision: number;
+  readonly startedAt: number;
+  readonly observedAt: number;
+  readonly status: (RunStatusValue & { readonly statusRevision: number; readonly staleProjection: boolean }) | null;
+  readonly revocation: "present" | "not-observed";
+}
+
+export interface RunListPage {
+  readonly v: 1;
+  readonly semantics: "diagnostic";
+  readonly space: string;
+  readonly endpointFilter: string | null;
+  readonly responder: { readonly instanceId: string; readonly epoch: number };
+  readonly cutSeq: number;
+  readonly nextSeq: number;
+  readonly items: readonly RunListPageRow[];
+  readonly nextCursor?: string;
+  readonly endObserved: boolean;
+  readonly stopReason: "end" | "rows" | "bytes" | "read-budget";
+  readonly storageReads: number;
+}
+
+/** Local host context. The runtime receives no serving connection or credential. */
+export interface RunListPageContext {
+  readonly responder: { readonly instanceId: string; readonly epoch: number };
+  /** Monotonic deadline after which no new storage call is issued, not a total wall-time bound. */
+  readonly issueUntil: number;
+  readonly replyFits: (data: unknown, ceiling: number) => boolean;
+}
+
+/** One row of a run's journal view. */
+export type RunJournalRow =
+  | { readonly n: number; readonly kind: "activation"; readonly holder: string; readonly epoch: number; readonly replayedTo: number }
+  | {
+      readonly n: number;
+      readonly kind: "step";
+      readonly step: string;
+      /** The entry's effect kind (`checkpoint`, `fanOut`, ...) and name, as the journal records them. */
+      readonly effect: string;
+      readonly name: string;
+      readonly state: "pending" | "settled";
+      /** `pending`, or the checkpoint disposition the settled result names (`resolved` / `expired`);
+       *  otherwise the settled status with its error code when there is one. */
+      readonly outcome: string;
+      /** The settled status and error code as recorded; `outcome` is their presentation. */
+      readonly status?: string;
+      readonly errorCode?: string;
+      /** The recorded error's message, on a settled `failed` or `refused` step. */
+      readonly errorMessage?: string;
+      /** When the step began and, once settled, ended (epoch ms). */
+      readonly startedAt: number;
+      readonly endedAt?: number;
+      /** On a settled `race` that took a branch's value, that branch. */
+      readonly winner?: string;
+      /** On a step in a branch that lost a `race`, that race's step key. The program never read
+       *  what the step settled with, so an answer it holds was not acted on. */
+      readonly lostRace?: string;
+      /** What an open pause asks, present only while it is open. */
+      readonly asks?: string;
+      readonly addressee?: string;
+      /** When an open pause expires, as its entry records it. */
+      readonly deadlineAt?: number;
+      /** What an open checkpoint does on expiry (`fail`, `proceed`, `escalate`), as it was armed.
+       *  Absent where the entry records none, as on a checkpoint opened before it was recorded. */
+      readonly onExpiry?: string;
+      /** The accepted answer of a settled pause: named by a checkpoint's settled result, and for an
+       * `ask`, whose result is the value alone, read from the answer record its last attempt's settle
+       * named. A pause cancelled after it accepted an answer carries that answer too, read the same
+       * way. Absent for open and expired pauses and ordinary steps. */
+      readonly answer?: {
+        readonly answerId: string;
+        readonly value?: unknown;
+        readonly by?: string;
+        readonly artifact?: string;
+        readonly at?: number;
+      };
+      /** Answers filed after the pause settled, in the order the store committed them, each naming
+       *  the accepted answer it supersedes. The program acted on the accepted answer; these record
+       *  later positions, and the last is the current one. */
+      readonly amendments?: readonly {
+        readonly answerId: string;
+        readonly supersedes: string;
+        readonly value?: unknown;
+        readonly by: string;
+        readonly artifact?: string;
+        readonly at: number;
+      }[];
+    };
+
+export interface RunStatusView {
+  readonly runId: string;
+  readonly endpoint: string;
+  readonly spec: RunSpecValue;
+  readonly status?: RunStatusValue;
+  /** The independently observed marker, not proof that the recorded holder has stopped. */
+  readonly revoked?: { readonly by: string; readonly reason: string };
+  /** A failed marker read is unknown, not an absent marker or a resumable run. */
+  readonly revocationUnreadable?: string;
+  /** The language's hash of the run's recorded program, the value its run-list row carries. Absent
+   *  for a run with no recorded program. */
+  readonly programHash?: string;
+  /** Why the recorded program could not be read or parsed. The view then carries no `programHash`,
+   *  and the run's program identity is unknown, not absent. */
+  readonly programUnreadable?: string;
+  readonly journal: RunJournalRow[];
+  /** On a paged read, the journal's row count; `journal` then holds the rows from the requested
+   *  offset that fit in one reply. */
+  readonly journalTotal?: number;
+}
+
+/** A paged journal read: the rows from `offset` that fit in one reply. */
+export interface RunJournalPageRequest {
+  readonly offset: number;
+}
+
+/** What a paged journal read measures its reply against. */
+export interface RunJournalPageContext {
+  readonly replyFits: (data: unknown, ceiling: number) => boolean;
+}
+
+export type RunValidation =
+  | {
+      readonly ok: true;
+      /** Explicit manager instances a validated program may place a spawn on. The host uses this
+       * only to mint the existing per-instance placement rows before the program starts. */
+      readonly placements?: readonly { readonly endpoint: string; readonly instanceId: string }[];
+    }
+  /** The runtime's own error records, one per problem, opaque here and handed on verbatim. */
+  | { readonly ok: false; readonly errors: readonly Record<string, unknown>[] };
+
+export interface RunHost extends Extension {
+  readonly kind: typeof RUN_HOST_KIND;
+  readonly name: string;
+  /** Parse and validate a program with no broker. A refusal carries every problem found. */
+  validate(source: string, file?: string): RunValidation;
+  /** Drive on the narrow `planes` connection, with a separate trusted `mediator` retained by
+   *  the hosting runtime. Returns as soon as launched; `done` never rejects. */
+  drive(planes: RunHostPlanes, req: RunHostDriveRequest, mediator: RunHostPlanes): RunHostDrive;
+  /** Find the open checkpoint, or open `ask` attempt, at a step: a read, nothing written. */
+  locate(planes: RunHostPlanes, req: RunHostLocateRequest): Promise<RunHostOpenPause>;
+  /** Answer a located pause through the driver's own door. A host that pins credentials mints
+   *  the answering one for `req.open.token` and opens fresh planes under it for this call. */
+  answer(planes: RunHostPlanes, req: RunHostAnswerRequest): Promise<unknown>;
+  /** Find a settled pause's accepted answer at a step: a read, nothing written. Refuses a step that
+   *  is still open, and one that settled without accepting an answer. */
+  locateAccepted(planes: RunHostPlanes, req: RunHostLocateRequest): Promise<RunHostAcceptedAnswer>;
+  /** File an amendment beside a located accepted answer. A host that pins credentials mints the
+   *  answering one for `req.accepted.token`; nothing is presented and the pause stays settled. */
+  amend(planes: RunHostPlanes, req: RunHostAmendRequest): Promise<unknown>;
+  /** The run's record plus its journal view, or undefined when no run record exists. The replay
+   *  rides a durable named by `takeoverId`, the one the caller's credential row pins. With
+   *  `journal`, the view holds one page of the journal, measured by `context`. */
+  status(planes: RunHostPlanes, req: { readonly endpoint: string; readonly runId: string; readonly takeoverId: string; readonly journal?: RunJournalPageRequest }, context?: RunJournalPageContext): Promise<RunStatusView | undefined>;
+  /** Every run recorded on `endpoint`, or on every endpoint when none is named. */
+  list(planes: RunHostPlanes, req: { readonly endpoint?: string }): Promise<RunListRow[]>;
+  /** Bounded diagnostic pages, when supported. Never emulate with a full list followed by slicing. */
+  listPage?(planes: RunHostPlanes, req: RunListRequest & { readonly page: RunListPageOptions }, context: RunListPageContext): Promise<RunListPage>;
+}
