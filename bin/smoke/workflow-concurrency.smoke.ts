@@ -24,7 +24,7 @@ function check(name: string, cond: boolean, extra?: unknown): void {
 
 /** Pin the active parser population and push-policy coverage. */
 const EXPECTED_WORKFLOWS = 13;
-const EXPECTED_PUSH_TO_MAIN = 6;
+const EXPECTED_PUSH_TO_MAIN = 7;
 // Rigel merges land on rigel-release; upstream main remains a mirrored branch.
 const RELEASE_BRANCH = "rigel-release";
 const EXPECTED_GROUPED = 6;

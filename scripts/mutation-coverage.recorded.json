@@ -87,10 +87,6 @@
     "sha256": "c70806596fa270f1fabda487c37045969daa12a9588bf37e17e1b22183f73d88",
     "refusal": "mutation \"restore the old generic CLI static-auth-only guard\" targets implementations/cli/src/commands/describe.ts, which none of [implementations/auth/smoke/user-spawn.smoke.ts] imports by source path, reaches through a declared assembled tree, nor reaches through a declared subprocess entrypoint. A by-name import resolves that package to dist. Use a suite in implementations/cli that reaches into ../src, declare the copied source tree in \"assembles\", declare the spawned repo entrypoint in \"executes\" with the target package built by the command, or record the mutation as unkillable with its reason."
   },
-  "bin/smoke/mutations/workflow-concurrency.json": {
-    "sha256": "0d6e221d6293b3b9fabf295cbea7b1923c68046aff9763293c651b0ce79741e8",
-    "refusal": "mutation \"changesets.yml goes back to the short concurrency form\" targets .github/workflows/changesets.yml, which none of [bin/smoke/workflow-concurrency.smoke.ts] imports by source path, reaches through a declared assembled tree, nor reaches through a declared subprocess entrypoint. A by-name import resolves that package to dist. Use a suite in .github/workflows that reaches into ../src, declare the copied source tree in \"assembles\", declare the spawned repo entrypoint in \"executes\" with the target package built by the command, or record the mutation as unkillable with its reason."
-  },
   "bin/smoke/mutations/workspace-import-exports.json": {
     "sha256": "26309a56fd3132ec98fd02c7189f7732895f7a368f9ae65843cfa80274f48f57",
     "refusal": "mutation \"W1 MeshAgent moves back to core\" is missing \"cell\""
