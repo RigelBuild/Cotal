@@ -203,6 +203,9 @@ interface CommandRow {
 }
 
 const PLACEMENT_CAPABILITY = "auth.placement";
+// Keep validator and published artifacts independent of the exported schema objects.
+const ROSTER_INPUT_SCHEMA = structuredClone(AUTH_ROSTER_INPUT_SCHEMA);
+const ROSTER_OUTPUT_SCHEMA = structuredClone(AUTH_ROSTER_OUTPUT_SCHEMA);
 
 const ROWS: CommandRow[] = [
   { name: "retire-lifecycle", capability: "auth.admin", input: RETIRE_LIFECYCLE_INPUT_SCHEMA, output: RETIRE_LIFECYCLE_OUTPUT_SCHEMA, targeted: true, modes: ["exact"] },
@@ -210,7 +213,7 @@ const ROWS: CommandRow[] = [
   { name: "enrollment-effect-status", capability: PLACEMENT_CAPABILITY, input: EFFECT_STATUS_INPUT_SCHEMA, output: PLACEMENT_STATUS_SCHEMA, targeted: false },
   { name: "close-enrollment-effect", capability: PLACEMENT_CAPABILITY, input: CLOSE_EFFECT_INPUT_SCHEMA, output: PLACEMENT_STATUS_SCHEMA, targeted: false },
   { name: "retire-placement-enrollment", capability: PLACEMENT_CAPABILITY, input: RETIRE_PLACEMENT_INPUT_SCHEMA, output: RETIRE_PLACEMENT_OUTPUT_SCHEMA, targeted: false },
-  { name: AUTH_ROSTER_COMMAND, capability: "auth.roster", input: AUTH_ROSTER_INPUT_SCHEMA, output: AUTH_ROSTER_OUTPUT_SCHEMA, targeted: false },
+  { name: AUTH_ROSTER_COMMAND, capability: "auth.roster", input: ROSTER_INPUT_SCHEMA, output: ROSTER_OUTPUT_SCHEMA, targeted: false },
 ];
 
 /** The placement participant commands, served by the auth endpoint and admitted only from the

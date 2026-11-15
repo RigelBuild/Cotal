@@ -38,14 +38,14 @@ export function parseAuthRosterOutput(value: unknown): AuthRosterOutput {
   return { rows, ...(typeof row.next === "string" ? { next: row.next } : {}) };
 }
 
-export const AUTH_ROSTER_INPUT_SCHEMA = {
+export const AUTH_ROSTER_INPUT_SCHEMA = deepFreeze({
   type: "object",
   additionalProperties: false,
   properties: {
     limit: { type: "integer", minimum: 1, maximum: AUTH_ROSTER_PAGE_LIMIT },
     after: { type: "string", minLength: 1, maxLength: 256 },
   },
-} as const;
+} as const);
 
 const PRESENCE_ROW_SCHEMA = {
   type: "object",
@@ -58,7 +58,7 @@ const PRESENCE_ROW_SCHEMA = {
   },
 } as const;
 
-export const AUTH_ROSTER_OUTPUT_SCHEMA = {
+export const AUTH_ROSTER_OUTPUT_SCHEMA = deepFreeze({
   type: "object",
   additionalProperties: false,
   required: ["rows"],
@@ -66,4 +66,13 @@ export const AUTH_ROSTER_OUTPUT_SCHEMA = {
     rows: { type: "array", maxItems: AUTH_ROSTER_PAGE_LIMIT, items: PRESENCE_ROW_SCHEMA },
     next: { type: "string", minLength: 1, maxLength: 256 },
   },
-} as const;
+} as const);
+
+/** Freeze nested schema members before exposing the contract to importers. */
+function deepFreeze<T>(value: T): T {
+  if (value !== null && typeof value === "object") {
+    for (const child of Object.values(value as Record<string, unknown>)) deepFreeze(child);
+    Object.freeze(value);
+  }
+  return value;
+}

@@ -1064,9 +1064,12 @@ interface CommandRow {
   modes?: EpAuthzMode[];
   handler: keyof ManagerServiceHandlers;
 }
+// Keep validator and published artifacts independent of the exported schema objects.
+const ROSTER_INPUT_SCHEMA = structuredClone(AUTH_ROSTER_INPUT_SCHEMA);
+const ROSTER_OUTPUT_SCHEMA = structuredClone(AUTH_ROSTER_OUTPUT_SCHEMA);
 
 const ROWS: CommandRow[] = [
-  { name: AUTH_ROSTER_COMMAND, capability: "manager.read", input: AUTH_ROSTER_INPUT_SCHEMA, output: AUTH_ROSTER_OUTPUT_SCHEMA, targeted: false, handler: "roster" },
+  { name: AUTH_ROSTER_COMMAND, capability: "manager.read", input: ROSTER_INPUT_SCHEMA, output: ROSTER_OUTPUT_SCHEMA, targeted: false, handler: "roster" },
   { name: "vitals", capability: "manager.vitals", input: VOID_SCHEMA, output: VITALS_OUTPUT_SCHEMA, targeted: false, handler: "vitals" },
   { name: "status", capability: "manager.read", input: VOID_SCHEMA, output: STATUS_OUTPUT_SCHEMA, targeted: false, handler: "status" },
   { name: "ps", capability: "manager.read", input: VOID_SCHEMA, output: PS_OUTPUT_SCHEMA, targeted: false, handler: "ps" },
