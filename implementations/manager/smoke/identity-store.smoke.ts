@@ -36,6 +36,12 @@ try {
     (error: unknown) => error instanceof EpEnvelopeError && error.code === "conflict",
     "stale issuance generations cannot overwrite a concurrent transition",
   );
+  const expiredIntent = { issuanceId: mintLifecycleUid(), iat: 11, exp: 21 };
+  first.beginRenewal("alice", "signer", alice.lifecycleUid, issued.issuanceId, expiredIntent);
+  const replacementIntent = { issuanceId: mintLifecycleUid(), iat: 22, exp: 40 };
+  const replacedIntent = second.beginRenewal("alice", "signer", alice.lifecycleUid, issued.issuanceId, replacementIntent);
+  assert.deepEqual(replacedIntent.renewal, replacementIntent);
+  console.log("PASS expired pending renewal is atomically replaced");
 
   const retired = first.retire("alice", "signer", alice.lifecycleUid, issued.generation, 7);
   assert.equal(retired.retiredAt, 7, "retirement persists a terminal timestamp");
