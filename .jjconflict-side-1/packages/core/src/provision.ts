@@ -28,10 +28,10 @@ import {
   encodeOperator,
   encodeAccount,
   encodeUser,
-  fmtCreds,
   type Account,
 } from "@nats-io/jwt";
 import { createOperator, createAccount, fromPublic, fromSeed } from "@nats-io/nkeys";
+import type { KeyPair } from "@nats-io/nkeys";
 import type { BrokerTransport } from "./broker-tls.js";
 import {
   token,
@@ -102,7 +102,7 @@ import { SERVICE_ACCESS_TTL_SECONDS } from "./service-authority-limits.js";
 import { effectsBindGrants, poolOwnerBindGrants, goalWriterGrants, environmentManagerGoalWriterGrants, sessionLedgerGrants, epAuthBucket, sessionsBucket, epcStreamName, endpointPlaneStreamNames, eptReqStreamName, eptStreamName, hardenedAuthorityStreamNames, timerWriterDurable, timerWriterGrants } from "./endpoint-binding.js";
 import { epsSubject, epCallerReplyFilter, assertGeneration, isIssuedCaller, AUTH_ENDPOINT, EP_CMD_RETIRE_LIFECYCLE, EP_CMD_VERIFY_PLACEMENT_ENROLLMENT, EP_CMD_ENROLLMENT_EFFECT_STATUS, EP_CMD_CLOSE_ENROLLMENT_EFFECT, EP_CMD_RETIRE_PLACEMENT_ENROLLMENT, type EpCaller, type IssuedCaller } from "./endpoint-subjects.js";
 import { managerRegistrationFamilySubject } from "./endpoint-subjects.js";
-import { acceptedKey, acceptedReadGrant, acceptedBucket, importNativeSubjectPermissions, issuedBucket, issuedHorizon, issuedPermitsPattern, issuedStoreStreamNames, prepareListing, writeAcceptedRow, type IssuanceSeam, type IssuedAuthorityRef, type ListingBinding, type ListingSeam, type PreparedListing } from "./issued-authority.js";
+import { acceptedKey, acceptedReadGrant, acceptedBucket, importNativeSubjectPermissions, issuedBucket, issuedHorizon, issuedPermitsPattern, issuedStoreStreamNames, prepareListing, writeAcceptedRow, type IssuanceSeam, type IssuedAuthorityRef, type IssuedSubjectPermissions, type IssuedSourceRef, type ListingBinding, type ListingSeam, type PreparedListing } from "./issued-authority.js";
 import { signIssuedUserJwt } from "./issued-user-jwt.js";
 import { REGISTRY_ENDPOINTS_GRANT } from "./registry-contract.js";
 import { admissionBucket, admissionKey, revocationKey } from "./run-admission.js";
@@ -1171,7 +1171,7 @@ async function releaseIssuance(
   const permissions = importNativeSubjectPermissions(perms);
   if (seam.mode === "renew") {
     await seam.store.confirm(ref, permissions);
-    await seam.finalize?.(credentialId);
+    await seam.finalize(credentialId);
     return;
   }
   // The spawn bound reads an issuance with no source and no presence key of its own as an operator
@@ -1186,85 +1186,139 @@ async function releaseIssuance(
     permissions,
     ...(seam.sources.length === 0 ? { expiresAt: exp } : {}),
   });
-  await seam.store.release(prepared, async () => { await seam.finalize?.(credentialId); });
+  await seam.store.release(prepared, async () => { await seam.finalize(credentialId); });
   await writeAcceptedRow(seam.accepted, opts.issued.acceptedToken, ref);
 }
 
-/** Issue a DM-only seat credential without accepting the holder's private key. */
-export async function mintPublicSeatUserJwt(
-  auth: { space: string; account: Pick<SpaceAccountAuth["account"], "pub" | "signingSeed"> },
-  publicId: string,
-  opts: { name: string; principal: { owner: string; actor: string }; lifecycleUid: string; expiresAt: number; issued: IssuedBinding; issuance: IssuanceSeam },
-): Promise<{ jwt: string; exp: number; acceptedToken: string }> {
-  if (!isUserNkey(publicId)) throw new Error("mintPublicSeatUserJwt: publicId must be a user nkey");
-  assertValidName(opts.name);
-  const now = Math.floor(Date.now() / 1000);
-  if (!Number.isSafeInteger(opts.expiresAt) || opts.expiresAt <= now || opts.expiresAt > now + STANDING_RENEWABLE_TTL_SEC)
-    throw new Error("mintPublicSeatUserJwt: expiresAt must be within the next 24 hours");
-  if (opts.issuance.mode !== "issue") throw new Error("mintPublicSeatUserJwt: a public seat requires a new issuance");
-  const pr: MintPrincipal = { ...opts.principal, connId: publicId, lifecycleUid: opts.lifecycleUid };
-  const mintOpts: MintOpts = { ...opts, dmOnly: true };
-  const perms = permissionsFor("agent", auth.space, pr, mintOpts);
-  const tags = userTags("agent", pr);
-  const signer = nativeNkeySigner(new TextEncoder().encode(auth.account.signingSeed));
-  const signerPublicKey = signer.getPublicKey();
-  const claimsDigest = createHash("sha256").update(canonicalJson({
-    accountIssuer: auth.account.pub,
-    signerPublicKey,
-    userPublicKey: publicId,
-    name: opts.name,
-    permissions: perms,
-    tags,
-  })).digest("hex");
-  const ref: IssuedAuthorityRef = {
-    space: auth.space,
-    owner: pr.owner,
-    actor: pr.actor,
-    uid: opts.lifecycleUid,
-    generation: opts.issued.generation,
-  };
-  const permissions = importNativeSubjectPermissions(perms);
-  if (opts.expiresAt > issuedHorizon(ref.generation))
-    throw new Error(`mintPublicSeatUserJwt: expiresAt must not pass generation horizon ${issuedHorizon(ref.generation)}`);
-  const source = { space: auth.space, bucket: epAuthBucket(auth.space), key: `cred.${opts.lifecycleUid}` };
-  if (opts.issuance.sources.length !== 1 || canonicalJson(opts.issuance.sources[0]) !== canonicalJson(source))
-    throw new Error("mintPublicSeatUserJwt: issuance must name this lifecycle's static credential-family source");
+type PublicSeatMintOptions = {
+  name: string;
+  principal: { owner: string; actor: string };
+  lifecycleUid: string;
+  issuedAt: number;
+  expiresAt: number;
+  issued: IssuedBinding;
+  issuance: IssuanceSeam;
+};
+
+type PublicSeatMintContext = {
+  auth: { space: string; account: Pick<SpaceAccountAuth["account"], "pub" | "signingSeed"> };
+  publicId: string;
+  opts: PublicSeatMintOptions;
+  signer: KeyPair;
+  perms: Record<string, unknown>;
+  tags: string[];
+  claimsDigest: string;
+  ref: IssuedAuthorityRef;
+  source: IssuedSourceRef;
+  permissions: IssuedSubjectPermissions;
+};
+
+async function assertPublicSeatAcceptedRow(context: PublicSeatMintContext): Promise<void> {
+  const accepted = await context.opts.issuance.accepted.get(acceptedKey(context.opts.issued.acceptedToken));
+  if (!accepted || accepted.operation !== "PUT"
+    || canonicalJson(accepted.json<unknown>()) !== canonicalJson({ version: 1, ref: context.ref }))
+    throw new Error("mintPublicSeatUserJwt: issuance has no identical accepted row");
+}
+
+function signPublicSeatUserJwt(context: PublicSeatMintContext, issuedAt: number, expiresAt: number): string {
+  const jwt = signIssuedUserJwt({
+    accountSigner: context.signer,
+    accountIssuer: context.auth.account.pub,
+    userPublicKey: context.publicId,
+    name: context.opts.name,
+    permissions: context.perms,
+    tags: context.tags,
+    exp: expiresAt,
+    iat: issuedAt,
+  });
+  if (Buffer.byteLength(jwt, "utf8") > MAX_MINTED_JWT_BYTES)
+    throw new Error("mintPublicSeatUserJwt: minted JWT exceeds the CONNECT line budget");
+  return jwt;
+}
+
+async function issuePublicSeatUserJwt(context: PublicSeatMintContext): Promise<{ jwt: string; exp: number; acceptedToken: string }> {
+  const { opts, ref, source, permissions } = context;
   const prepared = await opts.issuance.store.stage({
     version: 1,
     ref,
     sources: [source],
     permissions,
+    issuedAt: opts.issuedAt,
     jwtExpiresAt: opts.expiresAt,
-    jwtClaimsDigest: claimsDigest,
+    jwtClaimsDigest: context.claimsDigest,
   });
-  if (prepared.issuedAt === undefined || prepared.jwtExpiresAt !== opts.expiresAt || prepared.jwtClaimsDigest !== claimsDigest)
+  if (prepared.issuedAt !== opts.issuedAt || prepared.jwtExpiresAt !== opts.expiresAt || prepared.jwtClaimsDigest !== context.claimsDigest)
     throw new Error("mintPublicSeatUserJwt: prepared issuance is missing or mismatches persisted JWT claims");
-  const jwt = signIssuedUserJwt({
-    accountSigner: signer,
-    accountIssuer: auth.account.pub,
-    userPublicKey: publicId,
-    name: opts.name,
-    permissions: perms,
-    tags,
-    exp: prepared.jwtExpiresAt,
-    iat: prepared.issuedAt,
-  });
-  if (Buffer.byteLength(jwt, "utf8") > MAX_MINTED_JWT_BYTES)
-    throw new Error("mintPublicSeatUserJwt: minted JWT exceeds the CONNECT line budget");
-  const credentialId = credentialIdOf(jwt);
+  const jwt = signPublicSeatUserJwt(context, prepared.issuedAt, prepared.jwtExpiresAt);
   if (prepared.state === "prepared") {
-    await opts.issuance.store.release(prepared, async () => { await opts.issuance.finalize?.(credentialId); });
+    await opts.issuance.store.release(prepared, () => opts.issuance.finalize(credentialIdOf(jwt)));
     await writeAcceptedRow(opts.issuance.accepted, opts.issued.acceptedToken, ref);
   } else {
     if (prepared.state !== "active") throw new Error("mintPublicSeatUserJwt: issuance is not active");
     await opts.issuance.store.release(prepared, async () => {});
-    const accepted = await opts.issuance.accepted.get(acceptedKey(opts.issued.acceptedToken));
-    if (!accepted || accepted.operation !== "PUT"
-      || canonicalJson(accepted.json<unknown>()) !== canonicalJson({ version: 1, ref }))
-      throw new Error("mintPublicSeatUserJwt: active issuance has no identical accepted row");
+    await assertPublicSeatAcceptedRow(context);
   }
-  signer.clear();
   return { jwt, exp: prepared.jwtExpiresAt, acceptedToken: opts.issued.acceptedToken };
+}
+
+async function renewPublicSeatUserJwt(context: PublicSeatMintContext): Promise<{ jwt: string; exp: number; acceptedToken: string }> {
+  const { opts, ref, source, permissions } = context;
+  const previous = await opts.issuance.store.observe(ref);
+  if (previous.evidence.sources.length !== 1 || canonicalJson(previous.evidence.sources[0]) !== canonicalJson(source))
+    throw new Error("mintPublicSeatUserJwt: renewal source does not match the active issuance's static credential-family source");
+  if (previous.evidence.jwtClaimsDigest !== context.claimsDigest
+    || previous.evidence.issuedAt === undefined || previous.evidence.jwtExpiresAt === undefined)
+    throw new Error("mintPublicSeatUserJwt: renewal claims do not match immutable active issuance evidence");
+  if (opts.issuedAt <= previous.evidence.issuedAt || opts.expiresAt <= previous.evidence.jwtExpiresAt)
+    throw new Error("mintPublicSeatUserJwt: renewal must advance the persisted issuedAt and expiresAt");
+  await opts.issuance.store.confirm(ref, permissions);
+  const jwt = signPublicSeatUserJwt(context, opts.issuedAt, opts.expiresAt);
+  await assertPublicSeatAcceptedRow(context);
+  await opts.issuance.finalize(credentialIdOf(jwt));
+  return { jwt, exp: opts.expiresAt, acceptedToken: opts.issued.acceptedToken };
+}
+
+/** Issue or renew a DM-only seat credential without accepting the holder's private key. */
+export async function mintPublicSeatUserJwt(
+  auth: { space: string; account: Pick<SpaceAccountAuth["account"], "pub" | "signingSeed"> },
+  publicId: string,
+  opts: PublicSeatMintOptions,
+): Promise<{ jwt: string; exp: number; acceptedToken: string }> {
+  if (!isUserNkey(publicId)) throw new Error("mintPublicSeatUserJwt: publicId must be a user nkey");
+  assertValidName(opts.name);
+  const now = Math.floor(Date.now() / 1000);
+  if (!Number.isSafeInteger(opts.issuedAt) || opts.issuedAt <= 0 || opts.issuedAt > now
+    || !Number.isSafeInteger(opts.expiresAt) || opts.expiresAt <= now || opts.expiresAt <= opts.issuedAt
+    || opts.expiresAt > opts.issuedAt + STANDING_RENEWABLE_TTL_SEC)
+    throw new Error("mintPublicSeatUserJwt: persisted issuedAt and expiresAt must describe a live JWT no longer than 24 hours");
+
+  const pr: MintPrincipal = { ...opts.principal, connId: publicId, lifecycleUid: opts.lifecycleUid };
+  const perms = permissionsFor("agent", auth.space, pr, { ...opts, dmOnly: true });
+  const tags = userTags("agent", pr);
+  const encodedSeed = new TextEncoder().encode(auth.account.signingSeed);
+  const signer = nativeNkeySigner(encodedSeed);
+  encodedSeed.fill(0);
+  try {
+    const claimsDigest = createHash("sha256").update(canonicalJson({
+      accountIssuer: auth.account.pub, signerPublicKey: signer.getPublicKey(), userPublicKey: publicId,
+      name: opts.name, permissions: perms, tags,
+    })).digest("hex");
+    const ref: IssuedAuthorityRef = { space: auth.space, owner: pr.owner, actor: pr.actor, uid: opts.lifecycleUid, generation: opts.issued.generation };
+    const source = { space: auth.space, bucket: epAuthBucket(auth.space), key: `cred.${opts.lifecycleUid}` };
+    if (opts.expiresAt > issuedHorizon(ref.generation))
+      throw new Error(`mintPublicSeatUserJwt: expiresAt must not pass generation horizon ${issuedHorizon(ref.generation)}`);
+    if (opts.issuance.sources.length !== 1 || canonicalJson(opts.issuance.sources[0]) !== canonicalJson(source))
+      throw new Error("mintPublicSeatUserJwt: issuance must name this lifecycle's static credential-family source");
+    const context: PublicSeatMintContext = {
+      auth, publicId, opts, signer, perms, tags, claimsDigest, ref, source,
+      permissions: importNativeSubjectPermissions(perms),
+    };
+    return opts.issuance.mode === "issue"
+      ? await issuePublicSeatUserJwt(context)
+      : await renewPublicSeatUserJwt(context);
+  } finally {
+    signer.clear();
+  }
 }
 
 /** Issue a host-signed NATS user JWT for a caller-generated nkey. The private seed stays with
