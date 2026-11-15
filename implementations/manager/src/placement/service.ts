@@ -67,7 +67,13 @@ function requestArgs<T>(ctx: EpServeContext, command: string): T {
 }
 
 async function authorize(ctx: EpServeContext, deps: PlacementServiceDeps): Promise<void> {
-  if (!deps.authorizePlacement || !(await deps.authorizePlacement(ctx)))
+  let authorized = false;
+  try {
+    authorized = deps.authorizePlacement ? await deps.authorizePlacement(ctx) : false;
+  } catch {
+    authorized = false;
+  }
+  if (!authorized)
     throw new EpEnvelopeError("permission-denied", "placement requires the authenticated reconciler service principal", undefined, "not-executed");
 }
 
@@ -94,9 +100,12 @@ export function placementServiceHandlers(deps: PlacementServiceDeps): {
       accepted: requestArgs<{ accepted: AcceptedIntent }>(ctx, "place").accepted,
       caller: ctx.subject.caller,
     })),
-    observe: (ctx) => callPlacement(ctx, "retained placement/execution journal and T5 RuntimeProvider.rebindDelegated", (callbacks) => {
+    observe: (ctx) => callPlacement(ctx, "retained placement/execution journal and T5 RuntimeProvider.rebindDelegated", async (callbacks) => {
       const args = requestArgs<{ name: string; generation: number }>(ctx, "observe");
-      return callbacks.observe({ name: args.name, generation: args.generation, caller: ctx.subject.caller });
+      const observation = await callbacks.observe({ name: args.name, generation: args.generation, caller: ctx.subject.caller });
+      if (observation.placement.name !== args.name || observation.placement.generation !== args.generation)
+        throw new EpEnvelopeError("expired", `retained observation for ${args.name} generation ${args.generation} is unavailable`, undefined, "not-executed");
+      return observation;
     }),
     stopPlacement: (ctx) => callPlacement(ctx, "T5 RuntimeProvider.close and terminal retirement proof", (callbacks) => callbacks.stopPlacement({
       placement: requestArgs<{ placement: Placement }>(ctx, "stop-placement").placement,
