@@ -28,6 +28,7 @@ import {
   encodeOperator,
   encodeAccount,
   encodeUser,
+  fmtCreds,
   type Account,
 } from "@nats-io/jwt";
 import { createOperator, createAccount, fromPublic, fromSeed } from "@nats-io/nkeys";
@@ -1171,7 +1172,7 @@ async function releaseIssuance(
   const permissions = importNativeSubjectPermissions(perms);
   if (seam.mode === "renew") {
     await seam.store.confirm(ref, permissions);
-    await seam.finalize(credentialId);
+    await seam.finalize?.(credentialId);
     return;
   }
   // The spawn bound reads an issuance with no source and no presence key of its own as an operator
@@ -1186,7 +1187,7 @@ async function releaseIssuance(
     permissions,
     ...(seam.sources.length === 0 ? { expiresAt: exp } : {}),
   });
-  await seam.store.release(prepared, async () => { await seam.finalize(credentialId); });
+  await seam.store.release(prepared, async () => { await seam.finalize?.(credentialId); });
   await writeAcceptedRow(seam.accepted, opts.issued.acceptedToken, ref);
 }
 
@@ -1251,7 +1252,7 @@ async function issuePublicSeatUserJwt(context: PublicSeatMintContext): Promise<{
     throw new Error("mintPublicSeatUserJwt: prepared issuance is missing or mismatches persisted JWT claims");
   const jwt = signPublicSeatUserJwt(context, prepared.issuedAt, prepared.jwtExpiresAt);
   if (prepared.state === "prepared") {
-    await opts.issuance.store.release(prepared, () => opts.issuance.finalize(credentialIdOf(jwt)));
+    await opts.issuance.store.release(prepared, async () => { await opts.issuance.finalize?.(credentialIdOf(jwt)); });
     await writeAcceptedRow(opts.issuance.accepted, opts.issued.acceptedToken, ref);
   } else {
     if (prepared.state !== "active") throw new Error("mintPublicSeatUserJwt: issuance is not active");
@@ -1274,7 +1275,7 @@ async function renewPublicSeatUserJwt(context: PublicSeatMintContext): Promise<{
   await opts.issuance.store.confirm(ref, permissions);
   const jwt = signPublicSeatUserJwt(context, opts.issuedAt, opts.expiresAt);
   await assertPublicSeatAcceptedRow(context);
-  await opts.issuance.finalize(credentialIdOf(jwt));
+  await opts.issuance.finalize?.(credentialIdOf(jwt));
   return { jwt, exp: opts.expiresAt, acceptedToken: opts.issued.acceptedToken };
 }
 
