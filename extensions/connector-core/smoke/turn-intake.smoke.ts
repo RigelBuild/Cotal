@@ -315,6 +315,8 @@ for (const status of ["blocked", "handoff"] as const) {
   await poll();
   const peek = a.peekPendingTurns()!;
   check("the surface orders oldest first", peek.goalIds[0] === "g5" && peek.goalIds[1] === "g6", peek.goalIds);
+  check("the rendered text equals its header, goal blocks and footer", peek.text ===
+    `${peek.header}2 turns:\n${peek.goalIds.map((id) => peek.blocks?.[id]).join("\n")}${peek.footer}`);
   const early = await a.yieldTurn("done", { turn: "g6" });
   check("an explicit id yields nothing the session has not been shown yet", early.ok === false && String(early.error).includes("surfaced"), early.error);
   a.commitSurfacedTurns(peek.goalIds);
@@ -1529,7 +1531,7 @@ await spawn(
   }
 }
 
-const EXPECTED_CELLS = 59;
+const EXPECTED_CELLS = 62;
 const ran = pass + fail;
 console.log(`\nturn-intake.smoke: ${pass} passed, ${fail} failed`);
 if (ran !== EXPECTED_CELLS) {
