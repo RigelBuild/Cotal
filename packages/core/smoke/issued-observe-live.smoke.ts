@@ -17,6 +17,9 @@ import {
 import { SMOKE_BROKER_TOKEN, awaitBrokerReady, emitSentinel, killAndAwaitExit, teardownOnSignal } from "@cotal-ai/smoke-kit";
 import { isReachable } from "../src/index.js";
 import { pickFreePort } from "./_free-port.js";
+import { createSpaceAuth, mintPublicSeatUserJwt } from "../src/provision.js";
+import { acceptedBucket, acceptedKey } from "../src/issued-authority.js";
+import { credentialIdOf, epAuthBucket, mintLifecycleUid, newIdentity } from "../src/index.js";
 
 function evidenceForGeneration(actor: string, generation: string): IssuedEvidence {
   const ref: IssuedAuthorityRef = { space: "observe", owner: "local", actor, uid: "a".repeat(26), generation };
@@ -66,6 +69,37 @@ try {
     const permissions = importNativeSubjectPermissions({ pub: { allow: [`cotal.${space}.ep.v1.one.registry.endpoints.local.${actor}.${ref.uid}.${ref.generation}.*`] }, sub: { deny: [">"] } });
     return { version: 1, ref, sources: [source], permissions, ...extra };
   };
+  await check("public seat retry repairs accepted row after activation interruption", async () => {
+    const auth = await createSpaceAuth(space);
+    const identity = newIdentity();
+    const uid = mintLifecycleUid();
+    const issued = { generation: mintGeneration(now + 3600), acceptedToken: mintAcceptedToken() };
+    const accepted = await kvm.open(acceptedBucket(space));
+    let credentialId = "";
+    let interrupted = false;
+    const interruptedAccepted = new Proxy(accepted, {
+      get(target, property, receiver) {
+        if (property === "create") return async () => { interrupted = true; throw new Error("injected accepted-row interruption"); };
+        const value = Reflect.get(target, property, receiver);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const source = { space, bucket: epAuthBucket(space), key: `cred.${uid}` };
+    const options = {
+      name: "seat", principal: { owner: "local", actor: identity.id }, lifecycleUid: uid,
+      issuedAt: now, expiresAt: now + 1800, issued,
+      issuance: { mode: "issue" as const, store, accepted: interruptedAccepted, sources: [source],
+        finalize: async (id: string) => { credentialId = id; } },
+    };
+    await assert.rejects(() => mintPublicSeatUserJwt(auth, identity.id, options), /injected accepted-row interruption/);
+    assert.ok(interrupted && credentialId);
+    assert.equal(await accepted.get(acceptedKey(issued.acceptedToken)), null);
+    const replay = await mintPublicSeatUserJwt(auth, identity.id, { ...options, issuance: { ...options.issuance, accepted } });
+    assert.equal(credentialIdOf(replay.jwt), credentialId);
+    assert.ok(await accepted.get(acceptedKey(issued.acceptedToken)));
+    const again = await mintPublicSeatUserJwt(auth, identity.id, { ...options, issuance: { ...options.issuance, accepted } });
+    assert.equal(again.jwt, replay.jwt);
+  });
   await check("JWT time and claims replay preserve first iat and reject claim changes", async () => {
     const base = evidenceFor("timestamp_replay");
     const evidence: IssuedEvidence = { ...base, jwtExpiresAt: issuedHorizon(base.ref.generation), jwtClaimsDigest: "a".repeat(64) };

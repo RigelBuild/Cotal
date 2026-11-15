@@ -1257,7 +1257,7 @@ async function issuePublicSeatUserJwt(context: PublicSeatMintContext): Promise<{
   } else {
     if (prepared.state !== "active") throw new Error("mintPublicSeatUserJwt: issuance is not active");
     await opts.issuance.store.release(prepared, async () => {});
-    await assertPublicSeatAcceptedRow(context);
+    await writeAcceptedRow(opts.issuance.accepted, opts.issued.acceptedToken, ref);
   }
   return { jwt, exp: prepared.jwtExpiresAt, acceptedToken: opts.issued.acceptedToken };
 }
