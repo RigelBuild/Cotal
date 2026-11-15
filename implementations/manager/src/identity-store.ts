@@ -27,9 +27,11 @@ export type IdentityRecord = {
   retiredAt?: number;
   publicKey?: string;
   issuance?: IdentityIssuance;
+  renewal?: { issuanceId: string; iat: number; exp: number };
+  initialIssuance?: IdentityIssuance;
 };
 
-const KEYS = new Set(["version", "name", "lifecycleUid", "minter", "reservedAt", "touchedAt", "retiredAt", "publicKey", "issuance"]);
+const KEYS = new Set(["version", "name", "lifecycleUid", "minter", "reservedAt", "touchedAt", "retiredAt", "publicKey", "issuance", "renewal", "initialIssuance"]);
 const ISSUANCE_KEYS = new Set(["generation", "iat", "exp", "acceptedToken", "issuanceId", "credentialId", "state"]);
 const UID = /^[a-z0-9]{26,32}$/;
 const USER_NKEY = /^U[A-Z2-7]{55}$/;
@@ -68,6 +70,15 @@ export function parseIdentityRecord(raw: unknown): IdentityRecord {
       (raw.publicKey !== undefined && (typeof raw.publicKey !== "string" || !USER_NKEY.test(raw.publicKey))))
     throw new Error("invalid identity record");
   const issuance = parseIssuance(raw.issuance);
+  const initialIssuance = parseIssuance(raw.initialIssuance);
+  let renewal: IdentityRecord["renewal"];
+  if (raw.renewal !== undefined) {
+    if (!object(raw.renewal) || Object.keys(raw.renewal).some((key) => !["issuanceId", "iat", "exp"].includes(key)) ||
+        typeof raw.renewal.issuanceId !== "string" || !UID.test(raw.renewal.issuanceId) ||
+        !Number.isSafeInteger(raw.renewal.iat) || !Number.isSafeInteger(raw.renewal.exp) || issuance?.state !== "issued")
+      throw new Error("invalid identity renewal intent");
+    renewal = { issuanceId: raw.renewal.issuanceId, iat: raw.renewal.iat as number, exp: raw.renewal.exp as number };
+  }
   if (raw.retiredAt !== undefined && issuance !== undefined && issuance.state !== "retired")
     throw new Error("retired identity issuance must be terminal");
   return {
@@ -80,6 +91,8 @@ export function parseIdentityRecord(raw: unknown): IdentityRecord {
     ...(raw.retiredAt === undefined ? {} : { retiredAt: raw.retiredAt as number }),
     ...(raw.publicKey === undefined ? {} : { publicKey: raw.publicKey as string }),
     ...(issuance === undefined ? {} : { issuance }),
+    ...(renewal === undefined ? {} : { renewal }),
+    ...(initialIssuance === undefined ? {} : { initialIssuance }),
   };
 }
 
@@ -90,7 +103,7 @@ function sameIssuance(a: IdentityIssuance | undefined, b: IdentityIssuance | und
 }
 
 function cloneRecord(record: IdentityRecord): IdentityRecord {
-  return { ...record, ...(record.issuance === undefined ? {} : { issuance: { ...record.issuance } }) };
+  return { ...record, ...(record.issuance === undefined ? {} : { issuance: { ...record.issuance } }), ...(record.initialIssuance === undefined ? {} : { initialIssuance: { ...record.initialIssuance } }), ...(record.renewal === undefined ? {} : { renewal: { ...record.renewal } }) };
 }
 
 function identityError(code: ConstructorParameters<typeof EpEnvelopeError>[0], message: string): EpEnvelopeError {
@@ -226,7 +239,7 @@ export class IdentityStore {
       if (!current || current.name !== parsed.name || current.minter !== parsed.minter ||
           current.reservedAt !== parsed.reservedAt || this.#current(parsed.name)?.lifecycleUid !== parsed.lifecycleUid)
         throw identityError("conflict", "identity update does not match the current reserved UID");
-      if (parsed.publicKey !== current.publicKey || parsed.retiredAt !== current.retiredAt || !sameIssuance(parsed.issuance, current.issuance))
+      if (parsed.publicKey !== current.publicKey || parsed.retiredAt !== current.retiredAt || !sameIssuance(parsed.issuance, current.issuance) || !sameIssuance(parsed.initialIssuance, current.initialIssuance) || JSON.stringify(parsed.renewal) !== JSON.stringify(current.renewal))
         throw identityError("failed-precondition", "identity public-key, retirement, or issuance changes require their atomic store operation");
       if (parsed.touchedAt < current.touchedAt)
         throw identityError("conflict", "identity update is older than the current record");
@@ -282,6 +295,34 @@ export class IdentityStore {
       this.#records[this.#indexByUid(current.lifecycleUid)] = bound;
       this.#persist();
       return cloneRecord(bound);
+    });
+  }
+
+  beginRenewal(name: string, minter: string, lifecycleUid: string, expectedIssuanceId: string, renewal: NonNullable<IdentityRecord["renewal"]>): IdentityRecord {
+    return this.#withLock(() => {
+      const current = this.#current(name);
+      if (!current || current.lifecycleUid !== lifecycleUid || current.minter !== minter || current.retiredAt !== undefined || current.issuance?.state !== "issued" || current.issuance.issuanceId !== expectedIssuanceId)
+        throw identityError("conflict", "identity changed before renewal");
+      if (current.renewal) return cloneRecord(current);
+      if (!UID.test(renewal.issuanceId) || !Number.isSafeInteger(renewal.iat) || !Number.isSafeInteger(renewal.exp) || renewal.iat <= current.issuance.iat || renewal.exp <= current.issuance.exp)
+        throw identityError("failed-precondition", "renewal must advance the issued credential");
+      const updated = { ...current, renewal: { ...renewal } };
+      this.#records[this.#indexByUid(lifecycleUid)] = updated;
+      this.#persist();
+      return cloneRecord(updated);
+    });
+  }
+
+  finishRenewal(name: string, minter: string, lifecycleUid: string, renewalId: string, credentialId: string): IdentityRecord {
+    return this.#withLock(() => {
+      const current = this.#current(name);
+      if (!current || current.lifecycleUid !== lifecycleUid || current.minter !== minter || current.retiredAt !== undefined || current.issuance?.state !== "issued" || current.renewal?.issuanceId !== renewalId)
+        throw identityError("conflict", "identity renewal changed before completion");
+      const { renewal, ...rest } = current;
+      const updated = parseIdentityRecord({ ...rest, initialIssuance: current.initialIssuance ?? current.issuance, issuance: { ...current.issuance, ...renewal, credentialId }, touchedAt: Math.max(current.touchedAt, Date.now()) });
+      this.#records[this.#indexByUid(lifecycleUid)] = updated;
+      this.#persist();
+      return cloneRecord(updated);
     });
   }
 

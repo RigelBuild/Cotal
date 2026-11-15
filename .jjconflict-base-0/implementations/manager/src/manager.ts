@@ -2004,6 +2004,7 @@ export class Manager {
   /** Durable reservation and issuance state for identities this static manager mints. */
   private identityStore?: IdentityStore;
   private readonly identityMintFlights = new Map<string, Promise<{ name: string; jwt: string; lifecycleUid: string; exp: number; acceptedToken: string }>>();
+  private readonly identityRenewFlights = new Map<string, Promise<{ name: string; jwt: string; lifecycleUid: string; exp: number; acceptedToken: string }>>();
   /** Readiness-race backstop (#159 B1) — the {@link READINESS_TIMEOUT_MS} constant, held as an instance
    *  field so a test can shorten it (the join/exit signals are event-driven; only the backstop is timed).
    *  Production leaves it at the constant. */
@@ -12527,7 +12528,7 @@ export class Manager {
     if (existing) return existing;
     const flight = (async () => {
       const now = Math.floor(Date.now() / 1000);
-      let issuance = bound.issuance;
+      let issuance = bound.initialIssuance ?? bound.issuance;
       if (!issuance) {
         issuance = { generation: mintGeneration(now + STATIC_GENERATION_HORIZON_SEC), acceptedToken: mintAcceptedToken(), issuanceId: mintLifecycleUid(), iat: now, exp: now + MANAGED_STATIC_TTL_SEC, state: "pending" };
         store.transition(name, minter, record.lifecycleUid, undefined, issuance);
@@ -12560,9 +12561,39 @@ export class Manager {
     try { return await flight; } finally { if (this.identityMintFlights.get(record.lifecycleUid) === flight) this.identityMintFlights.delete(record.lifecycleUid); }
   }
 
-  private identityRenew(_ctx: EpServeContext): never {
-    this.identityStoreForCommand();
-    throw new EpEnvelopeError("unavailable", "public-seat JWT renewal is unavailable until the core mintPublicSeatUserJwt API is integrated", undefined, "not-executed");
+  private async identityRenew(ctx: EpServeContext): Promise<{ name: string; jwt: string; lifecycleUid: string; exp: number; acceptedToken: string }> {
+    const store = this.identityStoreForCommand();
+    const input = ctx.request.args;
+    if (typeof input !== "object" || input === null || Array.isArray(input) || !("name" in input) || !("publicKey" in input) || typeof input.publicKey !== "string")
+      throw new EpEnvelopeError("bad-request", "identity renewal requires a name and public key", undefined, "not-executed");
+    const name = this.identityAlias(input.name);
+    const publicKey = input.publicKey;
+    const minter = principalKey(ctx.subject.caller.owner, ctx.subject.caller.actor).key;
+    const record = store.get(name);
+    if (!record) throw new EpEnvelopeError("not-found", `identity ${name} has no reservation`, undefined, "not-executed");
+    if (record.minter !== minter) throw new EpEnvelopeError("permission-denied", `identity ${name} is owned by another minter`, undefined, "not-executed");
+    if (record.publicKey !== publicKey) throw new EpEnvelopeError("permission-denied", "identity public key does not match", undefined, "not-executed");
+    if (record.retiredAt !== undefined || record.issuance?.state !== "issued") throw new EpEnvelopeError("failed-precondition", "identity is not issued", undefined, "not-executed");
+    const existing = this.identityRenewFlights.get(record.lifecycleUid);
+    if (existing) return existing;
+    const flight = (async () => {
+      const issuance = record.issuance!;
+      const now = Math.floor(Date.now() / 1000);
+      const exp = Math.min(now + MANAGED_STATIC_TTL_SEC, issuedHorizon(issuance.generation));
+      const saved = record.renewal ? record : store.beginRenewal(name, minter, record.lifecycleUid, issuance.issuanceId, { issuanceId: mintLifecycleUid(), iat: now, exp });
+      const pending = saved.renewal;
+      if (!pending) throw new Error("renewal intent was not persisted");
+      const minted = await this.withIssuer((i) => mintPublicSeatUserJwt(this.auth!, publicKey, {
+        name, principal: { owner: DEV_OWNER, actor: publicKey }, lifecycleUid: record.lifecycleUid,
+        issuedAt: pending.iat, expiresAt: pending.exp,
+        issued: { generation: issuance.generation, acceptedToken: issuance.acceptedToken },
+        issuance: this.issuanceSeam(i, "renew", { name, id: publicKey, lifecycleUid: record.lifecycleUid }, pending.exp),
+      }));
+      store.finishRenewal(name, minter, record.lifecycleUid, pending.issuanceId, credentialIdOf(minted.jwt));
+      return { name, lifecycleUid: record.lifecycleUid, ...minted };
+    })();
+    this.identityRenewFlights.set(record.lifecycleUid, flight);
+    try { return await flight; } finally { if (this.identityRenewFlights.get(record.lifecycleUid) === flight) this.identityRenewFlights.delete(record.lifecycleUid); }
   }
 
   /** `chat-session-open`: admit one static chat session. The manager draws the `chat_` alias and a
