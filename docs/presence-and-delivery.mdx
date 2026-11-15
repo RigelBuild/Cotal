@@ -42,9 +42,9 @@ The [endpoint presence reference](embedding-endpoints.mdx#presence-metadata) def
 The [view and write diagnosis reference](embedding-endpoints.mdx#presence-view-and-write-diagnosis) describes incomplete snapshots, stale-watch recovery, and failed heartbeats.
 The [connector display reference](connector-runtime-reference.mdx#presence-display-and-name-verification) explains how tools report those limits and refuse an unverifiable name.
 
-Agent seats read presence on demand with `CotalEndpoint.readPresence()`. User-auth connections call `auth.roster`; static connections call `manager.roster`. A separate read-only connection serves each command. Concurrent reads share one request, and an earlier peer missing from a later read stays visible as offline. A refused read reports a failure and a last-known roster, never an empty space. Agent credentials cannot raw-read or watch presence. See [presence reads](embedding-endpoints.mdx#on-demand-presence).
+Agent seats read presence on demand with `CotalEndpoint.readPresence()`. User-auth connections call `auth.roster`; static and token-authenticated connections call `manager.roster`. Static managers use a separate read-only presence connection; token-mode managers serve from their existing presence watch cache. Concurrent reads share one request, and an earlier peer missing from a later read stays visible as offline. A refused read reports a failure and a last-known roster, never an empty space. Authenticated agent credentials cannot raw-read or watch presence. See [presence reads](embedding-endpoints.mdx#on-demand-presence).
 
-Open and shared broker-token meshes have no per-profile grant boundary and use direct presence reads.
+Open-mode agents have no per-profile grant boundary and retain direct presence reads.
 
 Seats read the channel registry the same way, with `CotalEndpoint.readChannels()`. One read at connect fills the boot briefing. `cotal_channels`, `cotal_channel_info`, and every join and leave read again first, so an entry an operator adds or removes later is seen, and a seat holds no consumer on the registry.
 

@@ -40,6 +40,7 @@ import {
   epCall, epRequestSubject, epCallerReplyFilter, EpEnvelopeError, parseAuthRosterOutput,
   serveIssuanceGateKv,
   type CredentialLedgerRow,
+  type Presence,
 } from "@cotal-ai/core";
 import { authDir, saveSpaceAuth } from "@cotal-ai/workspace";
 import { Manager } from "../src/manager.js";
@@ -68,7 +69,7 @@ const releaseBroker = teardownOnSignal(srv, dir);
 
 const mgr = new Manager({ space, servers: SERVERS, runtime: "pty", workspaceRoot });
 // The smoke reaches private state ONLY to observe/force fence states the wire cannot cheaply
-// produce (retired principal, resume-pending) and to read the minted serve identity.
+// produce (retired principal, resume-pending), read the minted serve identity, and observe the manager-owned roster reader.
 const M = mgr as unknown as {
   managerLifecycleUid: string;
   managerInstanceId: string; // P2 item 3: the PERSISTED logical registration id (distinct from the per-process managerLifecycleUid)
@@ -76,6 +77,12 @@ const M = mgr as unknown as {
   retiredPrincipals: Set<string>;
   resumeRequired: boolean;
   withEndpointServeExecutor: <T>(fn: (kvs: { recordsKv: KV; authKv: KV }) => Promise<T>) => Promise<T>;
+  auth: unknown;
+  userMode: boolean;
+  remoteAuthority: object | undefined;
+  rosterReader?: Promise<{ read(): Promise<Presence[]> }>;
+  managerRosterReader?: { read(): Promise<Presence[]> };
+  managerEndpointTransportConnected: boolean;
 };
 
 try {
@@ -151,7 +158,7 @@ try {
   const caller = { owner: DEV_OWNER, actor: callerId.id, uid: callerUid };
   const callerCreds = await mintCreds(auth, callerId, "agent", {
     lifecycleUid: callerUid,
-    endpointCapabilities: [{ endpoint: MANAGER_ENDPOINT, command: "status" }, { endpoint: MANAGER_ENDPOINT, command: "ps" }],
+    endpointCapabilities: [{ endpoint: MANAGER_ENDPOINT, command: "status" }, { endpoint: MANAGER_ENDPOINT, command: "ps" }, { endpoint: MANAGER_ENDPOINT, command: "roster" }],
   });
   const callerNc = await connect({ servers: SERVERS, ...standaloneConnectOpts({ creds: callerCreds, tls: false }), maxReconnectAttempts: 0 });
   // checklist 6: the `one`-rail currency reader is the GATE's processEpoch (the service epoch
@@ -167,8 +174,50 @@ try {
   const rawRequest = enc.encode(JSON.stringify({ last_by_subj: `$KV.cotal_presence_${space}.${rosterRow.card.id}` }));
   const trusted = await connect({ servers: SERVERS, ...standaloneConnectOpts({ creds: await mintCreds(auth, newIdentity(), "auth-roster-reader"), tls: false }) });
   const trustedReply = await trusted.request(rawSubject, rawRequest, { timeout: 1500 });
-  check("trusted reader can issue the same Direct Get", trustedReply.headers?.get("Nats-Subject") === `$KV.cotal_presence_${space}.${rosterRow.card.id}` && trustedReply.data.length > 0);
+  check("auth roster reader control can issue the same Direct Get", trustedReply.headers?.get("Nats-Subject") === `$KV.cotal_presence_${space}.${rosterRow.card.id}` && trustedReply.data.length > 0);
   await trusted.drain();
+  const managerReader = M.rosterReader;
+  const managerRows = managerReader ? await (await managerReader).read() : [];
+  check("static manager hosts roster with its dedicated reader, which reads the returned presence row",
+    managerReader !== undefined && managerRows.some((row) => row.card.id === rosterRow.card.id), managerRows);
+  const savedAuth = M.auth;
+  const savedUserMode = M.userMode;
+  const savedRemoteAuthority = M.remoteAuthority;
+  const savedTransport = M.managerEndpointTransportConnected;
+  const staticReader = M.rosterReader;
+  try {
+    M.auth = undefined;
+    M.userMode = false;
+    M.remoteAuthority = undefined;
+    const tokenRoster = await epCall(callerNc, space, { mode: "one" },
+      { endpoint: MANAGER_ENDPOINT, command: "roster", contract: MANAGER_CONTRACTS.roster, caller, args: {} },
+      { deadlineMs: 8000, currentEpoch: serviceEpochReader });
+    const tokenRows = tokenRoster.reply.ok ? parseAuthRosterOutput(tokenRoster.reply.data).rows : [];
+    check("token-mode manager serves roster from its existing presence watch cache",
+      tokenRoster.reply.ok && tokenRows.some((row) => row.card.id === rosterRow.card.id)
+        && M.rosterReader === staticReader && M.managerRosterReader !== undefined, tokenRoster);
+    const cachedReader = M.managerRosterReader;
+    M.managerEndpointTransportConnected = false;
+    let cacheReadError = "";
+    try { await cachedReader?.read(); } catch (error) { cacheReadError = (error as Error).message; }
+    check("token-mode roster cache refuses a read while endpoint transport is down",
+      cacheReadError.includes("connection is unavailable"), cacheReadError);
+    M.managerEndpointTransportConnected = savedTransport;
+    M.userMode = true;
+    M.remoteAuthority = { owner: DEV_OWNER, actors: { supervisor: "supervisor" } };
+    const userModeRoster = await epCall(callerNc, space, { mode: "one" },
+      { endpoint: MANAGER_ENDPOINT, command: "roster", contract: MANAGER_CONTRACTS.roster, caller, args: {} },
+      { deadlineMs: 8000, currentEpoch: serviceEpochReader });
+    check("user-mode manager refuses roster because auth owns that surface",
+      !userModeRoster.reply.ok && userModeRoster.reply.error.code === "unavailable", userModeRoster.reply);
+    M.userMode = false;
+    M.remoteAuthority = undefined;
+  } finally {
+    M.managerEndpointTransportConnected = savedTransport;
+    M.auth = savedAuth;
+    M.userMode = savedUserMode;
+    M.remoteAuthority = savedRemoteAuthority;
+  }
   let rawError: unknown;
   try { await callerNc.request(rawSubject, rawRequest, { timeout: 1500 }); }
   catch (error) { rawError = error; }
