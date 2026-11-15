@@ -32,6 +32,8 @@ import {
   mintMembershipObserverCreds,
   mintCreds,
   newIdentity,
+  mintLifecycleUid,
+  DEV_OWNER,
   serverConfig,
   ROTATION_RENEWED_TTL_SEC,
   STANDING_RENEWABLE_TTL_SEC,
@@ -202,6 +204,20 @@ try {
   check("delivery is bounded now that the manager-remint reload seam exists (slice 5 class 2)", credentialLifetime("delivery").defaultTtlSeconds === STANDING_RENEWABLE_TTL_SEC && typeof dlv.uc.exp === "number", dlv.uc.exp);
   const mrw = await parseCreds(enc(await mintCreds(auth, newIdentity(), "membership-rw")));
   check("membership-rw is bounded now that the manager-remint reload seam exists (slice 5 class 2)", credentialLifetime("membership-rw").defaultTtlSeconds === STANDING_RENEWABLE_TTL_SEC && typeof mrw.uc.exp === "number", mrw.uc.exp);
+
+  const reconcilerCaller = { owner: DEV_OWNER, actor: "reconciler", uid: mintLifecycleUid() };
+  const reconcilerCreds = await mintCreds(auth, newIdentity(), "reconciler", {
+    principal: { owner: DEV_OWNER, actor: reconcilerCaller.actor }, reconciler: reconcilerCaller,
+  });
+  const reconcilerClaims = await parseCreds(enc(reconcilerCreds));
+  const reconcilerLifetime = credentialLifetime("reconciler");
+  check("reconciler has a bounded standing-renewable lifetime and its minted credential carries the 24-hour exp",
+    reconcilerLifetime.class === "standing-renewable"
+      && reconcilerLifetime.defaultTtlSeconds === STANDING_RENEWABLE_TTL_SEC
+      && reconcilerLifetime.renewalOwner === "reconciler service"
+      && Boolean(reconcilerClaims.uc.exp && reconcilerClaims.uc.exp - now <= STANDING_RENEWABLE_TTL_SEC + 5
+        && reconcilerClaims.uc.exp - now > STANDING_RENEWABLE_TTL_SEC - 60),
+    { lifetime: reconcilerLifetime, claims: reconcilerClaims.uc });
 
   const obs = newIdentity();
   const obsCreds = await mintMembershipObserverCreds(auth, obs);

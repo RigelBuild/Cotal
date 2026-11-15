@@ -311,6 +311,11 @@ export const AUTH_ENDPOINT = "auth";
  *  authz mode `handle` (arity 3), the exact argument tuple it takes: `owner`/`any` resolve against
  *  the CURRENT mapping, which is the wrong semantics for retiring a NAMED incarnation. */
 export const EP_CMD_RETIRE_LIFECYCLE = "retire-lifecycle";
+/** The auth endpoint's untargeted placement-participant commands (§13.2). */
+export const EP_CMD_VERIFY_PLACEMENT_ENROLLMENT = "verify-placement-enrollment";
+export const EP_CMD_ENROLLMENT_EFFECT_STATUS = "enrollment-effect-status";
+export const EP_CMD_CLOSE_ENROLLMENT_EFFECT = "close-enrollment-effect";
+export const EP_CMD_RETIRE_PLACEMENT_ENROLLMENT = "retire-placement-enrollment";
 
 // ---- serve / read filters (§13.2, §13.9) ----------------------------------------------------
 

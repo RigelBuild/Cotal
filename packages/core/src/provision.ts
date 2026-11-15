@@ -98,7 +98,7 @@ import { assertServeGrantMintable, finalizeServeIssuance, type EpServeGrant, typ
 import { parseServiceConnectionBinding, type ServiceConnectionBinding } from "./service-gate.js";
 import { SERVICE_ACCESS_TTL_SECONDS } from "./service-authority-limits.js";
 import { effectsBindGrants, poolOwnerBindGrants, goalWriterGrants, environmentManagerGoalWriterGrants, sessionLedgerGrants, epAuthBucket, sessionsBucket, epcStreamName, endpointPlaneStreamNames, eptReqStreamName, eptStreamName, hardenedAuthorityStreamNames, timerWriterDurable, timerWriterGrants } from "./endpoint-binding.js";
-import { epsSubject, epCallerReplyFilter, assertGeneration, isIssuedCaller, AUTH_ENDPOINT, EP_CMD_RETIRE_LIFECYCLE, type EpCaller, type IssuedCaller } from "./endpoint-subjects.js";
+import { epsSubject, epCallerReplyFilter, assertGeneration, isIssuedCaller, AUTH_ENDPOINT, EP_CMD_RETIRE_LIFECYCLE, EP_CMD_VERIFY_PLACEMENT_ENROLLMENT, EP_CMD_ENROLLMENT_EFFECT_STATUS, EP_CMD_CLOSE_ENROLLMENT_EFFECT, EP_CMD_RETIRE_PLACEMENT_ENROLLMENT, type EpCaller, type IssuedCaller } from "./endpoint-subjects.js";
 import { managerRegistrationFamilySubject } from "./endpoint-subjects.js";
 import { acceptedReadGrant, acceptedBucket, importNativeSubjectPermissions, issuedBucket, issuedHorizon, issuedPermitsPattern, issuedStoreStreamNames, prepareListing, writeAcceptedRow, type IssuanceSeam, type IssuedAuthorityRef, type ListingBinding, type ListingSeam, type PreparedListing } from "./issued-authority.js";
 import { REGISTRY_ENDPOINTS_GRANT } from "./registry-contract.js";
@@ -127,6 +127,7 @@ export type Profile =
   | "supervisor"
   | "provisioner"
   | "deprovisioner" // ephemeral, TARGET-PINNED teardown of ONE departed agent's id-keyed footprint
+  | "reconciler" // standing caller of the auth placement rail; its profile metadata bounds lifetime and renewal
   | "retirement-requester" // ephemeral request+reply on the auth-admin rail: asks the AUTH plane to retire a lifecycle; holds NO executing right
   | "lifecycle-executor" // ephemeral, LIFECYCLE-PINNED §13.1 state writes for the STATIC manager: exactly ONE incarnation's head/uid/gate/cred-row/slot keys
   | "endpoint-serve-executor" // ephemeral, ENDPOINT-INSTANCE-PINNED §13.1 endpoint-serve writes: exactly ONE (endpoint, instanceId)'s epgate + epcred family + eprepair cursor
@@ -223,7 +224,7 @@ export type Profile =
 /** Runtime list of credential profile labels for claim classification. */
 export const PROFILES = Object.freeze([
   "agent", "manager-caller", "observer", "admin", "supervisor", "provisioner", "deprovisioner",
-  "retirement-requester", "lifecycle-executor", "endpoint-serve-executor", "operator", "purger",
+  "reconciler", "retirement-requester", "lifecycle-executor", "endpoint-serve-executor", "operator", "purger",
   "backup", "restore", "delivery", "membership-rw", "probe", "channel-writer", "channel-purger",
   "teardown", "control-caller-privileged", "control-caller-admin", "deployer", "endpoint-serve",
   "goal-writer", "session-caller", "session-serving", "session-ledger", "run-driver", "run-mediator",
@@ -312,6 +313,8 @@ export const CREDENTIAL_LIFETIMES: Record<CredentialKind, CredentialLifetimePoli
   "membership-rw": { class: "standing-renewable", defaultTtlSeconds: STANDING_RENEWABLE_TTL_SEC, renewalOwner: "manager", note: "membership feed writer; seed-less - the manager re-signs the membership-rw.creds store key for the SAME nkey, the feed adopts it on a 75% preflight-proven renewal timer (its active self-heal), and delivery-admin reloadCreds is the explicit adoption on top" },
   provisioner: { class: "one-shot", defaultTtlSeconds: FIVE_MINUTES, note: "setup/spawn provisioning window only" },
   deprovisioner: { class: "one-shot", defaultTtlSeconds: FIVE_MINUTES, note: "target-pinned teardown window only" },
+  // Standing because the reconciler must resume durable placement work across process restarts.
+  reconciler: { class: "standing-renewable", defaultTtlSeconds: STANDING_RENEWABLE_TTL_SEC, renewalOwner: "reconciler service", note: "the reconciler service runs outside Cotal, holds the space account signer, and re-mints before expiry; the host account signer can issue wider credentials and remains a trusted residual; Cotal does not renew it" },
   "retirement-requester": { class: "one-shot", defaultTtlSeconds: FIVE_MINUTES, note: "one despawn's retirement request window; request+reply only" },
   "lifecycle-executor": { class: "one-shot", defaultTtlSeconds: FIVE_MINUTES, note: "one static lifecycle operation's 13.1 state-write window (activation / terminal / renewal ledger append)" },
   "endpoint-serve-executor": { class: "one-shot", defaultTtlSeconds: FIVE_MINUTES, note: "one endpoint registration/serve-mint window (13.1 epgate CAS + epcred stage/revoke + eprepair cursor for one (endpoint, instanceId))" },
@@ -713,6 +716,9 @@ export interface MintOpts {
    *  never a peer's, never the role-shared `svc_<role>`, and structurally never a same-alias
    *  successor's (its names carry a different uid). Ignored by every other profile. */
   deprovisionTarget?: DeprovisionTarget;
+  /** `reconciler` profile only: the authenticated service caller triple for the untargeted
+   *  placement commands on the auth endpoint. Required and ignored by every other profile. */
+  reconciler?: { owner: string; actor: string; uid: string };
   /** `retirement-requester` profile only: the REQUESTING CALLER TRIPLE (the current space-manager's
    *  own `owner`/`actor`/`uid`) whose auth-endpoint request subject the credential may publish, and
    *  whose reply rail it may read. The subject IS the attribution: the auth plane's rail derives
@@ -1336,6 +1342,35 @@ export function permissionsFor(
     if (!opts.deprovisionTarget)
       throw new Error("permissionsFor: deprovisioner requires opts.deprovisionTarget ({principal, lifecycleUid} of the departed incarnation)");
     return deprovisionerPermissions(space, pr, opts.deprovisionTarget);
+  }
+  if (profile === "reconciler") {
+    const reconciler = opts.reconciler;
+    if (!reconciler)
+      throw new Error("permissionsFor: reconciler requires opts.reconciler ({owner, actor, uid} of the reconciler service caller)");
+    for (const [field, value] of [["owner", reconciler.owner], ["actor", reconciler.actor], ["uid", reconciler.uid]] as const)
+      if (typeof value !== "string" || value.length === 0)
+        throw new Error(`permissionsFor: reconciler requires opts.reconciler.${field} (the caller triple is <owner>.<actor>.<uid>)`);
+    if (reconciler.owner !== pr.owner)
+      throw new Error(`permissionsFor: reconciler owner mismatch: opts.reconciler.owner "${reconciler.owner}" does not match principal owner "${pr.owner}"`);
+    if (reconciler.actor !== pr.actor)
+      throw new Error(`permissionsFor: reconciler actor mismatch: opts.reconciler.actor "${reconciler.actor}" does not match principal actor "${pr.actor}"`);
+    const caller = { owner: reconciler.owner, actor: reconciler.actor, uid: reconciler.uid };
+    const rows = [
+      EP_CMD_VERIFY_PLACEMENT_ENROLLMENT,
+      EP_CMD_ENROLLMENT_EFFECT_STATUS,
+      EP_CMD_CLOSE_ENROLLMENT_EFFECT,
+      EP_CMD_RETIRE_PLACEMENT_ENROLLMENT,
+    ].flatMap((command) => epRequestGrantRows(space, { endpoint: AUTH_ENDPOINT, command }, caller));
+    return {
+      pub: {
+        allow: [
+          ...rows,
+          epDescribeAllGrantRow(space, caller),
+          `$JS.API.DIRECT.GET.${epcStreamName(space)}.${spacePrefix(space)}.epc.>`,
+        ],
+      },
+      sub: { allow: [epCallerReplyFilter(space, caller), `_INBOX_${pr.connId}.>`] },
+    };
   }
   if (profile === "retirement-requester") {
     // Ephemeral request+reply on the AUTH ENDPOINT rail:

@@ -48,9 +48,13 @@ import {
   recordReaderConfig, recordsKvStreamName, readerBindGrants,
   AUTHORITY_KIND_DEFS, callerReadableRecordKind,
   createSpaceAuth, mintCreds, newIdentity, permissionsFor, DEV_OWNER, mintLifecycleUid,
+  epRequestSubject, subjectMatches, AUTH_ENDPOINT,
+  EP_CMD_VERIFY_PLACEMENT_ENROLLMENT, EP_CMD_ENROLLMENT_EFFECT_STATUS,
+  EP_CMD_CLOSE_ENROLLMENT_EFFECT, EP_CMD_RETIRE_PLACEMENT_ENROLLMENT,
   runDriverGrants, runMediatorGrants, runDriverCaller, runOperatorGrants,
   type EpCapability,
 } from "@cotal-ai/core";
+import { AUTH_PLACEMENT_COMMANDS } from "../src/auth-service-contract.js";
 import { authorityWriterGrants, authorityBarrierGrants, barrierExecutorSettlementGrants, environmentManagerAdmissionIndexGrants, environmentManagerAdmissionWriterGrants, remoteManagerIssuerGrants } from "../src/authority-client.js";
 import { retirementExecutorClientGrants } from "../src/retirement-cleaner.js";
 import { drainApplierGrants, drainCancellerGrants, drainReconcilerGrants } from "../src/drain-repair.js";
@@ -821,8 +825,27 @@ c("the agent's control-surface reach is exactly its caller rows + the Appendix-B
 // with itself proves nothing. The uids are minted so the arity and token classes are real.
 console.log("4. the auth endpoint rail profiles (piece 3)");
 {
-  const T = { owner: "local", actor: "w1", lifecycleUid: mintLifecycleUid() };
   const CALLER = { owner: "local", actor: "mgr0", uid: mintLifecycleUid() };
+  const RECONCILER_CALLER = { owner: "local", actor: "reconciler", uid: mintLifecycleUid() };
+  const T = { owner: "local", actor: "w1", lifecycleUid: mintLifecycleUid() };
+  const reconciler = permissionsFor("reconciler", S, { ...RECONCILER_CALLER, connId: CONN }, { reconciler: RECONCILER_CALLER }) as {
+    pub: { allow: string[] }; sub: { allow: string[] };
+  };
+  c("core placement command constants match the auth service registry",
+    JSON.stringify(AUTH_PLACEMENT_COMMANDS) === JSON.stringify([
+      EP_CMD_VERIFY_PLACEMENT_ENROLLMENT,
+      EP_CMD_ENROLLMENT_EFFECT_STATUS,
+      EP_CMD_CLOSE_ENROLLMENT_EFFECT,
+      EP_CMD_RETIRE_PLACEMENT_ENROLLMENT,
+    ]));
+  const placementSubjectsMatch = AUTH_PLACEMENT_COMMANDS.every((command) => {
+    const subject = epRequestSubject(S, {
+      route: { mode: "one" }, endpoint: AUTH_ENDPOINT, command, caller: RECONCILER_CALLER, nonce: "n".repeat(22),
+    });
+    return reconciler.pub.allow.some((row) => subjectMatches(row, subject));
+  });
+  c("reconciler rows match each served placement subject", placementSubjectsMatch);
+
   const req = decode(await mintCreds(auth, newIdentity(), "retirement-requester", {
     retirementRequester: { ...CALLER, target: T },
   }));
