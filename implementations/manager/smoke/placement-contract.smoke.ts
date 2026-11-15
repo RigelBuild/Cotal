@@ -38,7 +38,7 @@ const root = mkdtempSync(join(tmpdir(), "cotal-placement-contract-"));
 try {
   const snapshot = { name: "default", revision: "r1", configRevision: "c1", modelRoles: { default: "provider/model" }, sha256: "abc" };
   const requested: string[] = [];
-  const authorizePlacement = (caller: EpServeContext["subject"]["caller"]) => caller.actor === "reconciler";
+  const authorizePlacement = (ctx: EpServeContext) => ctx.subject.caller.actor === "reconciler";
   const manager = new Manager({ space: "main", runtime: "pty", workspaceRoot: root, authorizePlacement, profileGet: async (name) => { requested.push(name); return snapshot; } });
   const absent = new Manager({ space: "main", runtime: "pty", workspaceRoot: root, authorizePlacement });
   // This test reaches the private service table without starting the broker.

@@ -220,7 +220,7 @@ import {
   type ServiceNameAuthority,
 } from "@cotal-ai/core";
 import { MANAGER_ENDPOINT, managerClusterArtifacts, managerCommandDefs, managerContractArtifactValues, type ManagerConnectorStatus, type ManagerStaticReconciliationFailure, type ManagerStaticReconciliationStatus, type ManagerStaticReconciliationSweep, type ManagerStatus, type ManagerStopImpact } from "./manager-service-contract.js";
-import { placementUnsupported } from "./placement-contract.js";
+import { placementServiceHandlers, type PlacementAuthorityCallbacks } from "./placement/service.js";
 import { measureManagerVitals } from "./vitals.js";
 import type { NatsConnection } from "@nats-io/transport-node";
 import type { KV } from "@nats-io/kv";
@@ -547,7 +547,9 @@ export interface ManagerOptions {
    *  roles config, and model catalog sources. Paths never come from the request. */
   profileGet?: (name: string) => Promise<{ name: string; revision: string; configRevision: string; modelRoles: Record<string, string>; sha256: string }>;
   /** Trusted composition verifies the authenticated reconciler service principal on each call. */
-  authorizePlacement?: (caller: EpServeContext["subject"]["caller"]) => boolean | Promise<boolean>;
+  authorizePlacement?: (context: EpServeContext) => boolean | Promise<boolean>;
+  /** Trusted reconciler placement operations over journal-owned state. */
+  placementAuthority?: PlacementAuthorityCallbacks;
   /** The selected registration requires every launched connector session to publish events. */
   eventsRequired?: boolean;
   /** Trusted registration policy withholds tool payloads for every seat. */
@@ -2010,6 +2012,7 @@ export class Manager {
   private readonly remoteAuthority?: NonNullable<ManagerOptions["remoteAuthority"]>;
   private readonly profileGet?: ManagerOptions["profileGet"];
   private readonly authorizePlacement?: ManagerOptions["authorizePlacement"];
+  private readonly placementAuthority?: ManagerOptions["placementAuthority"];
   private remoteExecutorCreds?: string;
   private remoteSupervisorCreds?: string;
   private remoteBundleRenewal?: Promise<void>;
@@ -2055,6 +2058,8 @@ export class Manager {
     if (opts.onServiceIdentity !== undefined && typeof opts.onServiceIdentity !== "function") throw new Error("manager onServiceIdentity must be a trusted embedding callback");
     if (opts.profileGet !== undefined && typeof opts.profileGet !== "function") throw new Error("manager profileGet must be a trusted embedding callback");
     if (opts.authorizePlacement !== undefined && typeof opts.authorizePlacement !== "function") throw new Error("manager authorizePlacement must be a trusted embedding callback");
+    if (opts.placementAuthority !== undefined && (opts.placementAuthority === null || typeof opts.placementAuthority !== "object"))
+      throw new Error("manager placementAuthority must be a trusted callback object");
     if (opts.execution !== undefined && opts.execution !== "runtime" && opts.execution !== "none")
       throw new Error(`unknown manager execution capability ${JSON.stringify(opts.execution)}`);
     if (opts.execution === "none" && ((opts.pooled !== undefined && typeof opts.pooled !== "boolean") ||
@@ -2076,6 +2081,7 @@ export class Manager {
     this.onServiceIdentity = opts.onServiceIdentity;
     this.profileGet = opts.profileGet;
     this.authorizePlacement = opts.authorizePlacement;
+    this.placementAuthority = opts.placementAuthority;
     this.eventsRequired = opts.eventsRequired === true;
     this.eventPayloadsWithheld = opts.eventPayloadsWithheld === true;
     this.maxSessions = opts.maxSessions;
@@ -4830,11 +4836,11 @@ export class Manager {
         throw new EpEnvelopeError("permission-denied", `${ctx.subject.command} is operator reach; the caller's current ledger grant does not carry "admin" (SPEC 13.2)`, undefined, "not-executed");
       return fn();
     };
-    const placementGated = async <T>(ctx: EpServeContext, fn: () => T | Promise<T>): Promise<T> => {
-      if (!this.authorizePlacement || !(await this.authorizePlacement(ctx.subject.caller)))
-        throw new EpEnvelopeError("permission-denied", "placement requires the authenticated reconciler service principal", undefined, "not-executed");
-      return fn();
-    };
+    const placementHandlers = placementServiceHandlers({
+      authorizePlacement: this.authorizePlacement,
+      profileGet: this.profileGet,
+      placementAuthority: this.placementAuthority,
+    });
     const targetAgent = (ctx: EpServeContext): ManagedAgent => {
       if (this.execution === "none") throw new EpEnvelopeError("unimplemented", this.executionRefusal());
       const t = ctx.request.target!; // targeted commands only: the serve boundary enforced body-target presence + fresh currency
@@ -4843,11 +4849,7 @@ export class Manager {
       return a;
     };
     return managerCommandDefs({
-      place: (ctx) => placementGated(ctx, () => placementUnsupported("RuntimeProvider rebind/create and private stage/bootstrap")),
-      observe: (ctx) => placementGated(ctx, () => placementUnsupported("retained placement observation and RuntimeProvider rebind")),
-      stopPlacement: (ctx) => placementGated(ctx, () => placementUnsupported("RuntimeProvider stop")),
-      prepareLaunch: (ctx) => placementGated(ctx, () => placementUnsupported("trusted workspace/profile/assets preparation")),
-      profileGet: (ctx) => placementGated(ctx, () => this.profileGet ? this.profileGet(String(args(ctx).name)) : placementUnsupported("configured trusted roles CUE profile source")),
+      ...placementHandlers,
       vitals: (ctx) => this.serveGated(ctx, () => measureManagerVitals()),
       // A remote Manager files every seat under its own owner, so only a user mesh's shared local
       // Manager narrows the count, and status never waits on a remote admin check.
