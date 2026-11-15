@@ -158,7 +158,7 @@ try {
   // authority), read fresh per reply — never a bare call.
   const serviceEpochReader = async () => (await readGate()).processEpoch;
   const roster = await epCall(callerNc, space, { mode: "one" },
-    { endpoint: MANAGER_ENDPOINT, command: "roster", contract: MANAGER_CONTRACTS.roster, caller },
+    { endpoint: MANAGER_ENDPOINT, command: "roster", contract: MANAGER_CONTRACTS.roster, caller, args: {} },
     { deadlineMs: 8000, currentEpoch: serviceEpochReader });
   check("agent reads roster through manager", roster.reply.ok && parseAuthRosterOutput(roster.reply.data).rows.length > 0, roster);
   const rawSubject = `$JS.API.DIRECT.GET.KV_cotal_presence_${space}`;

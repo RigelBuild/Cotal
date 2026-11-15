@@ -281,6 +281,8 @@ const BASELINE_PUB = [
   `cotal.epg.ep.one.delivery.join.u_abc.cli.${UID}.*`,
   `cotal.epg.ep.one.delivery.leave.u_abc.cli.${UID}.*`,
   `cotal.epg.ep.one.delivery.list.u_abc.cli.${UID}.*`,
+  `cotal.epg.ep.one.auth.roster.u_abc.cli.${UID}.*`,
+  `cotal.epg.ep.one.manager.roster.u_abc.cli.${UID}.*`,
   `cotal.epg.ep.one.manager.stop.self.u_abc.cli.${UID}.*`,
   `cotal.epg.ep.one.manager.turn-participate.self.u_abc.cli.${UID}.*`,
   `cotal.epg.ep.one.manager.turn-pending.self.u_abc.cli.${UID}.*`,
@@ -288,7 +290,7 @@ const BASELINE_PUB = [
   `cotal.epg.ep.one.manager.turn-unconfirmed.self.u_abc.cli.${UID}.*`,
   `cotal.epg.ep.one.manager.run-answer.self.u_abc.cli.${UID}.*`,
 ];
-c("no-capability mint carries EXACTLY the Appendix-B baseline ep rows (describe-all + delivery join/leave/list + self stop/turn-participate/turn-pending/turn-yield/turn-unconfirmed/run-answer), nothing wider",
+c("no-capability mint carries EXACTLY the Appendix-B baseline ep rows (describe-all + delivery join/leave/list + auth and manager roster + self stop/turn-participate/turn-pending/turn-yield/turn-unconfirmed/run-answer), nothing wider",
   JSON.stringify(without.pub.allow.filter((r) => r.includes(".ep.") || r.includes(".epj.")).sort())
   === JSON.stringify([...BASELINE_PUB].sort()),
   JSON.stringify(without.pub.allow.filter((r) => r.includes(".ep."))));
