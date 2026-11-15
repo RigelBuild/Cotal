@@ -236,15 +236,17 @@ export interface IssuedSourceRef {
   readonly key: string;
 }
 
-/** What the issuer persisted, create-only, before any material was returned. `expiresAt` (unix
- *  seconds) is REQUIRED when `sources` is empty: an issuance bound to no gate is a one-shot
- *  credential's, and its liveness is its expiry. It never passes the generation's horizon. */
+/** What the issuer persisted before material is returned. `expiresAt` is REQUIRED when there are no sources.
+ * JWT claim coordinates let a manager replay a deterministic signature without persisting its JWT or key. */
 export interface IssuedEvidence {
   readonly version: 1;
   readonly ref: IssuedAuthorityRef;
   readonly sources: readonly IssuedSourceRef[];
   readonly permissions: IssuedSubjectPermissions;
   readonly expiresAt?: number;
+  readonly issuedAt?: number;
+  readonly jwtExpiresAt?: number;
+  readonly jwtClaimsDigest?: string;
 }
 
 export type IssuedAttemptState = "prepared" | "active" | "aborted" | "revoked";
@@ -295,7 +297,7 @@ export function issuedSourceIndexKey(source: IssuedSourceRef, ref: IssuedAuthori
 }
 
 function evidenceSnapshot(value: IssuedEvidence): IssuedEvidence {
-  const raw = closed(value, ["version", "ref", "sources", "permissions", "expiresAt"], "issued evidence");
+  const raw = closed(value, ["version", "ref", "sources", "permissions", "expiresAt", "issuedAt", "jwtExpiresAt", "jwtClaimsDigest"], "issued evidence");
   if (raw.version !== 1 || !Array.isArray(raw.sources)) throw new Error("unsupported issued evidence");
   const ref = refSnapshot(raw.ref as IssuedAuthorityRef);
   const sources = Object.freeze((raw.sources as IssuedSourceRef[]).map(sourceSnapshot));
@@ -308,8 +310,39 @@ function evidenceSnapshot(value: IssuedEvidence): IssuedEvidence {
     throw new Error("an issuance bound to no source gate must carry expiresAt; nothing else can end its liveness");
   if (expiresAt !== undefined && expiresAt > issuedHorizon(ref.generation))
     throw new Error("issued evidence expiresAt must not pass its generation's horizon");
+  const issuedAt = raw.issuedAt;
+  const jwtExpiresAt = raw.jwtExpiresAt;
+  const jwtClaimsDigest = raw.jwtClaimsDigest;
+  for (const [name, time] of [["issuedAt", issuedAt], ["jwtExpiresAt", jwtExpiresAt]] as const)
+    if (time !== undefined && (typeof time !== "number" || !Number.isSafeInteger(time) || time <= 0))
+      throw new Error(`issued evidence ${name} must be a positive integer (unix seconds)`);
+  if (issuedAt !== undefined && jwtExpiresAt === undefined)
+    throw new Error("issued evidence issuedAt requires jwtExpiresAt");
+  if (jwtExpiresAt !== undefined && jwtClaimsDigest === undefined)
+    throw new Error("issued evidence jwtExpiresAt requires jwtClaimsDigest");
+  if (issuedAt !== undefined && jwtExpiresAt !== undefined && issuedAt >= jwtExpiresAt)
+    throw new Error("issued evidence JWT expiry must follow issuedAt");
+  if (jwtExpiresAt !== undefined && jwtExpiresAt > issuedHorizon(ref.generation))
+    throw new Error("issued evidence JWT expiry must not pass its generation's horizon");
+  if (jwtClaimsDigest !== undefined && (typeof jwtClaimsDigest !== "string" || !/^[0-9a-f]{64}$/.test(jwtClaimsDigest)))
+    throw new Error("issued evidence jwtClaimsDigest must be 64 lowercase SHA-256 hex characters");
   const permissions = readIssuedSubjectPermissions(raw.permissions);
-  return Object.freeze({ version: 1, ref, sources, permissions, ...(expiresAt !== undefined ? { expiresAt } : {}) });
+  return Object.freeze({ version: 1, ref, sources, permissions,
+    ...(expiresAt !== undefined ? { expiresAt } : {}),
+    ...(issuedAt !== undefined ? { issuedAt } : {}),
+    ...(jwtExpiresAt !== undefined ? { jwtExpiresAt } : {}),
+    ...(jwtClaimsDigest !== undefined ? { jwtClaimsDigest } : {}),
+  });
+}
+
+/** Store-selected issuedAt may differ on retry; every other field remains immutable. */
+function evidenceReplayIdentity(evidence: IssuedEvidence): Omit<IssuedEvidence, "issuedAt"> {
+  return Object.freeze({ version: evidence.version, ref: evidence.ref, sources: evidence.sources,
+    permissions: evidence.permissions,
+    ...(evidence.expiresAt !== undefined ? { expiresAt: evidence.expiresAt } : {}),
+    ...(evidence.jwtExpiresAt !== undefined ? { jwtExpiresAt: evidence.jwtExpiresAt } : {}),
+    ...(evidence.jwtClaimsDigest !== undefined ? { jwtClaimsDigest: evidence.jwtClaimsDigest } : {}),
+  });
 }
 
 /** The name the actor ledger carries as an issued source's bucket token: `cotal_actors_<space>`.
@@ -339,7 +372,16 @@ export function parseActorLedgerSource(source: IssuedSourceRef): { owner: string
   return { owner, actor, lifecycleUid };
 }
 
-export interface PreparedIssuance { readonly key: string }
+export interface PreparedIssuance {
+  readonly key: string;
+  readonly ref: IssuedAuthorityRef;
+  readonly revision: number;
+  readonly digest: string;
+  readonly state: "prepared" | "active";
+  readonly issuedAt?: number;
+  readonly jwtExpiresAt?: number;
+  readonly jwtClaimsDigest?: string;
+}
 
 /** The store bound to one space over one KV handle. The KV is the ISSUER's (a `issuer` or a
  *  `issued-reader` credential); a peer holds no grant on this bucket. */
@@ -423,7 +465,7 @@ export function openIssuedStore(kv: KV, jsm: JetStreamManager, space: string): I
   assertIssuedSpace(space);
   const bucket = issuedBucket(space);
   const stream = `KV_${bucket}`;
-  const staged = new WeakMap<PreparedIssuance, { evidence: IssuedEvidence; revision: number; digest: string; consumed: boolean }>();
+  const releasing = new Set<string>();
   const own = (ref: IssuedAuthorityRef): string => {
     if (ref.space !== space) throw new Error("issued reference names a foreign space");
     return issuedEvidenceKey(ref);
@@ -431,6 +473,18 @@ export function openIssuedStore(kv: KV, jsm: JetStreamManager, space: string): I
   // Every write carries its row's TTL and is refused at or after the generation's horizon. A
   // create is create-only on its key; an advance is a CAS from the revision it names.
   const create = (key: string, ref: IssuedAuthorityRef, value: unknown): Promise<number> => kv.create(key, bytes(value), rowTtl(ref));
+  const createOrVerify = async (key: string, ref: IssuedAuthorityRef, value: unknown): Promise<number> => {
+    try {
+      return await create(key, ref, value);
+    } catch (error) {
+      if (!isCasLoss(error)) throw error;
+      const existing = await read(key, "first");
+      if (existing === undefined) throw error;
+      if (canonicalJson(existing.value) !== canonicalJson(value))
+        throw new EpEnvelopeError("conflict", `issued row ${key} already exists with different content; immutable issuance state cannot be replaced`);
+      return existing.revision;
+    }
+  };
   const advance = async (key: string, ref: IssuedAuthorityRef, value: unknown, revision: number): Promise<void> => {
     await jsm.jetstream().publish(`$KV.${bucket}.${key}`, bytes(value), { expect: { lastSubjectSequence: revision }, ttl: rowTtl(ref) });
   };
@@ -498,36 +552,88 @@ export function openIssuedStore(kv: KV, jsm: JetStreamManager, space: string): I
   }
   return Object.freeze({
     async stage(input: IssuedEvidence): Promise<PreparedIssuance> {
-      const evidence = evidenceSnapshot(input);
-      const key = own(evidence.ref);
-      // A fresh generation only, before its horizon: an explicit read refuses first, the create-only
-      // CAS is the second line.
-      liveHorizon(evidence.ref.generation, nowSec());
-      if (await read(key, "first") !== undefined) throw new EpEnvelopeError("conflict", `generation ${evidence.ref.generation} already has issued evidence; a generation is never reused (SPEC 13.15)`);
+      const candidate = evidenceSnapshot(input);
+      const key = own(candidate.ref);
+      liveHorizon(candidate.ref.generation, nowSec());
+      const entry = await read(key, "first");
+      let evidence: IssuedEvidence;
+      if (entry === undefined) {
+        evidence = candidate.jwtExpiresAt !== undefined && candidate.issuedAt === undefined
+          ? evidenceSnapshot({ ...candidate, issuedAt: nowSec() })
+          : candidate;
+        try {
+          await create(key, evidence.ref, evidence);
+        } catch (error) {
+          if (!isCasLoss(error)) throw error;
+          const winner = await read(key, "first");
+          if (winner === undefined) throw error;
+          const recorded = evidenceSnapshot(winner.value as IssuedEvidence);
+          if (canonicalJson(evidenceReplayIdentity(recorded)) !== canonicalJson(evidenceReplayIdentity(candidate)))
+            throw new EpEnvelopeError("conflict", `generation ${candidate.ref.generation} already has different issued evidence; a generation cannot be rebound (SPEC 13.15)`);
+          evidence = recorded;
+        }
+      } else {
+        const recorded = evidenceSnapshot(entry.value as IssuedEvidence);
+        if (canonicalJson(evidenceReplayIdentity(recorded)) !== canonicalJson(evidenceReplayIdentity(candidate)))
+          throw new EpEnvelopeError("conflict", `generation ${candidate.ref.generation} already has different issued evidence; a generation cannot be rebound (SPEC 13.15)`);
+        evidence = recorded;
+      }
       const digest = rawDigest(canonicalJson(evidence));
-      await create(key, evidence.ref, evidence);
-      const revision = await create(issuedAttemptKey(evidence.ref), evidence.ref, { version: 1, state: "prepared", digest });
-      for (const source of evidence.sources) await create(issuedSourceIndexKey(source, evidence.ref), evidence.ref, { source, ref: evidence.ref });
-      const handle: PreparedIssuance = Object.freeze({ key });
-      staged.set(handle, { evidence, revision, digest, consumed: false });
-      return handle;
+      const attemptKey = issuedAttemptKey(evidence.ref);
+      if (await read(attemptKey) === undefined)
+        await createOrVerify(attemptKey, evidence.ref, { version: 1, state: "prepared", digest });
+      for (const source of evidence.sources) {
+        const sourceKey = issuedSourceIndexKey(source, evidence.ref);
+        const expected = { source, ref: evidence.ref };
+        const index = await read(sourceKey, "first");
+        if (index === undefined) await createOrVerify(sourceKey, evidence.ref, expected);
+        else if (canonicalJson(index.value) !== canonicalJson(expected))
+          throw new EpEnvelopeError("conflict", `issued source index ${sourceKey} conflicts with the replayed evidence`);
+      }
+      const attempt = await readAttempt(evidence.ref, digest);
+      if (attempt.state !== "prepared" && attempt.state !== "active")
+        throw new EpEnvelopeError("conflict", `generation ${evidence.ref.generation} is ${attempt.state}; only a prepared or active exact issuance can be replayed (SPEC 13.15)`);
+      return Object.freeze({ key, ref: evidence.ref, revision: attempt.revision, digest, state: attempt.state,
+        ...(evidence.issuedAt !== undefined ? { issuedAt: evidence.issuedAt } : {}),
+        ...(evidence.jwtExpiresAt !== undefined ? { jwtExpiresAt: evidence.jwtExpiresAt } : {}),
+        ...(evidence.jwtClaimsDigest !== undefined ? { jwtClaimsDigest: evidence.jwtClaimsDigest } : {}),
+      });
     },
     async release(prepared: PreparedIssuance, finalizeExisting: () => Promise<void>): Promise<void> {
-      const snap = staged.get(prepared);
-      if (snap === undefined || snap.consumed) throw new Error("unknown or already released issuance");
-      snap.consumed = true;
+      const row = closed(prepared, ["key", "ref", "revision", "digest", "state", "issuedAt", "jwtExpiresAt", "jwtClaimsDigest"], "prepared issuance");
+      if (typeof row.key !== "string" || typeof row.revision !== "number" || !Number.isSafeInteger(row.revision) || row.revision <= 0
+        || typeof row.digest !== "string" || (row.state !== "prepared" && row.state !== "active")
+        || (row.issuedAt !== undefined && (typeof row.issuedAt !== "number" || !Number.isSafeInteger(row.issuedAt) || row.issuedAt <= 0))
+        || (row.jwtExpiresAt !== undefined && (typeof row.jwtExpiresAt !== "number" || !Number.isSafeInteger(row.jwtExpiresAt) || row.jwtExpiresAt <= 0))
+        || (row.jwtClaimsDigest !== undefined && (typeof row.jwtClaimsDigest !== "string" || !/^[0-9a-f]{64}$/.test(row.jwtClaimsDigest))))
+        throw new Error("prepared issuance handle is malformed");
+      const ref = refSnapshot(row.ref as IssuedAuthorityRef);
+      const key = own(ref);
+      if (row.key !== key) throw new Error("prepared issuance handle names a different evidence key");
+      const { evidence, digest } = await readEvidence(ref);
+      if (row.issuedAt !== evidence.issuedAt || row.jwtExpiresAt !== evidence.jwtExpiresAt || row.jwtClaimsDigest !== evidence.jwtClaimsDigest)
+        throw new EpEnvelopeError("conflict", "prepared issuance handle JWT claims do not match its durable evidence");
+      if (row.digest !== digest) throw new EpEnvelopeError("conflict", "prepared issuance handle does not match its durable evidence");
+      const attempt = await readAttempt(ref, digest);
+      if (attempt.state !== row.state || attempt.revision !== row.revision)
+        throw new EpEnvelopeError("conflict", `generation ${ref.generation} is no longer ${row.state} at the recorded revision; release refused`);
+      if (row.state === "active") return;
+      if (releasing.has(key)) throw new EpEnvelopeError("conflict", `generation ${ref.generation} is already being released`);
+      releasing.add(key);
       try {
-        await finalizeExisting();
-        // At the revision the PREPARE observed, never a re-read one: a retirement that landed in
-        // between wins here, and re-reading would let a released credential ride a revoked attempt.
-        await advance(`attempt.${prepared.key}`, snap.evidence.ref, { version: 1, state: "active", digest: snap.digest }, snap.revision);
-      } catch (error) {
         try {
-          await retire(snap.evidence.ref);
-        } catch (cleanup) {
-          throw new AggregateError([error, cleanup], "issuance failed and its retirement is unconfirmed; no material may be released");
+          await finalizeExisting();
+          await advance(`attempt.${key}`, ref, { version: 1, state: "active", digest }, row.revision);
+        } catch (error) {
+          try {
+            await retire(ref);
+          } catch (cleanup) {
+            throw new AggregateError([error, cleanup], "issuance failed and its retirement is unconfirmed; no material may be released");
+          }
+          throw error;
         }
-        throw error;
+      } finally {
+        releasing.delete(key);
       }
     },
     retire,
@@ -793,7 +899,17 @@ export async function prepareListing(
  *  as the generation it names plus the retention margin, and is never written past its horizon. */
 export async function writeAcceptedRow(kv: KV, acceptedToken: string, ref: IssuedAuthorityRef): Promise<void> {
   const snap = refSnapshot(ref);
-  await kv.create(acceptedKey(acceptedToken), bytes({ version: 1, ref: snap }), rowTtl(snap));
+  const key = acceptedKey(acceptedToken);
+  const expected = { version: 1, ref: snap };
+  try {
+    await kv.create(key, bytes(expected), rowTtl(snap));
+  } catch (error) {
+    if (!isCasLoss(error)) throw error;
+    const existing = await kv.get(key);
+    if (!existing || existing.operation !== "PUT"
+      || canonicalJson(decodeRecordJson(existing.value, key, true)) !== canonicalJson(expected))
+      throw new EpEnvelopeError("conflict", `accepted token ${acceptedToken} already names a different or terminal row`);
+  }
 }
 
 
