@@ -157,6 +157,7 @@ export * from "./run-cancel.js";
 export * from "./run-submission.js";
 export * from "./run-submission-client.js";
 export * from "./issuer-session.js";
+export * from "./placement-enrollment.js";
 
 export * from "./service-gate.js";
 
