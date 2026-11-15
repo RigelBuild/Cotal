@@ -786,7 +786,7 @@ try {
     const { revokeAccountUser } = await import("@cotal-ai/core");
     await workspace.putSpaceAuth(workspace.workspaceSecretStore(root), await revokeAccountUser(pins, legacyRevokedKey, Math.floor(Date.now() / 1000)));
     const revokedExport = envelope((await runCotal(["doctor", "auth", "--space", SPACE, "--json"])).out).result?.exported?.find((entry) => entry.path === unmarked);
-    check("doctor reports a revoked unmarked export without trusting its profile", revokedExport?.state === "revoked" && revokedExport.profile === null && revokedExport.repair?.includes("trusted source") === true, revokedExport);
+    check("doctor classifies the revoked key on a valid unmarked export without trusting its profile", revokedExport?.state === "revoked" && revokedExport.profile === null && revokedExport.repair?.includes("trusted source") === true, revokedExport);
     const revokedJwt = jwtFromCreds(readFileSync(unmarked, "utf8"));
     assert.ok(revokedJwt);
     const signatureStart = revokedJwt.lastIndexOf(".") + 1;

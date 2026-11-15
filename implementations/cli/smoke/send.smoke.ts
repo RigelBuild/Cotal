@@ -475,6 +475,11 @@ try {
   );
   // Without --server the credential goes to the broker its space is registered at, never the default address.
   const registeredText = `registered-${randomUUID().slice(0, 6)}`;
+  const cwdCredsText = `cwd-registered-${randomUUID().slice(0, 6)}`;
+  const cwdCreds = await run(["send", "-t", "bob", cwdCredsText, "--creds", namedCreds], {}, undefined, 120_000, meshRoot);
+  await wait(400);
+  check("folder registration supplies the same verified holder-name space when --space is omitted",
+    cwdCreds.code === 0 && got.some((m) => m.route === "DM" && m.text === cwdCredsText && m.fromName === "named-sender"), { cwdCreds, got });
   const registered = await run(["send", "-t", "bob", registeredText, "--space", space, "--creds", explicitCreds]);
   await wait(400);
   check("explicit creds without --server reach the broker the space is registered at",

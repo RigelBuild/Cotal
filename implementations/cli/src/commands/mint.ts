@@ -79,9 +79,11 @@ function replaceNotes(replaced: Replaced | undefined, standing: boolean, profile
 
 /** Declared grants of a replaced agent credential whose issuer matches this space's account.
  *  This metadata is used only for a warning, never for authority or grant inheritance. */
-function heldGrants(standing: string, space: string, account: string): AgentGrants | undefined {
-  const claims = credsClaims(standing);
-  return claims.name === "agent" && (claims.nats?.issuer_account ?? claims.iss) === account ? agentGrants(claims.nats ?? {}, space) : undefined;
+function heldGrants(standing: string, space: string, auth: SpaceAuth): AgentGrants | undefined {
+  try {
+    const verified = verifyStaticUserCredential(standing, { accountPub: auth.account.pub, signingPub: auth.account.signingPub }, { allowOutOfWindow: true });
+    return verified.profile === "agent" ? agentGrants(credsClaims(standing).nats ?? {}, space) : undefined;
+  } catch { return undefined; }
 }
 
 const grantText = (grants: AgentGrants) => `read ${channelList(grants.read)}, post ${channelList(grants.post)} and ${grants.role ? `role ${grants.role}` : "no role"}`;
@@ -158,7 +160,12 @@ export async function mint(args: ParsedArgs): Promise<void> {
       try { text = new TextDecoder("utf-8", { fatal: true }).decode(bytes); identity = identityFromCreds(text); }
       catch { throw new CommandFailure("refused", "SCHEMA_INVALID", "the identity source has no matching native JWT subject and user nkey seed; contents were not printed"); }
       const claims = credsClaims(text);
-      if (profile === "agent" && claims.name === "agent" && (claims.nats?.issuer_account ?? claims.iss) === auth.account.pub) carried = agentGrants(claims.nats ?? {}, space);
+      let verifiedSource: ReturnType<typeof verifyStaticUserCredential>;
+      try { verifiedSource = verifyStaticUserCredential(text, { accountPub: auth.account.pub, signingPub: auth.account.signingPub }, { allowOutOfWindow: true }); }
+      catch { throw new CommandFailure("refused", "SCHEMA_INVALID", "--identity does not verify under this space's current issuer pins; it cannot supply a trusted profile or grants", { target: { ...target, identity: identity.id }, remedy: "mint a fresh key: run auth mint without --identity" }); }
+      if (profile === "agent" && verifiedSource.profile === "agent") carried = agentGrants(claims.nats ?? {}, space);
+      if (profile === "agent" && verifiedSource.profile !== "agent")
+        throw new CommandFailure("refused", "SCHEMA_INVALID", "--identity does not have a verified signed agent profile; choose an agent credential with a verified marker or mint a fresh identity", { target: { ...target, identity: identity.id } });
       if (profile === "agent" && !values["new-incarnation"]) {
         const candidate = new Set<string>();
         for (const subject of claims.nats?.pub?.allow ?? []) {
@@ -199,7 +206,7 @@ export async function mint(args: ParsedArgs): Promise<void> {
       if (standing !== undefined && !values.replace) throw new CommandFailure("refused", "CONFLICT", "the named standing credential already exists; it was not replaced", { target, remedy: "choose a new label or an explicit separate private --out path, or replace it with --replace once it has expired, if it has no expiry or if its key was revoked" });
       if (standing !== undefined) {
         replaced = replaceable(standing, name, target, accountRevocations(auth.account.jwt), auth);
-        replacedGrants = heldGrants(standing, space, auth.account.pub);
+        replacedGrants = heldGrants(standing, space, auth);
       }
     }
     let allowSubscribe: string[] | undefined, allowPublish: string[] | undefined, role: string | undefined, capabilities: string[] | undefined;
