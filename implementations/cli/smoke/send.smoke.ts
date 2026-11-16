@@ -475,7 +475,7 @@ try {
   // Without --server the credential goes to the broker its space is registered at, never the default address.
   const registeredText = `registered-${randomUUID().slice(0, 6)}`;
   const cwdCredsText = `cwd-registered-${randomUUID().slice(0, 6)}`;
-  const priorCotalHome = process.env.COTAL_HOME;
+  const priorRoutingCotalHome = process.env.COTAL_HOME;
   process.env.COTAL_HOME = isolatedEnv.COTAL_HOME;
   let cwdCreds: Awaited<ReturnType<typeof run>>;
   try {
@@ -486,8 +486,8 @@ try {
     try {
       setCurrent(space);
     } finally {
-      if (priorCotalHome === undefined) delete process.env.COTAL_HOME;
-      else process.env.COTAL_HOME = priorCotalHome;
+      if (priorRoutingCotalHome === undefined) delete process.env.COTAL_HOME;
+      else process.env.COTAL_HOME = priorRoutingCotalHome;
     }
   }
   await wait(400);
