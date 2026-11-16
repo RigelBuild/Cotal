@@ -109,6 +109,7 @@ import {
 import type { IdentityMintResult } from "./identity/commands.js";
 import { IdentityRetirementDriver, type IdentityRetirementServices } from "./identity/retirements.js";
 import { loadLaunchPersonaFile, PersonaSourceError, DEFAULT_SEAT_MINT_CAP } from "@cotal-ai/workspace";
+import { agentAuthState, agentCredsDir, agentLifecycleSecretFilePaths, agentSecretFilePaths, agentSecretKeyForFile, authDir, claimIdentityRecord, claimManagerSiblingIdentities, connectorInstallHint, DEFAULT_SEAT_CAP, DELIVERY_CREDS_KIND, extensionConnectors, findCotalRoot, getSpaceAuth, hasUserAuthState, loadExtensionsManifest, loadManagerInstanceIdentity, loadMeshes, localTrustOfSpace, manifestExtensionNames, materializeFromManifest, materializeSecretToFile, MEMBERSHIP_RW_CREDS_KIND, mergeLaunchOptions, probeLiveness, remintDaemonCreds, resolveAgentType, resolveOnPath, runtimeInstallHint, createManagerInstanceIdentity, SEAT_CAP_UNLIMITED, spaceKey, spaceMaterialKey, SYSTEM_CREDS_FILES, userAuthStateDir, workspaceSecretStore, writeRenewalRecord, type ManagerInstanceIdentity, type MeshEntry, type RenewalRecord, type SeatCap, type UserAuthInfo } from "@cotal-ai/workspace";
 import type { IdentityRecord } from "./identity/store.js";
 import type { ActionContext, AgentDef, RunAdmission, RunRevocation, AttachSession, Connector, ConnectorModelCatalog, ControlReply, CredHealth, DaemonStoreAnswer, DelegatedGrant, DeliveryLeaseInfo, EpCaller, EpErrorCode, EpErrorDetail, GrantOverreach, InlinePersona, IssuedSubjectPermissions, LaunchOpts, LaunchSpec, ManagedLifecycleHandoff, ManagerLeaseInfo, MeshLaunchAgent, Presence, RuntimeProvider, RuntimeReference, SecretStore, SecretStoreIdentity, SpaceAuth, StartupOutcome, UserAuthLaunch } from "@cotal-ai/core";
 import {
@@ -13036,6 +13037,7 @@ export class Manager {
       console.error(`! static reconcile refused alias=${item.alias} phase=${item.phase} uid=${item.lifecycleUid}: ${item.lastError}`);
       return;
     }
+    const live = this.agents.get(row.alias);
     let identityByUid: ReadonlyMap<string, IdentityRecord>;
     try {
       identityByUid = readIdentitySnapshot(this.identityStore);
@@ -13204,6 +13206,7 @@ export class Manager {
       const terminalRows: StaticManagedSlotRow[] = [];
       const plannedRows: Array<{ row: StaticManagedSlotRow; adopted: boolean }> = [];
       const joinedFlights: Array<Promise<StaticReconcileAttempt>> = [];
+      const restartRows: Array<{ row: StaticManagedSlotRow; record: SeatRecord }> = [];
       let identityByUid: ReadonlyMap<string, IdentityRecord> = new Map();
       let identitySnapshotAvailable = true;
       try {

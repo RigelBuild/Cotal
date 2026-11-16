@@ -3,6 +3,7 @@ import {
   EpEnvelopeError,
   mintAcceptedToken,
   mintGeneration,
+  mintLifecycleUid,
   mintPublicSeatUserJwt,
   principalKey,
   STATIC_GENERATION_HORIZON_SEC,
