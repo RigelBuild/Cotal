@@ -7,7 +7,7 @@ process.env.COTAL_HOME = home;
 
 const { recordMesh, findMesh, parsePositiveIntegerFlag, recordManagerSeatMintCap, readManagerSeatMintCap } = await import("@cotal-ai/workspace");
 const { maxSessionsFor } = await import("../src/commands/up.js");
-const { liveManagerWouldApplyMaxSessions, maxSessionsFromSuperviseArgv, liveManagerWouldApplySeatMintCap, seatMintCapFromSuperviseArgv } = await import("../src/lib/manager-proc.js");
+const { liveManagerWouldApplyMaxSessions, maxSessionsFromSuperviseArgv } = await import("../src/lib/manager-proc.js");
 
 let failures = 0;
 function check(label: string, cond: boolean, extra?: unknown): void {
@@ -45,18 +45,12 @@ try {
 
   const liveBare = "/usr/bin/node /opt/cotal/bin/dist/cotal.js supervise --space sized --server nats://127.0.0.1:35715";
   const liveSized = `${liveBare} --max-sessions 3`;
-  const liveMinted = `${liveBare} --seat-mint-cap 11`;
-  check("supervise argv reports the applied mint cap", seatMintCapFromSuperviseArgv(liveMinted) === 11);
-  check("equals-form supervise argv reports the applied mint cap", seatMintCapFromSuperviseArgv(`${liveBare} --seat-mint-cap=11`) === 11);
-  check("a matching live manager accepts the same mint cap", liveManagerWouldApplySeatMintCap(liveMinted, 11));
-  check("a live manager without the requested cap cannot apply it", !liveManagerWouldApplySeatMintCap(liveBare, 11));
   check("absent --max-sessions is not a recorded default", maxSessionsFromSuperviseArgv(liveBare) === undefined);
   check("a live supervisor argv reports its applied ceiling", maxSessionsFromSuperviseArgv(liveSized) === 3);
   check("equals-form argv reports the applied ceiling", maxSessionsFromSuperviseArgv(`${liveBare} --max-sessions=3`) === 3);
   check("a matching refresh may proceed", liveManagerWouldApplyMaxSessions(liveSized, 3) === true);
   check("an unapplied refresh must be refused", liveManagerWouldApplyMaxSessions(liveBare, 1) === false);
   check("an unreadable command line cannot prove a match", liveManagerWouldApplyMaxSessions(undefined, 1) === false);
-  check("the cap argument is a separate argv value", liveMinted.split(/\s+/).slice(-2).join(" ") === "--seat-mint-cap 11");
 } finally {
   rmSync(home, { recursive: true, force: true });
 }

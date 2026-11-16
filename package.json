@@ -1069,6 +1069,7 @@
     "smoke:console-ws-duplex": "tsx implementations/manager/smoke/console-ws-duplex.smoke.ts",
     "smoke:attach-host-persistence": "tsx implementations/cli/smoke/attach-host-persistence.smoke.ts",
     "smoke:max-sessions-persistence": "tsx implementations/cli/smoke/max-sessions-persistence.smoke.ts",
+    "smoke:seat-mint-cap:live": "tsx implementations/cli/smoke/seat-mint-cap-live.smoke.ts",
     "smoke:dist-freshness": "tsx bin/smoke/dist-freshness.smoke.ts",
     "smoke:gate-inventory": "tsx bin/smoke/gate-inventory.smoke.ts",
     "smoke:workspace-import-exports": "tsx bin/smoke/workspace-import-exports.smoke.ts",

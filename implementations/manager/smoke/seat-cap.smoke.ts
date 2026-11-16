@@ -328,7 +328,7 @@ try {
   check("a number round trips", readManagerSeatCap(ctx) === 7, readManagerSeatCap(ctx));
   recordManagerSeatCap(ctx, SEAT_CAP_UNLIMITED);
   check("and so does unlimited", readManagerSeatCap(ctx) === SEAT_CAP_UNLIMITED, readManagerSeatCap(ctx));
-  check("nothing recorded yet resolves to the default seat-mint cap of 32", (parsePositiveIntegerFlag("--seat-mint-cap", undefined) ?? readManagerSeatMintCap(ctx) ?? DEFAULT_SEAT_MINT_CAP) === 32 && DEFAULT_SEAT_MINT_CAP === 32);
+  check("nothing recorded yet resolves to the default seat-mint cap", (parsePositiveIntegerFlag("--seat-mint-cap", undefined) ?? readManagerSeatMintCap(ctx) ?? DEFAULT_SEAT_MINT_CAP) === DEFAULT_SEAT_MINT_CAP);
   recordManagerSeatMintCap(ctx, 9);
   check("a seat-mint cap round trips through the protected manager record", readManagerSeatMintCap(ctx) === 9);
   check("an explicit seat-mint cap overrides the saved value", parsePositiveIntegerFlag("--seat-mint-cap", "12") === 12);

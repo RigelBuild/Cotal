@@ -202,6 +202,7 @@ import {
   canonicalLocalProcessPath,
   DELIVERY_LOGFILE,
   terminalWidth,
+  DEFAULT_SEAT_MINT_CAP,
   seatCapText,
   type ControlAuth,
 } from "@cotal-ai/workspace";
@@ -222,7 +223,7 @@ import { deliveryStoppedByDown, deliveryUp, ensureControlPlane, ensureDelivery, 
 import { RESPONDER_UNBOUND_CONSEQUENCE } from "../lib/delivery-responder.js";
 import { displayCmd } from "../lib/self-exec.js";
 import { shellWord } from "../lib/endpoint-errors.js";
-import { clearManagerArtifacts, liveManagerWouldApplyMaxSessions, liveManagerWouldApplySeatMintCap, managerHasDeliveryMarker, managerLogDisplayPath, managerRecordState, managerUp, stopManager } from "../lib/manager-proc.js";
+import { clearManagerArtifacts, liveManagerWouldApplyMaxSessions, managerHasDeliveryMarker, managerLogDisplayPath, managerRecordState, managerUp, stopManager } from "../lib/manager-proc.js";
 import { ManifestError, formatIssue, loadManifest, type PreparedManifest } from "../lib/manifest/index.js";
 import { UnusableFile } from "../lib/unusable-file.js";
 import { buildLaunchSpec, genRunId, manifestToChannels, preflightConnectors, writeLaunchSpec } from "../lib/manifest/apply.js";
@@ -399,7 +400,7 @@ export const upFlags: FlagSpec[] = [
   { name: "max-sessions", type: "string", value: "<n>", description: "live-session ceiling for the mesh manager (default 64; one session per console pane, so size for agents × panes). Recorded and reused by later manager launches" },
   { name: "manager-name", type: "string", value: "<name>", description: "name this root's manager for who --all, the manager choice and --on; kept for later starts" },
   { name: "seat-cap", type: "string", value: "<n|unlimited>", description: "live seats this root's manager admits per owner (default unlimited); kept for later starts" },
-  { name: "seat-mint-cap", type: "string", value: "<n>", description: "positive seat-mint ceiling for this root's manager (default 32); kept for later starts" },
+  { name: "seat-mint-cap", type: "string", value: "<n>", description: `positive seat-mint ceiling for this root's manager (default ${DEFAULT_SEAT_MINT_CAP}); kept for later starts` },
   { name: "no-manager", type: "boolean", description: "broker-only boot: start the broker and, in auth mode, the delivery daemon, and no local manager (refuses on a mesh whose manager is live)" },
   { name: "file", type: "string", short: "f", value: "<cotal.yaml>", description: "launch a whole mesh from a manifest" },
   { name: "dry-run", type: "boolean", description: "with -f: print the plan, mutate nothing" },
@@ -1650,7 +1651,6 @@ async function runUp(args: ParsedArgs, inheritedLock?: MaintenanceLock, onAdopt?
         idp: values.idp,
         rotateSys: values["rotate-sys"],
         maxSessions,
-        seatMintCap,
         noManager,
         storeDir: values["store-dir"],
         logFile,
@@ -1972,13 +1972,6 @@ async function runUp(args: ParsedArgs, inheritedLock?: MaintenanceLock, onAdopt?
           process.exit(1);
         }
       }
-      if (seatMintCap !== undefined) {
-        const live = managerRecordState(held.space);
-        if (live.state === "alive" && !liveManagerWouldApplySeatMintCap(live.command, seatMintCap)) {
-          console.error(c.red(`✗ mesh "${held.space}" is already running at ${server} - a running manager can't change --seat-mint-cap (it is fixed at start); \`cotal down\` it first, then \`cotal up --seat-mint-cap ${seatMintCap}\``));
-          process.exit(1);
-        }
-      }
       // `--no-manager` on a refresh whose manager is LIVE is the same class of refusal: this branch
       // starts nothing, so the flag cannot apply, and silently keeping the manager would answer a
       // broker-only ask with a full stack while silently stopping it would kill agents this command
@@ -2137,7 +2130,6 @@ async function runUp(args: ParsedArgs, inheritedLock?: MaintenanceLock, onAdopt?
         open: held.mode === "open",
         runtime: values.runtime,
         attachHost: attachHostFor(held.space, values.host),
-        seatMintCap: readManagerSeatMintCap({ root: cotalRoot(), space: held.space }),
       }, startAuth);
       if (!controlPlane) process.exitCode = 1;
       // #883: a refresh that HEALED a missing manager must say so — the summary line otherwise reads
@@ -2242,7 +2234,6 @@ async function runUp(args: ParsedArgs, inheritedLock?: MaintenanceLock, onAdopt?
       host: values.host,
       runtime: values.runtime,
       maxSessions,
-      seatMintCap,
       noManager,
       resumeAttempt,
       resumeCommit: commitTokenHandoff(cotalRoot(), (restored?.managerCommit ?? ordinaryAttempt?.managerCommit) !== undefined, startupLock),
@@ -2510,7 +2501,6 @@ async function runUp(args: ParsedArgs, inheritedLock?: MaintenanceLock, onAdopt?
       ...(values["recreate-issued-stores"] !== undefined ? { recreateIssuedStores: resolve(values["recreate-issued-stores"]) } : {}),
       host: values.host,
       maxSessions,
-      seatMintCap,
       maxFileStore,
       publicExchange,
       resumeAttempt,
@@ -3398,7 +3388,6 @@ export interface FreshTeamBootPlan {
   prepared: PreparedManifest;
   transport: BrokerTransport;
   maxSessions: number | undefined;
-  seatMintCap: number | undefined;
   logFile: string | undefined;
   logfileSizeLimit: number | undefined;
   logfileMaxNum: number | undefined;
@@ -3407,7 +3396,7 @@ export interface FreshTeamBootPlan {
 /** The fresh boot's read-only preparation, shared by the controller team boot. It runs the same
  *  manifest load, override, mode agreement, ownership, bind, runtime, reachability and connector
  *  refusals as the retained `upManifest` fresh path, in the same order, and writes nothing. */
-export async function prepareFreshTeamBoot(file: string, opts: { space: string; transport: BrokerTransport; server?: string; host?: string; runtime?: string; open?: boolean; userAuth?: boolean; idp?: string; maxSessions?: number; seatMintCap?: number }): Promise<FreshTeamBootPlan> {
+export async function prepareFreshTeamBoot(file: string, opts: { space: string; transport: BrokerTransport; server?: string; host?: string; runtime?: string; open?: boolean; userAuth?: boolean; idp?: string; maxSessions?: number }): Promise<FreshTeamBootPlan> {
   const flags: UpManifestFlags = { ...opts, dryRun: false, freshTeamBoot: true };
   let prepared: PreparedManifest;
   try { prepared = loadManifest(resolve(file)); }
@@ -3442,7 +3431,7 @@ export async function prepareFreshTeamBoot(file: string, opts: { space: string; 
   if (await isReachable(server)) throw new CommandFailure("refused", "CONFLICT", "the selected address already has a broker; fresh boot did not adopt it or start a competing listener", { target: { space: m.space, server: brokerAddressForDisplay(server) ?? "not displayable" } });
   const conn = await preflightConnectors(prepared);
   if (conn) throw new CommandFailure("refused", "DEPENDENCY_UNAVAILABLE", "connector preflight failed before the fresh boot intent; no native effect was requested", { target: { space: m.space }, remedy: conn });
-  return { root: canonicalRoot(cotalRoot()), space: m.space, server, host: m.broker?.host, mode, idp: m.broker?.idp, runtime, manifestPath: resolve(file), prepared: eff, transport: assertServesDialHost(opts.transport, new URL(server).hostname), maxSessions: opts.maxSessions, seatMintCap: opts.seatMintCap, logFile: m.broker?.logFile, logfileSizeLimit: m.broker?.logfileSizeLimit, logfileMaxNum: m.broker?.logfileMaxNum };
+  return { root: canonicalRoot(cotalRoot()), space: m.space, server, host: m.broker?.host, mode, idp: m.broker?.idp, runtime, manifestPath: resolve(file), prepared: eff, transport: assertServesDialHost(opts.transport, new URL(server).hostname), maxSessions: opts.maxSessions, logFile: m.broker?.logFile, logfileSizeLimit: m.broker?.logfileSizeLimit, logfileMaxNum: m.broker?.logfileMaxNum };
 }
 
 /** A stack's auth mode in words, and the manifest's `broker.auth` value that declares it. */
@@ -3489,7 +3478,7 @@ export async function prepareResumeTeamBoot(file: string, opts: { space: string;
   if (await isReachable(server)) throw new CommandFailure("refused", "CONFLICT", "the recorded broker address already answers; the stopped stack was not resumed over it", { target: { space: m.space, server: brokerAddressForDisplay(server) ?? "not displayable" } });
   const conn = await preflightConnectors(prepared);
   if (conn) throw new CommandFailure("refused", "DEPENDENCY_UNAVAILABLE", "connector preflight failed; nothing was resumed", { target: { space: m.space }, remedy: conn });
-  return { root: canonicalRoot(cotalRoot()), space: m.space, server, host: opts.recorded.host, mode, idp: m.broker?.idp, runtime, manifestPath: resolve(file), prepared: eff, transport: assertServesDialHost(opts.transport, new URL(server).hostname), maxSessions: undefined, seatMintCap: readManagerSeatMintCap({ root: cotalRoot(), space: m.space }), logFile: m.broker?.logFile, logfileSizeLimit: m.broker?.logfileSizeLimit, logfileMaxNum: m.broker?.logfileMaxNum };
+  return { root: canonicalRoot(cotalRoot()), space: m.space, server, host: opts.recorded.host, mode, idp: m.broker?.idp, runtime, manifestPath: resolve(file), prepared: eff, transport: assertServesDialHost(opts.transport, new URL(server).hostname), maxSessions: undefined, logFile: m.broker?.logFile, logfileSizeLimit: m.broker?.logfileSizeLimit, logfileMaxNum: m.broker?.logfileMaxNum };
 }
 
 /** The recorded broker transport of a prepared root, decided without persisting anything: a team
@@ -3748,7 +3737,7 @@ async function upManifest(file: string, opts: UpManifestFlags): Promise<void> {
   try {
     // `m.broker?.host`, not the defaulted `host`: same reason as the flag path — only a host the
     // manifest actually declared is an exposure decision worth persisting.
-    ({ pid, controlPlane, authService, deliveryResponderBound } = await startMeshDetached({ transport: opts.transport, server, space: m.space, open, userAuth, rotateSys: opts.rotateSys, host: m.broker?.host, logFile: m.broker?.logFile, logfileSizeLimit: m.broker?.logfileSizeLimit, logfileMaxNum: m.broker?.logfileMaxNum, seed: manifestToChannels(eff), runtime, launch: specPath, maxSessions: opts.maxSessions, seatMintCap: readManagerSeatMintCap({ root: cotalRoot(), space: m.space }), noManager: effectiveNoManager, quietBoot: opts.freshTeamBoot, ...(opts.storeDir ? { storeDir: opts.storeDir } : {}) }));
+    ({ pid, controlPlane, authService, deliveryResponderBound } = await startMeshDetached({ transport: opts.transport, server, space: m.space, open, userAuth, rotateSys: opts.rotateSys, host: m.broker?.host, logFile: m.broker?.logFile, logfileSizeLimit: m.broker?.logfileSizeLimit, logfileMaxNum: m.broker?.logfileMaxNum, seed: manifestToChannels(eff), runtime, launch: specPath, maxSessions: opts.maxSessions, noManager: effectiveNoManager, quietBoot: opts.freshTeamBoot, ...(opts.storeDir ? { storeDir: opts.storeDir } : {}) }));
   } catch (e) {
     if (opts.freshTeamBoot) throw new CommandFailure("unknown", "OPERATION_UNKNOWN", "the fresh broker startup did not confirm completion after its launch spec was written; the listener or control plane may have changed state and the boot was not retried", { target: { space: m.space, deploymentId, launchSpec: specPath }, changed: [{ kind: "launch-spec-written", path: specPath }], remedy: "inspect this exact run and the recorded local listener, manager and auth state before another boot" });
     // A classified failure, such as a certificate this client refuses, keeps its code and next step.
@@ -3852,8 +3841,6 @@ interface UpManifestFlags {
   rotateSys?: boolean;
   /** Operator-set live-session ceiling, recorded and handed to the manager started with the mesh. */
   maxSessions?: number;
-  /** Operator-set seat-mint ceiling, recorded and handed to the manager started with the mesh. */
-  seatMintCap?: number;
   /** #1417 broker-only boot: the broker (+ channels, + delivery daemon in auth mode) comes up and
    *  NO manager starts on this host. The manifest's agents are booted BY its manager, so a manifest
    *  declaring agents under `--no-manager` is a contradiction refused before anything boots. */
@@ -3931,7 +3918,6 @@ async function startDeliveryWithBroker(
     /** P2 item 6: broker ws listener port for the console session client. */
     wsPort?: number;
     maxSessions?: number;
-    seatMintCap?: number;
     /** #1417 broker-only mode: ensure the delivery daemon and not the manager. */
     noManager?: boolean;
     /** The mesh is open, so no delivery daemon starts, whatever accounts the root holds. */
@@ -4081,7 +4067,6 @@ async function serveReadyListener(l: {
   /** The raw `--host` flag, so the record can tell an operator's address from the loopback default. */
   host?: string;
   maxSessions?: number;
-  seatMintCap?: number;
   maxFileStore?: number;
   publicExchange?: string[];
   resumeAttempt?: string;
@@ -4116,7 +4101,6 @@ async function serveReadyListener(l: {
   // --preserve-state` then a bare `up`) carries the operator's `--host` only in the registry, and
   // the record below is written whole, so reading it afterwards would find the field this very call
   // had just erased.
-  const seatMintCap = readManagerSeatMintCap({ root: cotalRoot(), space });
   const attachHost = attachHostFor(space, l.host);
   recordOurMesh({
     space, server, root: cotalRoot(),
@@ -4152,7 +4136,6 @@ async function serveReadyListener(l: {
     // is never a side effect of anything but the operator binding the mesh somewhere reachable.
     attachHost,
     maxSessions: l.maxSessions,
-    seatMintCap,
     noManager: l.noManager,
     resumeAttempt: l.resumeAttempt,
     resumeCommit: l.resumeCommit,
@@ -4217,7 +4200,6 @@ export interface DetachOpts {
   resumeAttempt?: string;
   resumeCommit?: { path: string; sha256: string };
   maxSessions?: number;
-  seatMintCap?: number;
   /** #1417 broker-only boot (`--no-manager`): no manager starts with this broker. An `up -f` under
    *  the flag boots the broker + channels and launches NO agents from this host — a manifest's
    *  agents are booted by its manager, so a launch spec under `--no-manager` would promise a boot
@@ -4329,7 +4311,6 @@ export async function startMeshDetached(
     ...(opts.recreateIssuedStores !== undefined ? { recreateIssuedStores: opts.recreateIssuedStores } : {}),
     host: opts.host,
     maxSessions: opts.maxSessions,
-    seatMintCap: opts.seatMintCap,
     maxFileStore: opts.maxFileStore,
     publicExchange: opts.publicExchange,
     resumeAttempt: opts.resumeAttempt,

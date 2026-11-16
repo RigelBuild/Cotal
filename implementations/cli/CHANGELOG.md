@@ -4,7 +4,7 @@
 
 ### Patch Changes
 
-- Keep the manager seat-mint cap in its protected per-space record only. Ordinary starts, repairs, and manifest starts now pass that value to the manager without mirroring it in the mesh registry.
+- Keep the manager seat-mint cap in its protected per-space record only. Manager startup reads that record, and refresh no longer forwards a duplicate cap through manager argv.
 
 ## 0.151.2
 

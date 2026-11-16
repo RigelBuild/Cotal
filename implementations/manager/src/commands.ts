@@ -1083,7 +1083,7 @@ const managerCommands: Command[] = [
       { name: "ws-port", type: "string", value: "<n>", description: "broker ws listener port for the console session client" },
       { name: "max-sessions", type: "string", value: "<n>", description: "live-session ceiling (default 64; one session per console pane, so size for agents × panes)" },
       { name: "seat-cap", type: "string", value: "<n|unlimited>", description: "live seats this manager admits per owner (default unlimited); kept for later starts in this root" },
-      { name: "seat-mint-cap", type: "string", value: "<n>", description: "positive seat-mint ceiling (default 32); kept for later starts in this root" },
+      { name: "seat-mint-cap", type: "string", value: "<n>", description: `positive seat-mint ceiling (default ${DEFAULT_SEAT_MINT_CAP}); kept for later starts in this root` },
       { name: "name", type: "string", value: "<name>", description: "the name who --all, the manager choice and --on use for this manager; kept for later starts in this root" },
       { name: "spawn-allowlist", type: "string", value: "<path>", description: "JSON file of the exact names this manager may spawn (default: no allowlist)" },
       { name: "roster", type: "string", value: "<file>", description: "declarative roster to boot at startup" },
