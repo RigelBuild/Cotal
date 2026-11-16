@@ -11,7 +11,7 @@ import { jetstreamManager } from "@nats-io/jetstream";
 import { Kvm } from "@nats-io/kv";
 import {
   ensureIssuedStores, importNativeSubjectPermissions, issuedBucket, issuedHorizon, mintAcceptedToken, mintGeneration, openIssuedStore,
-  writeAcceptedRow,
+  acceptedBucket, acceptedKey, writeAcceptedRow,
   type IssuedAuthorityRef, type IssuedEvidence, type PreparedIssuance,
 } from "../src/issued-authority.js";
 import { SMOKE_BROKER_TOKEN, awaitBrokerReady, emitSentinel, killAndAwaitExit, teardownOnSignal } from "@cotal-ai/smoke-kit";
