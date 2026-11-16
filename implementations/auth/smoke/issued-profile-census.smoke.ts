@@ -9,7 +9,7 @@ import { connect, credsAuthenticator, type NatsConnection } from "@nats-io/trans
 import { encodeUser, fmtCreds, type User } from "@nats-io/jwt";
 import { createUser, fromPublic, fromSeed } from "@nats-io/nkeys";
 import { createSpaceAuth, serverConfig, isReachable, patternCovers, presenceBucket } from "@cotal-ai/core";
-import { SMOKE_BROKER_TOKEN, teardownOnSignal } from "@cotal-ai/smoke-kit";
+import { SMOKE_BROKER_TOKEN, emitSentinel, teardownOnSignal } from "@cotal-ai/smoke-kit";
 import { pickFreePort } from "../../../packages/core/smoke/_free-port.js";
 import { importNativeSubjectPermissions } from "../../../packages/core/smoke/prototypes/issued-subject-permissions.js";
 import { acceptedReadGrant } from "../../../packages/core/smoke/prototypes/issued-accepted-row.js";
@@ -365,6 +365,7 @@ try {
   };
   if (process.argv[2]) writeFileSync(process.argv[2], JSON.stringify(report, null, 2) + "\n");
   console.log(`issued profile census: ${passed} checks, ${report.profileCount} profiles, ${report.variantCount} variants, ${report.nativeProfileDecisions} native profile decisions`);
+  emitSentinel({ passed, failed: 0 });
 } finally {
   for (const nc of connections) await nc.close();
   if (broker.exitCode === null && broker.signalCode === null) broker.kill("SIGTERM");
