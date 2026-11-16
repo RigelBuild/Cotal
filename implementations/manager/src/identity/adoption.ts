@@ -5,6 +5,12 @@ export function readIdentitySnapshot(store: IdentityStore | undefined): Readonly
   return new Map((store?.list() ?? []).map((record) => [record.lifecycleUid, record]));
 }
 
+export function isLatchedIdentity(row: StaticManagedSlotRow, identityByUid: ReadonlyMap<string, IdentityRecord>): boolean {
+  const record = identityByUid.get(row.lifecycleUid);
+  return record?.terminalizing === true && record.retiredAt === undefined && record.name === row.alias &&
+    record.publicKey === row.actor && row.owner === DEV_OWNER;
+}
+
 export function isAdoptedIdentity(
   row: StaticManagedSlotRow,
   identityByUid: ReadonlyMap<string, IdentityRecord>,

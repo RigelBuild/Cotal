@@ -96,7 +96,7 @@ import {
   withIssuerSession,
   renderOnceTask,
 } from "@cotal-ai/core";
-import { isAdoptedIdentity, readIdentitySnapshot } from "./identity/adoption.js";
+import { isAdoptedIdentity, isLatchedIdentity, readIdentitySnapshot } from "./identity/adoption.js";
 import { IdentityRuntime } from "./identity/runtime.js";
 import { loadLaunchPersonaFile, PersonaSourceError, DEFAULT_SEAT_MINT_CAP } from "@cotal-ai/workspace";
 import { agentAuthState, agentCredsDir, agentLifecycleSecretFilePaths, agentSecretFilePaths, agentSecretKeyForFile, authDir, claimIdentityRecord, claimManagerSiblingIdentities, connectorInstallHint, DEFAULT_SEAT_CAP, DELIVERY_CREDS_KIND, extensionConnectors, findCotalRoot, getSpaceAuth, hasUserAuthState, loadExtensionsManifest, loadManagerInstanceIdentity, loadMeshes, localTrustOfSpace, manifestExtensionNames, materializeFromManifest, materializeSecretToFile, MEMBERSHIP_RW_CREDS_KIND, mergeLaunchOptions, probeLiveness, remintDaemonCreds, resolveAgentType, resolveOnPath, runtimeInstallHint, createManagerInstanceIdentity, SEAT_CAP_UNLIMITED, spaceKey, spaceMaterialKey, SYSTEM_CREDS_FILES, userAuthStateDir, workspaceSecretStore, writeRenewalRecord, type ManagerInstanceIdentity, type MeshEntry, type RenewalRecord, type SeatCap, type UserAuthInfo } from "@cotal-ai/workspace";
@@ -12875,7 +12875,7 @@ export class Manager {
             item.lastError = "identity backing store is unreadable; retry after repairing it";
             continue;
           }
-          if (row === undefined || row.lifecycleUid !== item.lifecycleUid || row.actor !== item.actor || (row.phase !== "active" && row.phase !== "provisioning") || live?.lifecycleUid === row.lifecycleUid || isAdoptedIdentity(row, identityByUid)) {
+          if (row === undefined || row.lifecycleUid !== item.lifecycleUid || row.actor !== item.actor || (row.phase !== "active" && row.phase !== "provisioning") || live?.lifecycleUid === row.lifecycleUid || isAdoptedIdentity(row, identityByUid) || isLatchedIdentity(row, identityByUid)) {
             this.staticReconcileItems.delete(key);
             console.error(`static reconcile deferred alias=${item.alias} uid=${item.lifecycleUid} left the deferred set: the durable slot is ${row === undefined ? "absent" : `${row.phase} at uid ${row.lifecycleUid}`}`);
             continue;
@@ -13010,6 +13010,7 @@ export class Manager {
       }
       throw error;
     }
+    if (isLatchedIdentity(row, identityByUid)) return;
     const adopted = live !== undefined && live.lifecycleUid === row.lifecycleUid || isAdoptedIdentity(row, identityByUid);
     if (planStaticSlotResume(row, adopted) !== "drive-terminal") {
       item.disposition = "refused";
@@ -13219,6 +13220,7 @@ export class Manager {
           console.error(`static reconcile deferred alias=${row.alias} uid=${row.lifecycleUid}: identity backing store is unreadable; retry after repairing it`);
           continue;
         }
+        if (isLatchedIdentity(row, identityByUid)) continue;
         const adopted = live !== undefined && live.lifecycleUid === row.lifecycleUid || isAdoptedIdentity(row, identityByUid);
         if (adopted) {
           preservedAdopted++;

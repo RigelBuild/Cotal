@@ -104,7 +104,7 @@ export class IdentityRetirementDriver {
   }
 
   scheduleDue(lifecycleUid: string, dueAtMs: number): void {
-    const delayMs = Math.max(0, dueAtMs - Date.now());
+    const delayMs = Math.max(0, dueAtMs - this.services().identityRetirementClock());
     const previous = this.#dueTimers.get(lifecycleUid);
     if (previous !== undefined) clearTimeout(previous);
     const timer = setTimeout(() => {

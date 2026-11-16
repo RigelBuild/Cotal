@@ -177,7 +177,8 @@ try {
   await manager.stop({ withAgents: true });
   manager = new Manager({ space, servers, runtime: "pty", workspaceRoot, seatMintCap: 2 });
   const retirementControls = manager as unknown as { identityRuntime: { clock: () => number; driver: { recheckIdentityRetirements(): Promise<void> } } };
-  retirementControls.identityRuntime.clock = () => (deadline + 59) * 1000;
+  const clockOffset = (deadline + 59) * 1000 - Date.now();
+  retirementControls.identityRuntime.clock = () => Date.now() + clockOffset;
   await manager.start();
   epoch = 2;
   service = await resolveService(nc, space, MANAGER_ENDPOINT, caller, { deadlineMs: 10_000 });
@@ -185,8 +186,9 @@ try {
   const stillHeld = await invokeCommand(nc, space, service, "identity-reserve", { name: "first" }, opts);
   assert.equal(stillHeld.reply.ok, false);
   console.log("PASS deferred retirement survives restart before deadline");
-  retirementControls.identityRuntime.clock = () => (deadline + 60) * 1000;
-  await retirementControls.identityRuntime.driver.recheckIdentityRetirements();
+  const retirementDeadline = Date.now() + 10_000;
+  while (store.get(reservation.name)?.retiredAt === undefined && Date.now() < retirementDeadline)
+    await new Promise((resolve) => setTimeout(resolve, 20));
   const replacement = await invokeCommand(nc, space, service, "identity-reserve", { name: "first" }, opts);
   assert.equal(replacement.reply.ok, true, JSON.stringify(replacement.reply));
   assert.ok(replacement.reply.data && typeof replacement.reply.data === "object" && "lifecycleUid" in replacement.reply.data);
