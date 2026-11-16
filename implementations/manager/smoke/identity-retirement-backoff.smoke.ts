@@ -30,13 +30,14 @@ store.recordRetirementExpiry = (name, minter, lifecycleUid) => {
   if (count === 1) throw new Error(`injected expiry failure for ${name}`);
   return recordExpiry(name, minter, lifecycleUid);
 };
-const renewalFlight = Promise.withResolvers<never>();
-setTimeout(() => renewalFlight.reject(new Error("injected slow renewal failure")), 1_100);
+const renewalFlight = new Promise<never>((_resolve, reject) => {
+  setTimeout(() => reject(new Error("injected slow renewal failure")), 1_100);
+});
 const driver = new IdentityRetirementDriver(() => ({
   identityStore: store,
   auth,
   identityMintFlights: new Map(),
-  identityRenewFlights: new Map([[second.lifecycleUid, renewalFlight.promise]]),
+  identityRenewFlights: new Map([[second.lifecycleUid, renewalFlight]]),
   staticReconcileStopping: false,
   managerLifecycleUid: "manager-lifecycle",
   managerInstanceId: "manager-instance",

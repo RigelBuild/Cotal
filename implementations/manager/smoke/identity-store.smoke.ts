@@ -8,15 +8,15 @@ import { isAdoptedIdentity } from "../src/identity/adoption.js";
 import { IdentityStore } from "../src/identity/store.js";
 
 function waitForFile(path: string, timeoutMs: number): Promise<void> {
-  const { promise, resolve, reject } = Promise.withResolvers<void>();
-  const deadline = Date.now() + timeoutMs;
-  const poll = (): void => {
-    if (existsSync(path)) return resolve();
-    if (Date.now() >= deadline) return reject(new Error(`timed out waiting for ${path}`));
-    setTimeout(poll, 10);
-  };
-  poll();
-  return promise;
+  return new Promise<void>((resolve, reject) => {
+    const deadline = Date.now() + timeoutMs;
+    const poll = (): void => {
+      if (existsSync(path)) return resolve();
+      if (Date.now() >= deadline) return reject(new Error(`timed out waiting for ${path}`));
+      setTimeout(poll, 10);
+    };
+    poll();
+  });
 }
 
 if (process.argv[2] === "reserve-worker") {

@@ -144,8 +144,10 @@ try {
   await new Promise((resolve) => setTimeout(resolve, 1100));
   const controlled = manager as unknown as { withIssuer: (...args: unknown[]) => Promise<unknown> };
   const originalIssuer = controlled.withIssuer.bind(manager);
-  const entered = Promise.withResolvers<void>();
-  const release = Promise.withResolvers<void>();
+  let signalEntered = (): void => {};
+  let signalRelease = (): void => {};
+  const entered = { promise: new Promise<void>((resolve) => { signalEntered = resolve; }), resolve: () => signalEntered() };
+  const release = { promise: new Promise<void>((resolve) => { signalRelease = resolve; }), resolve: () => signalRelease() };
   controlled.withIssuer = async (...args) => { entered.resolve(); await release.promise; return originalIssuer(...args); };
   const renewing = invokeCommand(nc, space, service, "identity-renew", { name: "first", publicKey: seat.id }, opts);
   await entered.promise;

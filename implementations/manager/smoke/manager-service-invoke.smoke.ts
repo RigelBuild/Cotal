@@ -35,6 +35,8 @@ import {
   MANAGER_VITALS_SCOPE, epBaselineGrantRows,
   resolveService, invokeCommand, registry, parseGoalResultFact, goalResultSubject, epfStreamName,
   epRequestGrantRows, epRequestSubject, credsClaims,
+  epCallerReplyFilter, parseEpSubject, deriveReplySubject,
+  type LaunchOpts, type LaunchSpec, type Connector, type EpAttributedReply,
   type EpCapability, type EpCaller,
 } from "@cotal-ai/core";
 
@@ -45,6 +47,10 @@ import { Manager } from "../src/manager.js";
 // hand-import schemas. The count comes from the cluster document, not a restated literal.
 import { MANAGER_ENDPOINT, managerShippedSurface } from "../src/manager-service-contract.js";
 import { SMOKE_BROKER_TOKEN, freePort, teardownOnSignal, killAndAwaitExit, emitSentinel } from "@cotal-ai/smoke-kit";
+const permissionDenial = (error: unknown): PermissionViolationError | undefined => {
+  const candidate = error instanceof PermissionViolationError ? error : error instanceof Error ? error.cause : undefined;
+  return candidate instanceof PermissionViolationError ? candidate : undefined;
+};
 const shipped = managerShippedSurface();
 function identityRequestSubject(caller: EpCaller, command: string): string {
   return epRequestSubject(space, {

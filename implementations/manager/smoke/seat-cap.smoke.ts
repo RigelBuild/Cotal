@@ -43,13 +43,16 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   isReachable, registry, parseCommandArgs, serverConfig, setupSpaceStreams, mintCreds, newIdentity, createSpaceAuth, DEV_OWNER,
-  type Command, type Connector, type ControlReply, type LaunchOpts, type LaunchSpec,
+  seatCapFrom, type Command, type Connector, type ControlReply, type LaunchOpts, type LaunchSpec,
 } from "@cotal-ai/core";
 import {
-  authDir, parseSeatCapFlag, parsePositiveIntegerFlag, seatCapFrom, readManagerSeatCap, recordManagerSeatCap, recordMesh, saveSpaceAuth,
+  authDir, parseSeatCapFlag, parsePositiveIntegerFlag, readManagerSeatCap, recordManagerSeatCap, recordMesh, saveSpaceAuth,
   SEAT_CAP_UNLIMITED, isCommandFailure, DEFAULT_SEAT_MINT_CAP, readManagerSeatMintCap, recordManagerSeatMintCap,
 } from "@cotal-ai/workspace";
 import { launchEnv } from "@cotal-ai/connector-core";
+import type { AgentConfig } from "../../../extensions/connector-core/src/config.js";
+import { cotalToolSpecs } from "../../../extensions/connector-core/src/tool-specs.js";
+import { Manager } from "../src/manager.js";
 // Dev-only smoke import of the sibling package's source, as the auth suites do: the tool spec
 // is not on connector-core's published surface, and the point of the cell is the shipped renderer.
 import { SMOKE_BROKER_TOKEN, emitSentinel, freePort, makeSeatRoot, teardownOnSignal } from "@cotal-ai/smoke-kit";
