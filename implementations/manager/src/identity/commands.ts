@@ -25,6 +25,7 @@ import {
   readStaticSlot,
 } from "../static-lifecycle.js";
 import { IdentityStore, type IdentityRecord } from "./store.js";
+import { waitForIdentityFlights } from "./retirements.js";
 export type IdentityMintResult = { name: string; jwt: string; lifecycleUid: string; exp: number; acceptedToken: string };
 export interface IdentityIssuerContext { store: IssuedStore; accepted: KV }
 
@@ -87,10 +88,7 @@ async function retireIdentity(services: IdentityCommandServices, ctx: EpServeCon
   const caller = record.minter;
   if (record.retiredAt !== undefined || record.issuance?.state === "retired") return {};
   store.latchRetirement(name, caller, record.lifecycleUid);
-  const mint = services.identityMintFlights.get(record.lifecycleUid);
-  if (mint) await mint.catch(() => {});
-  const renewal = services.identityRenewFlights.get(record.lifecycleUid);
-  if (renewal) await renewal.catch(() => {});
+  await waitForIdentityFlights(services, record.lifecycleUid);
   store.recordRetirementExpiry(name, caller, record.lifecycleUid);
   void services.recheckIdentityRetirements().catch((error) => console.error(`identity retirement sweep: ${error instanceof Error ? error.message : String(error)}`));
   return {};

@@ -6,10 +6,13 @@ import { tmpdir } from "node:os";
 import { setTimeout as delay } from "node:timers/promises";
 import { join } from "node:path";
 import { connect, type NatsConnection } from "@nats-io/transport-node";
+import { JetStreamApiCodes, JetStreamApiError, jetstreamManager } from "@nats-io/jetstream";
 import {
   createSpaceAuth,
   credRowKey,
   DEV_OWNER,
+  dmDurable,
+  dmStream,
   invokeCommand,
   isReachable,
   mintCreds,
@@ -22,6 +25,7 @@ import {
   setupSpaceStreams,
   standaloneConnectOpts,
   type LifecycleStateTransport,
+  type CotalEndpoint,
 } from "@cotal-ai/core";
 import { authDir, saveSpaceAuth } from "@cotal-ai/workspace";
 import { SMOKE_BROKER_TOKEN, awaitBrokerReady, freePort, killAndAwaitExit, teardownOnSignal } from "@cotal-ai/smoke-kit";
@@ -37,7 +41,8 @@ type ManagerInternals = {
   identityStore: IdentityStore;
   withLifecycleExecutor: LifecycleExecutor;
   identityRetirementClock: () => number;
-  recheckIdentityRetirements(): Promise<void>;
+  identityRetirementDriver: { recheckIdentityRetirements(): Promise<void>; start(uid: string): void };
+  withProvisioner<T>(fn: (provisioner: CotalEndpoint) => Promise<T>): Promise<T>;
   managerServeIdentity?: unknown;
   staticReconcileSweepsInFlight: number;
   staticReconcileLastSweep?: { completedAt?: string };
@@ -279,13 +284,92 @@ try {
   retirementControl.identityRetirementClock = () => (noSlotIssuance.exp + 61) * 1000;
   const retirement = await invokeCommand(nc, space, service, "identity-retire", { name: "retire-no-slot" }, callOptions);
   assert.equal(retirement.reply.ok, true, JSON.stringify(retirement.reply));
-  await retirementControl.recheckIdentityRetirements();
+  await retirementControl.identityRetirementDriver.recheckIdentityRetirements();
   retirementControl.identityRetirementClock = normalRetirementClock;
   assert.equal(noSlotStore.get(noSlotReservation.name)?.issuance?.state, "retired");
   assert.ok(noSlotStore.get(noSlotReservation.name)?.retiredAt);
   const retiredSlot = await slotFor(noSlotReservation.name, noSlotReservation.lifecycleUid, noSlotSeat.id);
   assert.equal(retiredSlot?.row.phase, "retired");
   console.log("PASS retirement settles a bound identity that had no static slot");
+
+  // Hold a real mint after DM provisioning while each retirement entry point runs.
+  for (const mode of ["command", "sweep"] as const) {
+    const slug = `race-${mode}`;
+    const reservation = await reserve(slug);
+    const seat = newIdentity();
+    const control = internals(manager);
+    const originalProvisioner = control.withProvisioner.bind(manager);
+    let releaseMint!: () => void;
+    let signalProvisioned!: () => void;
+    const held = new Promise<void>((resolve) => { releaseMint = resolve; });
+    const provisioned = new Promise<void>((resolve) => { signalProvisioned = resolve; });
+    control.withProvisioner = async <T>(fn: (provisioner: CotalEndpoint) => Promise<T>): Promise<T> =>
+      originalProvisioner(async (provisioner) => {
+        const provision = provisioner.provisionDmInbox.bind(provisioner);
+        provisioner.provisionDmInbox = async (...args) => {
+          const result = await provision(...args);
+          if (args[2] === reservation.lifecycleUid) { signalProvisioned(); await held; }
+          return result;
+        };
+        return fn(provisioner);
+      });
+    const mint = invokeCommand(nc, space, service, "identity-mint", mintInput(slug, reservation.lifecycleUid, seat.id), callOptions);
+    await provisioned;
+    const record = control.identityStore.get(reservation.name);
+    assert.ok(record?.issuance);
+    const oldClock = control.identityRetirementClock;
+    const retirementTime = (record.issuance.exp + 61) * 1000;
+    control.identityRetirementClock = () => retirementTime;
+    let mintHeld = true;
+    let passedBarrierWhileHeld = false;
+    let signalSweep!: () => void;
+    const sweepStarted = new Promise<void>((resolve) => { signalSweep = resolve; });
+    const driver = control.identityRetirementDriver;
+    const originalStart = driver.start.bind(driver);
+    driver.start = (uid) => { originalStart(uid); if (uid === reservation.lifecycleUid) signalSweep(); };
+    const originalExpiry = control.identityStore.recordRetirementExpiry.bind(control.identityStore);
+    control.identityStore.recordRetirementExpiry = (...args) => {
+      if (args[2] === reservation.lifecycleUid && mintHeld) passedBarrierWhileHeld = true;
+      return originalExpiry(...args);
+    };
+    let retirement: Promise<unknown>;
+    if (mode === "command") {
+      retirement = invokeCommand(nc, space, service, "identity-retire", { name: slug }, callOptions);
+      const latchDeadline = Date.now() + 5_000;
+      while (!control.identityStore.get(reservation.name)?.terminalizing && Date.now() < latchDeadline) await delay(10);
+      assert.equal(control.identityStore.get(reservation.name)?.terminalizing, true);
+      void driver.recheckIdentityRetirements();
+    } else {
+      control.identityStore.latchRetirement(reservation.name, record.minter, reservation.lifecycleUid);
+      retirement = driver.recheckIdentityRetirements();
+    }
+    await sweepStarted;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    mintHeld = false;
+    releaseMint();
+    await mint.catch(() => undefined);
+    await retirement;
+    driver.start = originalStart;
+    control.identityStore.recordRetirementExpiry = originalExpiry;
+    assert.equal(passedBarrierWhileHeld, false, `sweep during ${mode} retirement passed the flight barrier while mint was held`);
+    await control.identityRetirementDriver.recheckIdentityRetirements();
+    control.withProvisioner = originalProvisioner;
+    control.identityRetirementClock = oldClock;
+    assert.ok(control.identityStore.get(reservation.name)?.retiredAt, `${mode} retirement must finish`);
+    const probeId = newIdentity();
+    const probe = await connect({ servers, ...standaloneConnectOpts({ creds: await mintCreds(auth, probeId, "provisioner"), tls: false }), maxReconnectAttempts: 0 });
+    try {
+      const jsm = await jetstreamManager(probe);
+      let exists = true;
+      try { await jsm.consumers.info(dmStream(space), dmDurable(DEV_OWNER, seat.id, reservation.lifecycleUid)); }
+      catch (error) {
+        if (!(error instanceof JetStreamApiError) || error.code !== JetStreamApiCodes.ConsumerNotFound) throw error;
+        exists = false;
+      }
+      assert.equal(exists, false, `${mode} retirement must remove the DM durable`);
+    } finally { await probe.close(); }
+    console.log(`PASS ${mode} retirement waits for a mint and removes its DM durable`);
+  }
 
   // N simultaneous manager requests against a fresh manager's cap K must persist exactly K grants.
   await manager.stop({ withAgents: true });

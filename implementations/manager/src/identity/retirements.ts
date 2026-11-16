@@ -43,6 +43,7 @@ export class IdentityRetirementBackoff {
 export interface IdentityRetirementServices {
   readonly identityStore?: IdentityStore;
   readonly auth?: SpaceAuth;
+  readonly identityMintFlights: Map<string, Promise<IdentityMintResult>>;
   readonly identityRenewFlights: Map<string, Promise<IdentityMintResult>>;
   readonly staticReconcileStopping: boolean;
   readonly managerLifecycleUid: string;
@@ -54,6 +55,13 @@ export interface IdentityRetirementServices {
   readonly identityRetirementClock: () => number;
   withLifecycleExecutor<T>(pin: { owner: string; actor: string; lifecycleUid: string; alias: string }, fn: (transport: LifecycleStateTransport) => Promise<T>): Promise<T>;
   withIssuer<T>(fn: (issuer: IdentityIssuerContext) => Promise<T>): Promise<T>;
+}
+
+export async function waitForIdentityFlights(services: Pick<IdentityRetirementServices, "identityMintFlights" | "identityRenewFlights">, lifecycleUid: string): Promise<void> {
+  const mint = services.identityMintFlights.get(lifecycleUid);
+  if (mint) await mint.catch(() => {});
+  const renewal = services.identityRenewFlights.get(lifecycleUid);
+  if (renewal) await renewal.catch(() => {});
 }
 
 /** One single-flight retirement sweep with bounded exponential retry delays per identity UID. */
@@ -173,8 +181,7 @@ async function driveIdentityRetirementRow(services: IdentityRetirementServices, 
 }
 
 async function retireIdentity(services: IdentityRetirementServices, store: IdentityStore, row: IdentityRecord, driver: IdentityRetirementDriver): Promise<void> {
-  const active = services.identityRenewFlights.get(row.lifecycleUid);
-  if (active) await active.catch(() => {});
+  await waitForIdentityFlights(services, row.lifecycleUid);
   const current = store.recordRetirementExpiry(row.name, row.minter, row.lifecycleUid);
   const dueAt = ((current.retirementExpiry ?? 0) + 61) * 1000;
   if (services.identityRetirementClock() < dueAt) {

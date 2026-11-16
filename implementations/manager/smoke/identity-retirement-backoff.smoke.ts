@@ -35,6 +35,7 @@ setTimeout(() => renewalFlight.reject(new Error("injected slow renewal failure")
 const driver = new IdentityRetirementDriver(() => ({
   identityStore: store,
   auth,
+  identityMintFlights: new Map(),
   identityRenewFlights: new Map([[second.lifecycleUid, renewalFlight.promise]]),
   staticReconcileStopping: false,
   managerLifecycleUid: "manager-lifecycle",
