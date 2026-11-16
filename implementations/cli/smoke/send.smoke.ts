@@ -13,8 +13,9 @@
  * both buckets must be unchanged before and after the sends. The old watch, and the policy read's
  * scan, left one consumer per send on the bucket they read for five minutes. `cotal channel` on the
  * same operator credential reads the registry with a Direct Get and leaves no consumer either. An
- * agent credential uses manager-mediated presence and has no channel-registry watch.
- * A post to an unregistered channel reads that channel's retained count once with STREAM.INFO.
+ * agent credential uses manager-mediated presence and has no channel-registry watch. A credential
+ * that may not read presence is refused before anything is sent. A post to an unregistered channel
+ * reads that channel's retained count once with STREAM.INFO.
  *
  * Run: pnpm smoke:send
  */
@@ -48,12 +49,12 @@ import {
   type Delivery,
 } from "@cotal-ai/core";
 import { killAndAwaitExit, SMOKE_BROKER_TOKEN, teardownOnSignal, teardownPathOnSignal } from "@cotal-ai/smoke-kit";
-import { authDir, recordMesh, saveSpaceAuth, setCurrent } from "@cotal-ai/workspace";
+import { authDir, getCurrent, recordMesh, saveSpaceAuth, setCurrent } from "@cotal-ai/workspace";
 import { pickFreePort } from "../../../packages/core/smoke/_free-port.js";
 import { startRosterFixture } from "../../../packages/core/smoke/_roster-service.js";
 
 const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-const EXPECTED = 84;
+const EXPECTED = 85;
 let pass = 0;
 let fail = 0;
 const check = (name: string, cond: boolean, extra?: unknown) => {
@@ -107,6 +108,16 @@ const isolatedEnv: NodeJS.ProcessEnv = {
   COTAL_SKIP_CONNECTOR_SEED: "1",
   NO_COLOR: "1",
 };
+async function withCotalHome<T>(action: () => T | Promise<T>): Promise<T> {
+  const previous = process.env.COTAL_HOME;
+  process.env.COTAL_HOME = isolatedEnv.COTAL_HOME;
+  try {
+    return await action();
+  } finally {
+    if (previous === undefined) delete process.env.COTAL_HOME;
+    else process.env.COTAL_HOME = previous;
+  }
+}
 
 const run = (
   args: string[],
@@ -155,16 +166,11 @@ try {
   stopRoster = await startRosterFixture(space, servers, auth);
   await seedChannelRegistry({ servers, space, creds: provisionerCreds, file: { channels: { general: {} } } });
   saveSpaceAuth(authDir(meshRoot), auth);
-  const priorCotalHome = process.env.COTAL_HOME;
-  process.env.COTAL_HOME = isolatedEnv.COTAL_HOME;
-  try {
+  await withCotalHome(() => {
     recordMesh({ space, server: servers, root: meshRoot, mode: "auth", origin: "manual", ts: new Date().toISOString() });
     recordMesh({ space: "decoy", server: servers, root: decoyRoot, mode: "open", origin: "manual", ts: new Date().toISOString() });
     setCurrent(space);
-  } finally {
-    if (priorCotalHome === undefined) delete process.env.COTAL_HOME;
-    else process.env.COTAL_HOME = priorCotalHome;
-  }
+  });
   provisioner = new CotalEndpoint({
     space,
     servers,
@@ -474,12 +480,19 @@ try {
   // Without --server the credential goes to the broker its space is registered at, never the default address.
   const registeredText = `registered-${randomUUID().slice(0, 6)}`;
   const cwdCredsText = `cwd-registered-${randomUUID().slice(0, 6)}`;
-  setCurrent("decoy");
-  const cwdCreds = await run(["send", "-t", "bob", cwdCredsText, "--creds", namedCreds], {}, meshRoot);
-  setCurrent(space);
+  const priorRoutingSelection = getCurrent();
+  const cwdCreds = await withCotalHome(async () => {
+    setCurrent("decoy");
+    try {
+      return await run(["send", "-t", "bob", cwdCredsText, "--creds", namedCreds], {}, meshRoot);
+    } finally {
+      setCurrent(space);
+    }
+  });
   await wait(400);
   check("folder registration supplies the same verified holder-name space when --space is omitted",
     cwdCreds.code === 0 && got.some((m) => m.route === "DM" && m.text === cwdCredsText && m.fromName === "named-sender"), { cwdCreds, got });
+  check("folder-routing smoke leaves the caller's current mesh unchanged", getCurrent() === priorRoutingSelection, getCurrent());
   const registered = await run(["send", "-t", "bob", registeredText, "--space", space, "--creds", explicitCreds]);
   await wait(400);
   check("explicit creds without --server reach the broker the space is registered at",
