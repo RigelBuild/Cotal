@@ -18,7 +18,7 @@
  * Run: pnpm smoke:manager-reconcile-startup   (needs nats-server + node on PATH)
  */
 import { createHash, randomUUID } from "node:crypto";
-import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { connect } from "@nats-io/transport-node";
@@ -60,7 +60,7 @@ import {
   type EpCaller,
   type LaunchSpec,
 } from "@cotal-ai/core";
-import { authDir, createManagerInstanceIdentity, saveSpaceAuth, workspaceSecretStore } from "@cotal-ai/workspace";
+import { authDir, createManagerInstanceIdentity, saveSpaceAuth, spaceKey, workspaceSecretStore } from "@cotal-ai/workspace";
 import { Manager } from "../src/manager.js";
 import { LegacyPtyRuntime } from "../src/runtime/pty.js";
 import { MANAGER_ENDPOINT, MANAGER_CONTRACTS } from "../src/manager-service-contract.js";
@@ -213,6 +213,7 @@ try {
       }),
     };
   }, { boundReply: true });
+  writeFileSync(join(workspaceRoot, ".cotal", `manager-identities.${spaceKey(space)}.${managerInstanceId}.json`), "{invalid", { mode: 0o600 });
   for (let n = 0; n < ORPHANS; n++) await writeOrphan(`orphan-${n}`);
 
   observerNc = await connect({
@@ -411,7 +412,9 @@ try {
 
   await starting;
   const sweepSettled = await until(async () => (await phase(`orphan-${ORPHANS - 1}`)) === "retired", 20_000);
+  check("corrupt identity store does not block ordinary orphan reconciliation", sweepSettled, { phase: await phase(`orphan-${ORPHANS - 1}`) });
   check("startup sweep completes after the manager has served", sweepSettled, { phase: await phase(`orphan-${ORPHANS - 1}`) });
+  rmSync(join(workspaceRoot, ".cotal", `manager-identities.${spaceKey(space)}.${managerInstanceId}.json`));
 
   // THE BOOT SWEEP ADOPTING A PREDECESSOR'S ACCEPTED TURN. Two things were wrong with it and both
   // are invisible from outside: the agents map is EMPTY during reconcile (seats re-register later,
