@@ -36,7 +36,7 @@ try {
   check("an absent ceiling stays undefined", maxSessionsFor("defaulted") === undefined);
   check("an unknown space resolves to undefined", maxSessionsFor("no-such-space") === undefined);
 
-  mkdirSync(join(home, ".cotal"), { recursive: true });
+  mkdirSync(join(home, ".cotal"), { mode: 0o700 });
   recordManagerSeatMintCap({ root: home, space: "minted" }, 11);
   recordMesh({ ...base, space: "minted" });
   check("manager seat mint cap is saved in the protected per-space record", readManagerSeatMintCap({ root: home, space: "minted" }) === 11);
