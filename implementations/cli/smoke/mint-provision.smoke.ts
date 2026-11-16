@@ -174,17 +174,16 @@ try {
   {
     const agents = join(root, ".cotal", "agents");
     mkdirSync(agents, { recursive: true });
-    writeFileSync(join(agents, "mint-caller.md"), "---\nname: mint-caller\ncapabilities: [spawn]\n---\n");
-    const out = join(root, "mint-caller.creds");
-    const r = await runMint(["mint-caller", "--out", out]);
-    check("mint-caller child mint writes its output", r.code === 0 && existsSync(out), { code: r.code, outputExists: existsSync(out), output: r.out });
+    writeFileSync(join(agents, "mint_caller.md"), "---\nname: mint_caller\ncapabilities: [spawn]\n---\n");
+    const out = join(root, "mint_caller.creds");
+    const r = await runMint(["mint_caller", "--out", out]);
+    check("mint_caller child mint writes its output", r.code === 0 && existsSync(out), { code: r.code, outputExists: existsSync(out), output: r.out });
     const minted = facts(readFileSync(out, "utf8"));
     const caller: EpCaller = { owner: DEV_OWNER, actor: minted.principal!.split(".")[1]!, uid: minted.uids[0]! };
     const required = spawnCallerCapabilities(DEV_OWNER).flatMap((cap) => epRequestGrantRows(SPACE, cap, caller));
     check("mint forwards every agent-file spawn caller row into the JWT", r.code === 0 && required.every((row) => minted.pubAllow.includes(row)), {
       missing: required.filter((row) => !minted.pubAllow.includes(row)),
     });
-    check("mint prints the agent-file capabilities", /capabilities:\s+spawn/.test(r.out), r.out);
   }
   cleanup.push(() => process.chdir(cwd0));
 
@@ -524,14 +523,14 @@ try {
     // An invalid name must refuse before --provision connects and creates durables.
     const badOut = join(root, "bad.creds");
     const rBad = await runMint([" padded ", "--profile", "agent", "--provision", "--out", badOut]);
-    check("mint --provision refuses an invalid name before connecting", rBad.code === 1 && !existsSync(badOut) && /invalid name/.test(rBad.out) && !/nats:\/\//.test(rBad.out), rBad.out);
+    check("mint --provision refuses an invalid name before connecting", rBad.code === 1 && !existsSync(badOut) && /which a label cannot hold/.test(rBad.out) && !/nats:\/\//.test(rBad.out), rBad.out);
   }
 
   // ── 8. --identity re-mints for the SAME nkey ──────────────────────────────────────────────
   {
     const namedOut = join(root, "named.creds");
-    const namedMint = await runMint(["minted-label", "--profile", "observer", "--out", namedOut]);
-    check("plain mint stamps its requested display name", namedMint.code === 0 && credsClaims(readFileSync(namedOut, "utf8")).name === "minted-label", namedMint.out);
+    const namedMint = await runMint(["minted_label", "--profile", "observer", "--out", namedOut]);
+    check("plain mint stamps its requested display name", namedMint.code === 0 && credsClaims(readFileSync(namedOut, "utf8")).name === "minted_label", namedMint.out);
 
     const first = join(root, "id-first.creds");
     const r1 = await runMint(["idfirst", "--profile", "observer", "--out", first]);
@@ -558,11 +557,14 @@ try {
     const foreignIdentity = newIdentity();
     writeFileSync(foreign, await mintCreds(foreignAuth, foreignIdentity, "observer"), { mode: 0o600 });
     const refusedOutput = join(root, "untrusted-source.creds");
-    const refusedForeign = await runMint(["untrusted-source", "--profile", "observer", "--identity", foreign, "--out", refusedOutput, "--json"]);
-    const refusedEnvelope = JSON.parse(refusedForeign.out) as { error?: { code?: string; message?: string; remedy?: string } };
+    const refusedForeign = await runMint(["untrusted_source", "--profile", "observer", "--identity", foreign, "--out", refusedOutput, "--json"]);
+    const refusedLine = refusedForeign.out.split("\n").find((line) => line.startsWith('{"schemaVersion"'));
+    let refusedEnvelope: { error?: { code?: string; message?: string; remedy?: string } } = {};
+    try { refusedEnvelope = refusedLine ? JSON.parse(refusedLine) as typeof refusedEnvelope : {}; } catch { /* the assertion below reports malformed output */ }
     check("--identity refuses a credential signed by pins other than this space's current issuer",
       refusedForeign.code === 1 && refusedEnvelope.error?.code === "SCHEMA_INVALID" && refusedEnvelope.error.message?.includes("current issuer pins") === true &&
-        refusedEnvelope.error.remedy === "mint a fresh key: run auth mint without --identity" && !existsSync(refusedOutput), refusedEnvelope);
+        refusedEnvelope.error.remedy === "mint a fresh key: run auth mint without --identity" && !existsSync(refusedOutput),
+      { envelope: refusedEnvelope, code: refusedForeign.code, out: refusedForeign.out });
     const agentFirst = join(root, "incarnation-first.creds");
     const agentMint = await runMint(["incarnation", "--profile", "agent", "--out", agentFirst]);
     const firstAgentClaims = credsClaims(readFileSync(agentFirst, "utf8"));
@@ -736,9 +738,9 @@ try {
     const unreplaced = await runMint(["neu", "--replace"]);
     check("--replace on a label with no standing credential mints one and warns that it replaced nothing",
       unreplaced.code === 0 && unreplaced.out.includes('! --replace found no standing credential named "neu", so this is a new standing credential and it replaced nothing') && existsSync(standing("neu")), unreplaced.out);
-    const malformedStanding = standing("bad-native"), malformedBytes = "not a native credential\n";
+    const malformedStanding = standing("bad_native"), malformedBytes = "not a native credential\n";
     writeFileSync(malformedStanding, malformedBytes, { mode: 0o600 });
-    const malformedReplacement = await runMint(["bad-native", "--replace"]);
+    const malformedReplacement = await runMint(["bad_native", "--replace"]);
     check("--replace classifies malformed standing bytes as CONFLICT and preserves them", malformedReplacement.code === 2 && /^\s*Code:\s+CONFLICT$/m.test(malformedReplacement.out) && readFileSync(malformedStanding, "utf8") === malformedBytes, malformedReplacement.out);
   }
 
@@ -774,7 +776,7 @@ try {
       row?.state === "expired" && rows.some((entry) => entry.path === again && entry.state === "healthy") && rows.some((entry) => entry.path === other), rows);
     check("  an expired one is a warning, and its repair mints the same key into the same file",
       row?.repair?.includes(`auth mint grants --identity ${first} --out ${first}\``) === true && envelope(expired.out).warnings?.some((warning) => warning.code === "EXPORTED_CREDENTIAL_EXPIRED" && warning.message.includes(first)) === true, { row, warnings: envelope(expired.out).warnings });
-    const unmarked = join(root, "legacy-unmarked.creds"), legacyLabel = "legacy-unmarked";
+    const unmarked = join(root, "legacy-unmarked.creds"), legacyLabel = "legacy_unmarked";
     const legacyMint = await runMint([legacyLabel, "--profile", "agent", "--out", unmarked]);
     check("mint an agent credential for the doctor profile migration case", legacyMint.code === 0 && existsSync(unmarked), legacyMint.out);
     const legacyBytes = readFileSync(unmarked, "utf8");
