@@ -523,7 +523,7 @@ try {
     // An invalid name must refuse before --provision connects and creates durables.
     const badOut = join(root, "bad.creds");
     const rBad = await runMint([" padded ", "--profile", "agent", "--provision", "--out", badOut]);
-    check("mint --provision refuses an invalid name before connecting", rBad.code === 1 && !existsSync(badOut) && /which a label cannot hold/.test(rBad.out) && !/nats:\/\//.test(rBad.out), rBad.out);
+    check("mint --provision refuses an invalid name before connecting", rBad.code === 1 && !existsSync(badOut) && /the credential label " padded " has " ", which a label cannot hold/.test(rBad.out) && !/nats:\/\//.test(rBad.out), rBad.out);
   }
 
   // ── 8. --identity re-mints for the SAME nkey ──────────────────────────────────────────────
