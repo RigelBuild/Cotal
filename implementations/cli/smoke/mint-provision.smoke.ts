@@ -174,10 +174,10 @@ try {
   {
     const agents = join(root, ".cotal", "agents");
     mkdirSync(agents, { recursive: true });
-    writeFileSync(join(agents, "mint-caller.md"), "---\nname: mint-caller\ncapabilities: [spawn]\n---\n");
-    const out = join(root, "mint-caller.creds");
-    const r = await runMint(["mint-caller", "--out", out]);
-    check("mint-caller child mint writes its output", r.code === 0 && existsSync(out), { code: r.code, outputExists: existsSync(out), output: r.out });
+    writeFileSync(join(agents, "mint_caller.md"), "---\nname: mint_caller\ncapabilities: [spawn]\n---\n");
+    const out = join(root, "mint_caller.creds");
+    const r = await runMint(["mint_caller", "--out", out]);
+    check("mint_caller child mint writes its output", r.code === 0 && existsSync(out), { code: r.code, outputExists: existsSync(out), output: r.out });
     const minted = facts(readFileSync(out, "utf8"));
     const caller: EpCaller = { owner: DEV_OWNER, actor: minted.principal!.split(".")[1]!, uid: minted.uids[0]! };
     const required = spawnCallerCapabilities(DEV_OWNER).flatMap((cap) => epRequestGrantRows(SPACE, cap, caller));
@@ -559,7 +559,9 @@ try {
     writeFileSync(foreign, await mintCreds(foreignAuth, foreignIdentity, "observer"), { mode: 0o600 });
     const refusedOutput = join(root, "untrusted-source.creds");
     const refusedForeign = await runMint(["untrusted-source", "--profile", "observer", "--identity", foreign, "--out", refusedOutput, "--json"]);
-    const refusedEnvelope = JSON.parse(refusedForeign.out) as { error?: { code?: string; message?: string; remedy?: string } };
+    const refusedLine = refusedForeign.out.split("\n").find((line) => line.startsWith('{"schemaVersion"'));
+    let refusedEnvelope: { error?: { code?: string; message?: string; remedy?: string } } = {};
+    try { refusedEnvelope = refusedLine ? JSON.parse(refusedLine) as typeof refusedEnvelope : {}; } catch { /* the assertion below reports malformed output */ }
     check("--identity refuses a credential signed by pins other than this space's current issuer",
       refusedForeign.code === 1 && refusedEnvelope.error?.code === "SCHEMA_INVALID" && refusedEnvelope.error.message?.includes("current issuer pins") === true &&
         refusedEnvelope.error.remedy === "mint a fresh key: run auth mint without --identity" && !existsSync(refusedOutput), refusedEnvelope);
