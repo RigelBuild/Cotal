@@ -13036,8 +13036,17 @@ export class Manager {
       console.error(`! static reconcile refused alias=${item.alias} phase=${item.phase} uid=${item.lifecycleUid}: ${item.lastError}`);
       return;
     }
-    const live = this.agents.get(row.alias);
-    const adopted = live !== undefined && live.lifecycleUid === row.lifecycleUid || isAdoptedIdentity(row, readIdentitySnapshot(this.identityStore));
+    let identityByUid: ReadonlyMap<string, IdentityRecord>;
+    try {
+      identityByUid = readIdentitySnapshot(this.identityStore);
+    } catch (error) {
+      if (row.alias.startsWith(`${this.name}-`)) {
+        this.deferStaticReconcileItem(key, row, { error: `identity backing store is unreadable; retry after repairing it: ${rejectionText(error)}` });
+        return;
+      }
+      throw error;
+    }
+    const adopted = live !== undefined && live.lifecycleUid === row.lifecycleUid || isAdoptedIdentity(row, identityByUid);
     if (planStaticSlotResume(row, adopted) !== "drive-terminal") {
       item.disposition = "refused";
       item.remedy = adopted ? "leave the adopted live lifecycle running" : "inspect the fresh durable slot state";
@@ -13236,6 +13245,11 @@ export class Manager {
         // post-adoption sweep — the fix for the resume hole).
         const live = this.agents.get(row.alias);
         if (!identitySnapshotAvailable && row.alias.startsWith(`${this.name}-`)) {
+          if (live !== undefined && live.lifecycleUid === row.lifecycleUid) {
+            preservedAdopted++;
+            continue;
+          }
+          this.deferStaticReconcileItem(this.staticReconcileKey(row), row, { error: "identity backing store is unreadable; retry after repairing it" });
           deferredSlots++;
           console.error(`static reconcile deferred alias=${row.alias} uid=${row.lifecycleUid}: identity backing store is unreadable; retry after repairing it`);
           continue;

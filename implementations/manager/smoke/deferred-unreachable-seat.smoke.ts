@@ -51,7 +51,7 @@ import { requestDeliveryAdminZeroMemberships } from "./_fake-delivery-admin.js";
 let passed = 0;
 let failed = 0;
 /** Intent, not a measurement: one per check below. A shortfall means a cell stopped running. */
-const EXPECTED_CHECKS = 23;
+const EXPECTED_CHECKS = 25;
 function check(label: string, cond: boolean, extra?: unknown): void {
   console.log(`${cond ? "✓" : "✗"} ${label}${cond ? "" : ` — ${JSON.stringify(extra) ?? ""}`}`);
   if (cond) passed++;
@@ -67,6 +67,7 @@ mkdirSync(join(workspaceRoot, ".cotal", "agents"), { recursive: true });
 const mgr = new Manager({ space, servers: SERVERS, runtime: "pty", workspaceRoot });
 type Executor = <T>(pin: { owner: string; actor: string; lifecycleUid: string; alias: string }, fn: (t: LifecycleStateTransport) => Promise<T>) => Promise<T>;
 type Seams = {
+  identityStore?: { list: () => unknown[] };
   auth: unknown;
   runtime: unknown;
   ep: Record<string, unknown>;
@@ -195,6 +196,8 @@ try {
   const tickExp = nowSec() - 54;
   await plant("tick", tickExp);
   await plant("worker_2", nowSec() + 3600);
+  const managerIdentity = await plant("manager-identity", nowSec() - 120);
+  M.identityStore = { list: () => { throw new Error("smoke: identity backing store is unreadable"); } };
   await plant("attest", nowSec() + 3600);
   await plant("plain", nowSec() + 3600);
   await plant("busy", nowSec() + 3600);
@@ -219,10 +222,17 @@ try {
     deferred?.disposition === "deferred" && typeof deferred.deferUntil === "string" && (await readSlot("unexpired"))?.phase === "active",
     { deferred, slot: await readSlot("unexpired") });
   check("unexpired: status counts it in staticReconciliation.deferredSeats",
-    M.managerStatusData().staticReconciliation.deferredSeats === 7, M.managerStatusData().staticReconciliation);
+    M.managerStatusData().staticReconciliation.deferredSeats === 8, M.managerStatusData().staticReconciliation);
   check("fence: every plannable alias is fenced before the first expiry read, and a deferred alias leaves it",
-    ["unexpired", "expired", "tick", "attest", "plain", "busy", "unreadable", "worker_2"].every((a) => fencedDuringRead.has(a)) && !M.reconcilingAliases.has("unexpired"),
+    ["unexpired", "expired", "tick", "attest", "plain", "busy", "unreadable", "worker_2", "manager-identity"].every((a) => fencedDuringRead.has(a)) && !M.reconcilingAliases.has("unexpired"),
     { fenced: [...fencedDuringRead], after: [...M.reconcilingAliases] });
+  check("initial identity snapshot failure defers the manager identity slot without blocking ordinary rows",
+    item("manager-identity")?.disposition === "deferred" && (await readSlot("manager-identity"))?.phase === "active" && (await readSlot("expired"))?.phase === "retired",
+    { item: item("manager-identity"), expired: await readSlot("expired") });
+  await M.recheckDeferredSeats();
+  check("deferred identity snapshot failure keeps the slot deferred with the unreadable store error",
+    item("manager-identity")?.disposition === "deferred" && /identity backing store is unreadable/.test(item("manager-identity")?.lastError ?? "") && (await readSlot("manager-identity"))?.phase === "active",
+    { item: item("manager-identity"), slot: await readSlot("manager-identity") });
 
   // ── Unreadable ledger: deferred, with a remedy that says it never lapses ──
   const bad = item("unreadable");

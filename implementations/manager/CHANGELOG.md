@@ -5,7 +5,8 @@
 ### Patch Changes
 
 - Extract manager identity commands and retirement processing into focused modules; retry failed identity retirements with bounded exponential backoff.
-- Refuse expired identity mint replays, wait for active mint flights during retirement, and preserve due-time and failed-row retries in the retirement driver.
+  - Report persisted identity retirement failures in static reconciliation status, refuse unreadable identity snapshots without terminalizing identity-backed rows, and retry exact retirement work after due times and failures.
+  - Refuse expired identity mint replays, wait for active mint flights during retirement, and preserve due-time and failed-row retries in the retirement driver.
 
 ## 0.151.2
 
