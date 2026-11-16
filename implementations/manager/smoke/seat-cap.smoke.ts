@@ -53,6 +53,7 @@ import { launchEnv } from "@cotal-ai/connector-core";
 import type { AgentConfig } from "../../../extensions/connector-core/src/config.js";
 import { cotalToolSpecs } from "../../../extensions/connector-core/src/tool-specs.js";
 import { Manager } from "../src/manager.js";
+import "../src/commands.js";
 // Dev-only smoke import of the sibling package's source, as the auth suites do: the tool spec
 // is not on connector-core's published surface, and the point of the cell is the shipped renderer.
 import { SMOKE_BROKER_TOKEN, emitSentinel, freePort, makeSeatRoot, teardownOnSignal } from "@cotal-ai/smoke-kit";
@@ -343,7 +344,7 @@ try {
   }
   const supervise = registry.resolve<Command>("command", "supervise");
   if (supervise === undefined || supervise.validate === undefined) throw new Error("the manager supervise command is not registered with validation");
-  check("supervise exposes --seat-mint-cap and its persisted default", supervise.flags?.some((flag) => flag.name === "seat-mint-cap" && flag.description?.includes("default 32")) === true);
+  check("supervise exposes --seat-mint-cap and its persisted default", supervise.flags?.some((flag) => flag.name === "seat-mint-cap" && flag.description?.includes(`default ${DEFAULT_SEAT_MINT_CAP}`)) === true);
   const positiveMintArgs = parseCommandArgs(supervise, ["--seat-mint-cap", "6"]);
   supervise.validate(positiveMintArgs);
   check("supervise accepts a positive seat-mint cap", positiveMintArgs.values["seat-mint-cap"] === "6");
