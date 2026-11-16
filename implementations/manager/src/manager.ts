@@ -12912,7 +12912,7 @@ export class Manager {
             item.lastError = "identity backing store is unreadable; retry after repairing it";
             continue;
           }
-          if (row === undefined || row.lifecycleUid !== item.lifecycleUid || row.actor !== item.actor || (row.phase !== "active" && row.phase !== "provisioning") || live?.lifecycleUid === row.lifecycleUid || this.isAdoptedIdentity(row, identityByUid)) {
+          if (row === undefined || row.lifecycleUid !== item.lifecycleUid || row.actor !== item.actor || (row.phase !== "active" && row.phase !== "provisioning") || live?.lifecycleUid === row.lifecycleUid || isAdoptedIdentity(row, identityByUid)) {
             this.staticReconcileItems.delete(key);
             console.error(`static reconcile deferred alias=${item.alias} uid=${item.lifecycleUid} left the deferred set: the durable slot is ${row === undefined ? "absent" : `${row.phase} at uid ${row.lifecycleUid}`}`);
             continue;
@@ -13037,7 +13037,7 @@ export class Manager {
       return;
     }
     const live = this.agents.get(row.alias);
-    const adopted = live !== undefined && live.lifecycleUid === row.lifecycleUid || this.isAdoptedIdentity(row);
+    const adopted = live !== undefined && live.lifecycleUid === row.lifecycleUid || isAdoptedIdentity(row, readIdentitySnapshot(this.identityStore));
     if (planStaticSlotResume(row, adopted) !== "drive-terminal") {
       item.disposition = "refused";
       item.remedy = adopted ? "leave the adopted live lifecycle running" : "inspect the fresh durable slot state";
@@ -13240,7 +13240,7 @@ export class Manager {
           console.error(`static reconcile deferred alias=${row.alias} uid=${row.lifecycleUid}: identity backing store is unreadable; retry after repairing it`);
           continue;
         }
-        const adopted = live !== undefined && live.lifecycleUid === row.lifecycleUid || this.isAdoptedIdentity(row, identityByUid);
+        const adopted = live !== undefined && live.lifecycleUid === row.lifecycleUid || isAdoptedIdentity(row, identityByUid);
         if (adopted) {
           preservedAdopted++;
         }
