@@ -1,5 +1,11 @@
 # @cotal-ai/core
 
+## Unreleased
+
+### Patch Changes
+
+- Move public-seat issuance out of `provision.ts` and issued-subject permission parsing into `issued-permissions.ts`, keeping the existing core barrel exports.
+
 ## 0.151.2
 
 No changes in this release.

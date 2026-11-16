@@ -33,12 +33,65 @@ import type { NatsConnection } from "@nats-io/transport-node";
 import { canonicalJson, rawDigest } from "./canonical.js";
 import { EpEnvelopeError } from "./endpoint-envelope.js";
 import { isCasLoss, decodeRecordJson } from "./endpoint-records.js";
+import { assertGeneration, callerTokens, type EpCaller } from "./endpoint-subjects.js";
+export { assertGeneration, isIssuedCaller, EP_RAIL_V1, type IssuedCaller } from "./endpoint-subjects.js";
+import type { IssuedCaller } from "./endpoint-subjects.js";
+import { token } from "./subjects.js";
 import { acceptedBucket, acceptedKey, assertIssuedSpace, closed, issuedCallerOfToken, readAcceptedRow, refSnapshot, type IssuedAuthorityRef } from "./issued-accepted.js";
 export { acceptedBucket, acceptedKey, assertIssuedSpace, issuedCallerOfToken, readAcceptedRow } from "./issued-accepted.js";
 export type { IssuedAuthorityRef } from "./issued-accepted.js";
 
 export { importNativeSubjectPermissions, issuedPermitsPattern, issuedPermitsSubject, readIssuedSubjectPermission, readIssuedSubjectPermissions, type IssuedSubjectAllow, type IssuedSubjectPermission, type IssuedSubjectPermissions } from "./issued-permissions.js";
 import { importNativeSubjectPermissions, readIssuedSubjectPermissions, type IssuedSubjectPermissions } from "./issued-permissions.js";
+
+// ---- the reference -------------------------------------------------------------------------------
+
+/** A fresh generation that authorizes nothing at or after `horizon` (unix seconds): the horizon as
+ *  8 big-endian hex digits, then 96 bits of issuer entropy. Chosen by the ISSUER, never by the
+ *  client. The horizon rides the generation, so the broker pins it on the request subject with the
+ *  rest of the rail, and no row in the store can move it (SPEC 13.15). */
+export function mintGeneration(horizon: number): string {
+  if (!Number.isSafeInteger(horizon) || horizon <= 0 || horizon > 0xffffffff)
+    throw new Error("mintGeneration: the horizon must be a positive unix-seconds integer that fits 8 hex digits");
+  return horizon.toString(16).padStart(8, "0") + randomBytes(12).toString("hex");
+}
+
+/** The unix second at and after which `generation` authorizes nothing (SPEC 13.15). */
+export function issuedHorizon(generation: string): number {
+  return Number.parseInt(assertGeneration(generation).slice(0, 8), 16);
+}
+
+/** How long every row of a generation outlives its horizon before its own TTL removes it. It covers
+ *  the clock difference between a writer, the broker and a reader. It need not cover how long a
+ *  resolution takes: every reader checks the horizon again after its last read (SPEC 13.15). */
+export const ISSUED_RETAIN_MARGIN_SEC = 60;
+
+/** The horizon a manager gives the generation of a managed static seat. Each renewal is capped at it,
+ *  and a seat that reaches it is respawned. */
+export const STATIC_GENERATION_HORIZON_SEC = 30 * 24 * 60 * 60;
+
+const nowSec = (): number => Math.floor(Date.now() / 1000);
+
+/** Refuse a generation at or past its horizon, before anything of it is read or written: its rows
+ *  may already be gone, and a key re-created after that is never its evidence. */
+function liveHorizon(generation: string, now: number): number {
+  const horizon = issuedHorizon(generation);
+  if (now >= horizon)
+    throw new EpEnvelopeError("permission-denied", `generation ${generation} expired at ${horizon} (SPEC 13.15)`);
+  return horizon;
+}
+
+/** The `Nats-TTL` of a row written now for `ref`: it lasts until the generation's horizon plus the
+ *  retention margin, and no longer. A write at or after the horizon refuses before it is sent. */
+function rowTtl(ref: IssuedAuthorityRef): string {
+  const now = nowSec();
+  return `${liveHorizon(ref.generation, now) - now + ISSUED_RETAIN_MARGIN_SEC}s`;
+}
+
+/** A fresh accepted-row token: same grammar, chosen by the party that will connect. */
+export function mintAcceptedToken(): string {
+  return randomBytes(16).toString("hex");
+}
 
 // ---- the evidence store --------------------------------------------------------------------------
 

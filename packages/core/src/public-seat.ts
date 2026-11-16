@@ -4,6 +4,7 @@ import { assertValidName } from "./resolve.js";
 import { nativeNkeySigner } from "./nkey-signer.js";
 import { canonicalJson } from "./canonical.js";
 import { isUserNkey } from "./identity.js";
+import { principalTags } from "./subjects.js";
 import { epAuthBucket } from "./endpoint-binding.js";
 import { credentialIdOf } from "./lifecycle-state.js";
 import { acceptedKey, importNativeSubjectPermissions, issuedHorizon, writeAcceptedRow, type IssuedAuthorityRef, type IssuedSourceRef, type IssuedSubjectPermissions, type IssuanceSeam } from "./issued-authority.js";
