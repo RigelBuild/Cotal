@@ -725,6 +725,7 @@
     "smoke:journal-declaration": "tsx implementations/manager/smoke/journal-declaration.smoke.ts",
     "smoke:max-agents-single-source": "tsx implementations/manager/smoke/max-agents-single-source.smoke.ts",
     "smoke:contract-vocabulary": "tsx implementations/manager/smoke/contract-vocabulary.smoke.ts",
+    "smoke:manager-placement-contract": "tsx implementations/manager/smoke/placement-launch-contract.smoke.ts",
     "smoke:manager-spawn-action": "tsx implementations/manager/smoke/spawn-action.smoke.ts",
     "smoke:manager-refusal-code": "tsx implementations/manager/smoke/refusal-code.smoke.ts",
     "smoke:manager-supervise-restart": "tsx implementations/manager/smoke/supervise-restart.smoke.ts",

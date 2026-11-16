@@ -28,7 +28,7 @@
     {
       "name": "M2 keep revision 51 after adding roster",
       "file": "implementations/manager/src/manager-service-contract.ts",
-      "find": "  return buildClusterDocument(MANAGER_CLUSTER_URN, 52, ROWS);",
+      "find": "  return buildClusterDocument(MANAGER_CLUSTER_URN, 53, ROWS);",
       "replace": "  return buildClusterDocument(MANAGER_CLUSTER_URN, 51, ROWS);",
       "cell": "roster advances the manager cluster revision and retains existing commands"
     },

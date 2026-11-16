@@ -124,6 +124,7 @@ export * from "./conversation-approval.js";
 export * from "./manager-caller.js";
 export * from "./remote-manager-authority.js";
 export { parsePlacementEnrollmentRequest, type PlacementEnrollmentRequest, type PlacementEnrollmentResult } from "./placement-enrollment.js";
+export * from "./placement-launch.js";
 export * from "./remote-service-authority.js";
 export * from "./endpoint-capability-policy.js";
 export * from "./delegated-recovery.js";

@@ -34,6 +34,7 @@
  *   manager.admin    purge / launch / resume family / transcript-receive / release-seat / attest-gone / allowlist-set (operator instruments only)
  *   manager.run      run-start / run-resume / run-answer   (the `run` capability + privileged instrument)
  *                    run-status / run-ps ride manager.read
+ *   manager.placement prepare-launch / place               (placement-only launch; reconciler principal only)
  */
 import type { BrowserContractSource } from "@cotal-ai/core/browser-validators-build";
 import type { ManagerVitals } from "./vitals.js";
@@ -438,6 +439,198 @@ const RESOLVE_AGENT_INPUT_SCHEMA = {
 const RESOLVE_AGENT_OUTPUT_SCHEMA = {
   type: "object", additionalProperties: false, required: ["agent"],
   properties: { agent: { type: "string" } },
+} as const;
+
+// The placement-only launch vocabulary (RIG-8502 launch protocol § Placement and launch intent). Every
+// object is closed. The shared field constants below are copied per node by the canonicalizer, which
+// has no cycle check, so reusing one here is safe.
+const SHA256_DIGEST = { type: "string", pattern: "^sha256:[0-9a-f]{64}$" } as const;
+const UUID_FIELD = { type: "string", pattern: "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" } as const;
+const UINT_FIELD = { type: "integer", minimum: 0, maximum: Number.MAX_SAFE_INTEGER } as const;
+const ACCOUNT_NKEY = { type: "string", pattern: "^A[A-Z2-7]{55}$" } as const;
+const LIFECYCLE_TOKEN_FIELD = { type: "string", pattern: "^[a-z0-9]{26,32}$" } as const;
+const MANAGER_CLAIM_SCHEMA = {
+  type: "object", additionalProperties: false,
+  required: ["accountPublicKey", "instanceId", "managerLifecycleUid", "assignmentRevision", "currentRegistrationRevision", "serveEpoch"],
+  properties: {
+    accountPublicKey: ACCOUNT_NKEY, instanceId: LIFECYCLE_TOKEN_FIELD, managerLifecycleUid: LIFECYCLE_TOKEN_FIELD,
+    assignmentRevision: UINT_FIELD, currentRegistrationRevision: UINT_FIELD, serveEpoch: UINT_FIELD,
+  },
+} as const;
+const PLACEMENT_SCHEMA = {
+  type: "object", additionalProperties: false,
+  required: ["space", "name", "desiredRevision", "seatRevision", "claim", "generation", "operationId", "workspace"],
+  properties: {
+    space: { const: "main" }, name: { type: "string", pattern: "^[A-Za-z0-9_.-]+$" },
+    desiredRevision: UINT_FIELD, seatRevision: UINT_FIELD, claim: MANAGER_CLAIM_SCHEMA,
+    generation: UINT_FIELD, operationId: UUID_FIELD, workspace: { type: "string", minLength: 1 },
+  },
+} as const;
+const WINDOW_SCHEMA = {
+  oneOf: [
+    {
+      type: "object", additionalProperties: false, required: ["kind", "seconds", "anchorUtc", "timezone"],
+      properties: { kind: { const: "fixed" }, seconds: UINT_FIELD, anchorUtc: { type: "string", minLength: 1 }, timezone: { type: "string", minLength: 1 } },
+    },
+    {
+      type: "object", additionalProperties: false, required: ["kind", "seconds"],
+      properties: { kind: { const: "rolling" }, seconds: UINT_FIELD },
+    },
+  ],
+} as const;
+const CAP_SCHEMA = {
+  type: "object", additionalProperties: false, required: ["usd", "window"],
+  properties: { usd: { type: "number", minimum: 0 }, window: WINDOW_SCHEMA },
+} as const;
+const ROUTING_MAP_SCHEMA = {
+  type: "object", additionalProperties: false, required: [],
+  properties: {
+    claude: { oneOf: [{ const: "shared" }, { type: "array", items: { type: "string", minLength: 1 } }] },
+    codex: { oneOf: [{ const: "shared" }, { type: "array", items: { type: "string", minLength: 1 } }] },
+  },
+} as const;
+const KEY_LIMITS_SCHEMA = {
+  type: "object", additionalProperties: false, required: [],
+  properties: {
+    keyCap: CAP_SCHEMA,
+    perModel: {
+      type: "object", additionalProperties: { type: "object", additionalProperties: false, required: [],
+        properties: { tokens: UINT_FIELD, tpm: UINT_FIELD, rpm: UINT_FIELD } },
+    },
+  },
+} as const;
+const KEY_SETTINGS_SCHEMA = {
+  type: "object", additionalProperties: false, required: ["routing", "limits", "policyId"],
+  properties: { routing: ROUTING_MAP_SCHEMA, limits: KEY_LIMITS_SCHEMA, policyId: { type: "string", minLength: 1 } },
+} as const;
+const PROFILE_SNAPSHOT_SCHEMA = {
+  type: "object", additionalProperties: false, required: ["name", "revision", "configRevision", "modelRoles", "sha256"],
+  properties: {
+    name: { type: "string", minLength: 1 }, revision: { type: "string", minLength: 1 }, configRevision: { type: "string", minLength: 1 },
+    modelRoles: { type: "object", additionalProperties: { type: "string", minLength: 1 } }, sha256: SHA256_DIGEST,
+  },
+} as const;
+const RUNTIME_ASSETS_SCHEMA = {
+  type: "object", additionalProperties: false,
+  required: ["revision", "digest", "imageDigest", "baselineConfigDigest", "modelCatalogDigest", "personaCatalogDigest", "extensionsDigest", "rulesSkillsDigest", "cliClosureDigest", "toolBindings"],
+  properties: {
+    revision: { type: "string", minLength: 1 }, digest: SHA256_DIGEST, imageDigest: { type: "string", minLength: 1 },
+    baselineConfigDigest: SHA256_DIGEST, modelCatalogDigest: SHA256_DIGEST, personaCatalogDigest: SHA256_DIGEST,
+    extensionsDigest: SHA256_DIGEST, rulesSkillsDigest: SHA256_DIGEST, cliClosureDigest: SHA256_DIGEST,
+    toolBindings: {
+      type: "array",
+      items: {
+        type: "object", additionalProperties: false, required: ["id", "endpoint", "entitlementRef"],
+        properties: { id: { type: "string", minLength: 1 }, endpoint: { type: "string", minLength: 1 }, entitlementRef: { type: "string", minLength: 1 } },
+      },
+    },
+  },
+} as const;
+const MANAGED_LIFECYCLE_TARGET_SCHEMA = {
+  type: "object", additionalProperties: false, required: ["space", "owner", "actor", "lifecycleUid"],
+  properties: { space: { type: "string", minLength: 1 }, owner: { type: "string", minLength: 1 }, actor: { type: "string", minLength: 1 }, lifecycleUid: LIFECYCLE_TOKEN_FIELD },
+} as const;
+const HANDOFF_RECEIPT_SCHEMA = {
+  type: "object", additionalProperties: false,
+  required: ["receiptId", "request", "lifecycle", "artifactRef", "artifactDigest", "sizeBytes", "at"],
+  properties: {
+    receiptId: UUID_FIELD,
+    request: {
+      type: "object", additionalProperties: false,
+      required: ["restartOperationId", "name", "predecessorGeneration", "restartGeneration"],
+      properties: { restartOperationId: UUID_FIELD, name: { type: "string", minLength: 1 }, predecessorGeneration: UINT_FIELD, restartGeneration: UINT_FIELD },
+    },
+    lifecycle: MANAGED_LIFECYCLE_TARGET_SCHEMA,
+    artifactRef: {
+      type: "object", additionalProperties: false, required: ["kind", "id"],
+      properties: { kind: { const: "wave-handoff/v1" }, id: UUID_FIELD },
+    },
+    artifactDigest: SHA256_DIGEST, sizeBytes: UINT_FIELD, at: { type: "string", minLength: 1 },
+  },
+} as const;
+const HANDOFF_INPUT_SCHEMA = {
+  oneOf: [
+    {
+      type: "object", additionalProperties: false, required: ["mode", "receipt"],
+      properties: { mode: { const: "document" }, receipt: HANDOFF_RECEIPT_SCHEMA },
+    },
+    {
+      type: "object", additionalProperties: false, required: ["mode", "reason"],
+      properties: { mode: { const: "none" }, reason: { enum: ["skip", "not-running", "superseded"] } },
+    },
+  ],
+} as const;
+const LAUNCH_INTENT_SCHEMA = {
+  type: "object", additionalProperties: false,
+  required: ["placement", "cwd", "workspaceDigest", "persona", "personaDigest", "profile", "role", "roleTreeRevision", "assets", "key", "policyRevision", "restartGeneration", "digest"],
+  properties: {
+    placement: PLACEMENT_SCHEMA, cwd: { type: "string", minLength: 1 }, workspaceDigest: SHA256_DIGEST,
+    persona: { type: "string", minLength: 1 }, personaDigest: SHA256_DIGEST,
+    profile: PROFILE_SNAPSHOT_SCHEMA, role: { type: "string", minLength: 1 }, roleTreeRevision: UINT_FIELD,
+    assets: RUNTIME_ASSETS_SCHEMA, key: KEY_SETTINGS_SCHEMA, policyRevision: UINT_FIELD, restartGeneration: UINT_FIELD,
+    handoff: HANDOFF_INPUT_SCHEMA, digest: SHA256_DIGEST,
+  },
+} as const;
+const EXECUTION_AUTHORITY_SCHEMA = {
+  type: "object", additionalProperties: false,
+  required: ["subject", "placementOperationId", "intentDigest", "claim", "launchRevision"],
+  properties: {
+    subject: {
+      type: "object", additionalProperties: false, required: ["acceptanceId", "enrollmentOperationId", "phase"],
+      properties: { acceptanceId: UUID_FIELD, enrollmentOperationId: UUID_FIELD, phase: { const: "accepted" } },
+    },
+    placementOperationId: UUID_FIELD, intentDigest: SHA256_DIGEST, claim: MANAGER_CLAIM_SCHEMA,
+    launchRevision: { type: "integer", minimum: 1, maximum: Number.MAX_SAFE_INTEGER },
+  },
+} as const;
+const EXECUTION_GATE_SCHEMA = {
+  type: "object", additionalProperties: false, required: ["authority", "state"],
+  properties: {
+    authority: EXECUTION_AUTHORITY_SCHEMA, state: { enum: ["open", "closing", "closed"] }, fenceId: UUID_FIELD,
+  },
+} as const;
+const ACCEPTED_INTENT_SCHEMA = {
+  type: "object", additionalProperties: false,
+  required: ["acceptanceId", "intent", "acceptedListRevision", "acceptedSeatRevision", "enrollmentOperationId", "executionGate"],
+  properties: {
+    acceptanceId: UUID_FIELD, intent: LAUNCH_INTENT_SCHEMA, acceptedListRevision: UINT_FIELD,
+    acceptedSeatRevision: UINT_FIELD, enrollmentOperationId: UUID_FIELD, executionGate: EXECUTION_GATE_SCHEMA,
+  },
+} as const;
+// LOOSE BY PROTOCOL: SeatObservation carries optional lifecycle, key, obligations and cleanup fields
+// whose shapes are not yet frozen here, so this object is closed on the required core only.
+const SEAT_OBSERVATION_SCHEMA = {
+  type: "object", additionalProperties: false, required: ["placement", "state"],
+  properties: {
+    placement: PLACEMENT_SCHEMA,
+    state: { enum: ["pending", "starting", "running", "stopping", "stopped", "unknown", "parked"] },
+  },
+} as const;
+// SeatEntryV2 as the protocol names it. `expiresAt` (RIG-8659 T7) is deliberately absent: closed JSON
+// refuses it until T7 lands.
+const SEAT_ENTRY_V2_SCHEMA = {
+  type: "object", additionalProperties: false,
+  required: ["name", "seatRevision", "cwd", "tab", "state", "restartGeneration", "updatedAt", "profile", "role", "roleTreeRevision", "key", "workspace", "persona"],
+  properties: {
+    name: { type: "string", pattern: "^[A-Za-z0-9_.-]+$" }, seatRevision: UINT_FIELD, cwd: { type: "string", minLength: 1 },
+    tab: { type: "string", minLength: 1 }, state: { enum: ["active", "paused", "retired"] },
+    restartGeneration: UINT_FIELD, parent: { type: "string", minLength: 1 }, note: { type: "string" },
+    updatedAt: { type: "string", minLength: 1 }, host: { enum: ["k3s", "macbook", "mattmini"] },
+    profile: { type: "string", minLength: 1 }, role: { type: "string", minLength: 1 }, roleTreeRevision: UINT_FIELD,
+    key: KEY_SETTINGS_SCHEMA, workspace: { type: "string", minLength: 1 }, persona: { type: "string", minLength: 1 },
+  },
+} as const;
+const PREPARE_LAUNCH_INPUT_SCHEMA = {
+  type: "object", additionalProperties: false, required: ["placement", "entry"],
+  properties: { placement: PLACEMENT_SCHEMA, entry: SEAT_ENTRY_V2_SCHEMA },
+} as const;
+const PLACE_INPUT_SCHEMA = {
+  type: "object", additionalProperties: false, required: ["accepted"],
+  properties: { accepted: ACCEPTED_INTENT_SCHEMA },
+} as const;
+const PLACE_OUTPUT_SCHEMA = {
+  type: "object", additionalProperties: false, required: ["observation", "executionGate"],
+  properties: { observation: SEAT_OBSERVATION_SCHEMA, executionGate: EXECUTION_GATE_SCHEMA },
 } as const;
 
 // Attach returns the holder-bound §13.6 session GRANT, never a 127.0.0.1 ws:// URL. The
@@ -1132,6 +1325,8 @@ const ROWS: CommandRow[] = [
   { name: "release-seat", capability: "manager.admin", input: RELEASE_SEAT_INPUT_SCHEMA, output: RELEASE_SEAT_OUTPUT_SCHEMA, targeted: false, handler: "releaseSeat" },
   { name: "attest-gone", capability: "manager.admin", input: ATTEST_GONE_INPUT_SCHEMA, output: ATTEST_GONE_OUTPUT_SCHEMA, targeted: false, handler: "attestGone" },
   { name: "allowlist-set", capability: "manager.admin", input: ALLOWLIST_SET_INPUT_SCHEMA, output: ALLOWLIST_SET_OUTPUT_SCHEMA, targeted: false, handler: "allowlistSet" },
+  { name: "prepare-launch", capability: "manager.placement", input: PREPARE_LAUNCH_INPUT_SCHEMA, output: LAUNCH_INTENT_SCHEMA, targeted: false, handler: "prepareLaunch" },
+  { name: "place", capability: "manager.placement", input: PLACE_INPUT_SCHEMA, output: PLACE_OUTPUT_SCHEMA, targeted: false, handler: "place" },
 ];
 
 // WHEN THE COMPILE HAPPENS (#1323): every CLI invocation loads this module before its verb is
@@ -1263,10 +1458,11 @@ export const MANAGER_STATUS_CONTRACT: { input: CompiledContract; output: Compile
  *
  *  48 adds retained-custody and deferred-seat reconciliation status; 49 adds `release-seat`;
  *  50 adds `attest-gone`; 51 adds `allowlist-set` and the fork's blank continuation refusal;
- *  52 adds `roster` for static agent presence reads.
+ *  52 adds `roster` for static agent presence reads; 53 adds `prepare-launch` and `place`, the
+ *  placement-only launch contract (RIG-10267). A new served command is what a revision is for.
  */
 export function managerClusterDocument(): ClusterDocument {
-  return buildClusterDocument(MANAGER_CLUSTER_URN, 52, ROWS);
+  return buildClusterDocument(MANAGER_CLUSTER_URN, 53, ROWS);
 }
 
 /** Revision, count, and names from the shipped cluster document. Reached smokes derive surface pins from this. */
@@ -1365,6 +1561,8 @@ export interface ManagerServiceHandlers {
   releaseSeat(ctx: EpServeContext): unknown | Promise<unknown>;
   attestGone(ctx: EpServeContext): unknown | Promise<unknown>;
   allowlistSet(ctx: EpServeContext): unknown | Promise<unknown>;
+  prepareLaunch(ctx: EpServeContext): unknown | Promise<unknown>;
+  place(ctx: EpServeContext): unknown | Promise<unknown>;
 }
 
 /** Build the `EpCommandDef[]` `serveEndpoint` consumes: each command's provenance-branded compiled

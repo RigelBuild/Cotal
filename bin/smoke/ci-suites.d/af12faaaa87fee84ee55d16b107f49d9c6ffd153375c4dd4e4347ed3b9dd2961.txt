@@ -1,0 +1,2 @@
+# The placement-only prepare-launch and place contract is served with its refusal cells pinned (RIG-10267).
+smoke:manager-placement-contract

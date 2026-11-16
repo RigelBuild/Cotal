@@ -229,6 +229,7 @@ import {
   type ServiceNameAuthority,
 } from "@cotal-ai/core";
 import { MANAGER_ENDPOINT, managerClusterArtifacts, managerCommandDefs, managerContractArtifactValues, type ManagerConnectorStatus, type ManagerStaticReconciliationFailure, type ManagerStaticReconciliationStatus, type ManagerStaticReconciliationSweep, type ManagerStatus, type ManagerStopImpact } from "./manager-service-contract.js";
+import { createPlacementLaunchHandlers } from "./placement-launch-door.js";
 import { measureManagerVitals } from "./vitals.js";
 import type { NatsConnection } from "@nats-io/transport-node";
 import type { KV } from "@nats-io/kv";
@@ -5025,6 +5026,7 @@ export class Manager {
           throw new EpEnvelopeError("failed-precondition", "transcript-receive: this manager does not receive carried transcripts (its remote authority issues no transfer reader)");
         return this.transcripts.receive(args(ctx) as unknown as TranscriptReceiveInput);
       })),
+      ...createPlacementLaunchHandlers({ configured: false, port: () => undefined }),
     });
   }
 
