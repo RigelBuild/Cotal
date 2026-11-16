@@ -9,15 +9,12 @@
  * the seed store follows XDG_CONFIG_HOME (via globalConfigDir()), not COTAL_HOME.
  *
  * Leak check (#4091): each one-shot send reads presence and the channel registry once, with no watch
- * consumer, and a channel send reads that channel's policy with a Direct Get, so the consumer count
- * on both buckets is the same before and after the sends. The old watch, and the policy read's scan,
- * left one consumer per send on the bucket they read for five minutes. `cotal channel` on the same
- * operator credential reads the registry with a Direct Get and leaves no consumer either. An operator
- * credential passed with `--creds` reads the same way. An agent credential, which holds no Direct
- * Get row, watches instead, and one that may not read presence is refused.
- * operator credential reads the registry with a Direct Get and leaves no consumer either. A post to
- * an unregistered channel reads that channel's retained count once with STREAM.INFO, which opens no
- * consumer.
+ * consumer, and a channel send reads that channel's policy with a Direct Get. The consumer count on
+ * both buckets must be unchanged before and after the sends. The old watch, and the policy read's
+ * scan, left one consumer per send on the bucket they read for five minutes. `cotal channel` on the
+ * same operator credential reads the registry with a Direct Get and leaves no consumer either. An
+ * agent credential uses manager-mediated presence and has no channel-registry watch.
+ * A post to an unregistered channel reads that channel's retained count once with STREAM.INFO.
  *
  * Run: pnpm smoke:send
  */
@@ -56,7 +53,7 @@ import { pickFreePort } from "../../../packages/core/smoke/_free-port.js";
 import { startRosterFixture } from "../../../packages/core/smoke/_roster-service.js";
 
 const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-const EXPECTED = 83;
+const EXPECTED = 84;
 let pass = 0;
 let fail = 0;
 const check = (name: string, cond: boolean, extra?: unknown) => {
@@ -114,12 +111,13 @@ const isolatedEnv: NodeJS.ProcessEnv = {
 const run = (
   args: string[],
   extra: NodeJS.ProcessEnv = {},
+  cwd = operatorShell,
 ): Promise<{ code: number; stdout: string; stderr: string }> =>
   new Promise((resolve) => {
     execFile(
       process.execPath,
       ["--import", tsx, cli, ...args],
-      { cwd: operatorShell, env: { ...isolatedEnv, ...extra } },
+      { cwd, env: { ...isolatedEnv, ...extra } },
       (err, stdout, stderr) =>
         resolve({ code: err && typeof err.code === "number" ? err.code : err ? 1 : 0, stdout, stderr }),
     );
@@ -300,8 +298,8 @@ try {
   await inspector.close();
 
   check(
-    "the consumer count reads bob's own presence and channel-registry watches",
-    consumersBefore.presence >= 1 && consumersBefore.channels >= 1,
+    "static-agent send smoke has no channel-registry watch baseline",
+    consumersBefore.channels === 0,
     consumersBefore,
   );
   check(
@@ -475,6 +473,13 @@ try {
   );
   // Without --server the credential goes to the broker its space is registered at, never the default address.
   const registeredText = `registered-${randomUUID().slice(0, 6)}`;
+  const cwdCredsText = `cwd-registered-${randomUUID().slice(0, 6)}`;
+  setCurrent("decoy");
+  const cwdCreds = await run(["send", "-t", "bob", cwdCredsText, "--creds", namedCreds], {}, meshRoot);
+  setCurrent(space);
+  await wait(400);
+  check("folder registration supplies the same verified holder-name space when --space is omitted",
+    cwdCreds.code === 0 && got.some((m) => m.route === "DM" && m.text === cwdCredsText && m.fromName === "named-sender"), { cwdCreds, got });
   const registered = await run(["send", "-t", "bob", registeredText, "--space", space, "--creds", explicitCreds]);
   await wait(400);
   check("explicit creds without --server reach the broker the space is registered at",

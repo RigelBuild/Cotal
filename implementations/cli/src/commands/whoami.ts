@@ -1,9 +1,9 @@
 import { resolve } from "node:path";
-import { credsClaims, dlvStream, dmStream, principalKey, resolveAuthProvider, spacePrefix, type FlagSpec, type FlagValues, type ParsedArgs, type UserAuthStatus } from "@cotal-ai/core";
-import { authDir, brokerAddressForDisplay, recordOperationSpace, CLI_USER_ACTOR, CommandFailure, findMesh, hasUserAuthState, isMeshRegistryError, isWorkspaceTargetError, jsonFlag, loadSpaceAuth, MeshTargetError, plainFlag, presentationOf, readCredsFile, recordedRevocation, resolveMeshTarget, serverFlag, spaceFlag, spaceInCreds, userAuthStateDir, workspaceSecretStore, writeResult, type Cell, type OutputWarning, type Presentation, type Report, type Section } from "@cotal-ai/workspace";
+import { credsClaims, dlvStream, dmStream, principalKey, resolveAuthProvider, spacePrefix, verifyStaticUserCredential, type FlagSpec, type FlagValues, type ParsedArgs, type UserAuthStatus } from "@cotal-ai/core";
+import { authDir, brokerAddressForDisplay, recordOperationSpace, CLI_USER_ACTOR, CommandFailure, findMesh, getSpaceAuth, hasUserAuthState, isMeshRegistryError, isWorkspaceTargetError, jsonFlag, loadSpaceAuth, MeshTargetError, plainFlag, presentationOf, readCredsFile, recordedRevocation, resolveMeshTarget, serverFlag, spaceFlag, spaceInCreds, userAuthStateDir, workspaceSecretStore, writeResult, type Cell, type OutputWarning, type Presentation, type Report, type Section } from "@cotal-ai/workspace";
 import { registryFailure } from "../lib/registry-errors.js";
 
-const credsFlag = { name: "creds", type: "string", value: "<file>", description: "report what this credential file may do, from its own claims; no broker is contacted" } as const satisfies FlagSpec;
+const credsFlag = { name: "creds", type: "string", value: "<file>", description: "report this credential's claims and its profile only when verified against registered issuer pins; no broker is contacted" } as const satisfies FlagSpec;
 
 export const whoamiFlags = [spaceFlag, serverFlag, credsFlag, jsonFlag, plainFlag] as const satisfies readonly FlagSpec[];
 
@@ -44,16 +44,18 @@ export interface WhoamiResult {
   readonly capabilities: Grant | null;
 }
 
-/** What `cotal whoami --creds <file>` reports: what a credential file's own claims permit, in the
- *  one space they name. The claims are decoded, not verified, and no broker is contacted; the broker
- *  enforces them. */
+/** What `cotal whoami --creds <file>` reports: public fields decoded from the credential claims,
+ *  including an unverified holder name, plus a profile only when verified against registered pins.
+ *  No broker is contacted; the broker enforces permission claims. */
 export interface WhoamiCredentialResult {
   readonly kind: "credential";
   readonly file: string;
   /** `null` when its permissions name no single space, so read, post and DMs are `null` too. */
   readonly space: string | null;
-  /** The profile it was minted with: the user JWT's `name` claim. */
+  /** Signed profile marker, verified with this machine's registered issuer pins when available. */
   readonly profile: string | null;
+  /** The user JWT's `name` claim; shown only as unverified display data. */
+  readonly nameUnverified: string | null;
   readonly principal: string | null;
   /** The agent lifecycle its delivery and history grants are keyed to; `null` for a credential
    *  that holds none, such as the observer and admin profiles. */
@@ -207,9 +209,21 @@ async function whoamiCredential(path: string, presentation: Presentation): Promi
   const nats = (claims.nats ?? {}) as NonNullable<typeof claims.nats> & { tags?: unknown };
   const tags = Array.isArray(nats.tags) ? nats.tags.filter((tag): tag is string => typeof tag === "string") : [];
   const tag = (name: string) => tags.find((t) => t.startsWith(`${name}:`))?.slice(name.length + 1);
+  const space = spaceInCreds(creds) ?? null;
+  let verifiedProfile: string | null = null;
+  if (space !== null) {
+    try {
+      const root = findMesh(space)?.root;
+      if (root !== undefined) {
+        const auth = await getSpaceAuth(workspaceSecretStore(root), space);
+        if (auth) {
+          verifiedProfile = verifyStaticUserCredential(creds, { accountPub: auth.account.pub, signingPub: auth.account.signingPub }, { allowOutOfWindow: true }).profile;
+        }
+      }
+    } catch { /* damaged registry, untrusted credentials or unavailable pins cannot classify claims */ }
+  }
   const owner = tag("owner"), actor = tag("actor");
   const pub = nats.pub?.allow ?? [], sub = nats.sub?.allow ?? [];
-  const space = spaceInCreds(creds) ?? null;
   let lifecycleUid: string | null = null;
   if (space !== null && owner !== undefined && actor !== undefined) {
     let name: string | undefined;
@@ -224,13 +238,15 @@ async function whoamiCredential(path: string, presentation: Presentation): Promi
     : pub.some((row) => row.startsWith(`$JS.API.CONSUMER.MSG.NEXT.${dm}.dm_`)) ? "own"
     : "none";
   const iso = (seconds: unknown) => typeof seconds === "number" && Number.isFinite(seconds) ? new Date(seconds * 1000).toISOString() : null;
+  const principal = tag("principal") ?? null;
   const revokedAt = space === null ? undefined : await recordedRevocation(space, creds);
   const result: WhoamiCredentialResult = {
     kind: "credential",
     file,
     space,
-    profile: typeof claims.name === "string" ? claims.name : null,
-    principal: tag("principal") ?? null,
+    profile: verifiedProfile,
+    nameUnverified: typeof claims.name === "string" ? claims.name : null,
+    principal,
     lifecycleUid,
     issuedAt: iso(claims.iat),
     expiresAt: iso(claims.exp),
@@ -266,6 +282,7 @@ function credentialView(r: WhoamiCredentialResult): Report {
     ["file", r.file],
     ["space", r.space === null ? unknown : { text: r.space, tone: "selected" }],
     ["profile", r.profile ?? unknown],
+    ["name (unverified)", r.nameUnverified ?? unknown],
     ["principal", r.principal ?? unknown],
     ["lifecycle", r.lifecycleUid ?? { text: "none: no agent lifecycle", tone: "hint" }],
     ["issued", r.issuedAt ?? unknown],
@@ -275,7 +292,7 @@ function credentialView(r: WhoamiCredentialResult): Report {
     ["post", grantText(r.post, "no channels")],
     ["dm history", r.dms === null ? unknown : DMS_TEXT[r.dms]],
   ];
-  const hint: Cell = { text: "Read from the file's own claims: its signature is not checked and no broker is contacted. The broker enforces these permissions.", tone: "hint" };
+  const hint: Cell = { text: "Permissions, principal tags, lifecycle and name are decoded from the file's claims, not verified. The profile marker is shown only when its signature verifies against this machine's registered pins; no broker is contacted.", tone: "hint" };
   return { sections: [{ title: "Credential", blocks: [{ kind: "fields", rows }, { kind: "lines", lines: [hint] }] }] };
 }
 

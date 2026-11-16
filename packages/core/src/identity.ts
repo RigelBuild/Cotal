@@ -2,6 +2,8 @@ import { createHash } from "node:crypto";
 import { decode, fmtCreds, Types } from "@nats-io/jwt";
 import { credsAuthenticator } from "@nats-io/nats-core";
 import { createUser, fromSeed } from "@nats-io/nkeys";
+import { PROFILES } from "./credential-profiles.js";
+import type { Profile } from "./provision.js";
 import { nativeNkeySigner } from "./nkey-signer.js";
 import { presenceBucket, subjectMatches } from "./subjects.js";
 
@@ -202,23 +204,31 @@ export function agentCredentialLifecycleUid(creds: string, space: string): strin
   return ids.size === 1 && !grants.some((row) => subjectMatches(row, watch)) ? [...ids][0] : undefined;
 }
 
-/** Verify the native NATS signature, current window and matching user seed under supplied
- *  public account/signing pins. The caller must obtain those pins from trusted space authority.
- *  This does not prove revocation, broker admission or a lifecycle/generation's current state. */
-export function verifyStaticUserCredential(creds: string, expected: { accountPub: string; signingPub: string }) {
+/** Verify the native NATS signature, matching user seed and account/signing pins. The caller must
+ *  obtain those pins from trusted space authority. Out-of-window credentials are accepted only when
+ *  explicitly requested. This does not prove revocation, broker admission or lifecycle state. */
+export function verifyStaticUserCredential(
+  creds: string,
+  expected: { accountPub: string; signingPub: string },
+  options: { allowOutOfWindow?: boolean; requireProfile?: boolean } = {},
+) {
   try {
     if (typeof creds !== "string" || Buffer.byteLength(creds, "utf8") > 1_048_576 || !expected.accountPub.startsWith("A") || !expected.signingPub.startsWith("A")) throw new Error();
     const jwt = jwtFromCreds(creds);
     if (!jwt) throw new Error();
-    // decode verifies the nkey signature; it is not exhaustive NATS policy validation.
     const claims = decode<Record<string, unknown>>(jwt), identity = identityFromCreds(creds).id;
     const nats = claims.nats, now = Math.floor(Date.now() / 1000);
     if (!nats || typeof nats !== "object" || Array.isArray(nats) || nats.type !== Types.User || !isUserNkey(identity) || claims.sub !== identity || claims.iss !== expected.signingPub) throw new Error();
     if (expected.signingPub === expected.accountPub ? nats.issuer_account !== undefined && nats.issuer_account !== expected.accountPub : nats.issuer_account !== expected.accountPub) throw new Error();
     if (claims.aud !== undefined && claims.aud !== "NATS" || !Number.isSafeInteger(claims.iat) || claims.iat < 0) throw new Error();
-    if (claims.exp !== undefined && (!Number.isSafeInteger(claims.exp) || claims.exp <= now) || claims.nbf !== undefined && (!Number.isSafeInteger(claims.nbf) || claims.nbf > now)) throw new Error();
-    return { identity, accountPub: expected.accountPub, expiresAt: claims.exp ?? null, permissionFields: { pub: nats.pub ?? null, sub: nats.sub ?? null, resp: nats.resp ?? null }, principalTags: nats.tags ?? [], brokerAdmitted: false as const };
-  } catch { throw new Error("verifyStaticUserCredential: no currently valid matching native user credential under the supplied account/signing pins"); }
+    if (claims.exp !== undefined && (!Number.isSafeInteger(claims.exp) || claims.exp < 0 || !options.allowOutOfWindow && claims.exp <= now) || claims.nbf !== undefined && (!Number.isSafeInteger(claims.nbf) || claims.nbf < 0 || !options.allowOutOfWindow && claims.nbf > now)) throw new Error();
+    const tags: unknown = nats.tags;
+    if (tags !== undefined && (!Array.isArray(tags) || !tags.every((tag: unknown) => typeof tag === "string"))) throw new Error();
+    const markers = (tags ?? []).filter((tag: string) => tag.startsWith("profile:"));
+    const profile: Profile | null = markers.length === 1 ? PROFILES.find((value) => `profile:${value}` === markers[0]) ?? null : null;
+    if (options.requireProfile && profile === null) throw new Error();
+    return { identity, accountPub: expected.accountPub, expiresAt: claims.exp ?? null, permissionFields: { pub: nats.pub ?? null, sub: nats.sub ?? null, resp: nats.resp ?? null }, principalTags: tags ?? [], profile, brokerAdmitted: false as const };
+  } catch { throw new Error("verifyStaticUserCredential: no matching native user credential under the supplied account/signing pins"); }
 }
 
 /** Ms until a source-fed cred's RENEWAL point — 75% of its iat→exp lifetime (the cert-manager-style

@@ -30,7 +30,7 @@ import { createHash } from "node:crypto";
 import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { accountRevocations, createSpaceAuth, mintCreds, mintLifecycleUid, newIdentity } from "@cotal-ai/core";
+import { accountRevocations, createSpaceAuth, credsClaims, identityFromCreds, mintCreds, mintLifecycleUid, newIdentity } from "@cotal-ai/core";
 import { assertSmokeSandboxDown, createSuite, freePort, recordSmokeSandbox, type SmokeSandboxAnchor } from "@cotal-ai/smoke-kit";
 
 const WT = resolve(import.meta.dirname, "..", "..", "..");
@@ -110,9 +110,7 @@ try {
 
   const stopped = cli(root, "down", "--yes", "--json");
   check("down --yes stops the stack", stopped.status === 0, shown(stopped));
-
-  // 2. After down: confirmation, the revocation, a repeat, and a foreign credential.
-  let revocation: unknown;
+  let revocation: unknown, legacyFile = "";
   {
     const before = accountDigest(root);
     const unconfirmed = cli(root, "auth", "revoke-credential", leaked, "--json");
@@ -123,7 +121,8 @@ try {
     check("with --yes it revokes the creds file's key, to take effect at the next up",
       revoked.status === 0 && result.publicKey === key && result.source === "creds-file" && result.alreadyRevoked === false && result.takesEffect === "next-up" && typeof result.revokedAt === "number", shown(revoked));
     const auth = await getSpaceAuth(workspaceSecretStore(root), space);
-    check("the space's account JWT now revokes that key at that time", auth !== undefined && accountRevocations(auth.account.jwt)[key] === result.revokedAt);
+    if (!auth) throw new Error("the space authority disappeared before the legacy observer fixture was minted");
+    check("the space's account JWT now revokes that key at that time", accountRevocations(auth.account.jwt)[key] === result.revokedAt);
     const again = cli(root, "auth", "revoke-credential", key, "--yes", "--json");
     check("by public key again it reports the same time and changes nothing",
       again.status === 0 && again.env?.outcome === "no-op" && again.env.result?.alreadyRevoked === true && again.env.result.revokedAt === result.revokedAt, shown(again));
@@ -164,6 +163,15 @@ try {
           && sys.env.error.remedy === `cotal down --yes, then ${codeSpan("cotal up --rotate-sys")}, from ${shellPath(root)}, issues a new system account and retires this one's credentials; full backups taken before it can no longer be restored`, shown(sys));
     }
     check("  and none of them changes the account record", accountDigest(root) === unchanged);
+    const legacyKey = newIdentity(), legacyMarked = await mintCreds(auth, legacyKey, "observer");
+    const legacyClaims = credsClaims(legacyMarked), legacySeed = identityFromCreds(legacyMarked);
+    const { encodeUser, fmtCreds } = await import("@nats-io/jwt"), { fromPublic, fromSeed } = await import("@nats-io/nkeys");
+    const legacyNats = legacyClaims.nats as NonNullable<Parameters<typeof encodeUser>[3]> & { tags?: unknown[] };
+    const unmarkedJwt = await encodeUser("observer", fromPublic(legacySeed.id), fromPublic(auth.account.pub), { ...legacyNats, tags: legacyNats.tags?.filter((tag): tag is string => typeof tag === "string" && !tag.startsWith("profile:")) }, { signer: fromSeed(new TextEncoder().encode(auth.account.signingSeed)) });
+    legacyFile = join(root, "legacy-observer.creds");
+    writeFileSync(legacyFile, new TextDecoder().decode(fmtCreds(unmarkedJwt, fromSeed(new TextEncoder().encode(legacySeed.seed)))), { mode: 0o600 });
+    const legacyRevoked = cli(root, "auth", "revoke-credential", legacyFile, "--yes", "--json");
+    check("a revoked unmarked observer credential is recognized as revoked", legacyRevoked.status === 0 && legacyRevoked.env?.result?.publicKey === legacySeed.id, shown(legacyRevoked));
     const labelRevoked = cli(root, "auth", "revoke-credential", labelFile, "--yes", "--json");
     check("the label's standing file is revoked by its path", labelRevoked.status === 0 && labelRevoked.env?.result?.publicKey === labelKey, shown(labelRevoked));
   }
@@ -178,6 +186,8 @@ try {
     const revokedAt = new Date(Number(revocation) * 1000).toISOString();
     check("  and names the revoked key, its file and when it was revoked",
       refused.env?.error?.message === `credentials rejected at ${server}: the key ${key} in ${leaked} was revoked at ${revokedAt} with auth revoke-credential`, refused.env?.error);
+    const legacyRefused = cli(root, "who", "--json", "--creds", legacyFile, "--space", space, "--server", server);
+    check("revoked unmarked profile advice names a trusted-source profile instead of defaulting to agent", legacyRefused.status === 2 && legacyRefused.env?.error?.code === "PERMISSION_DENIED" && legacyRefused.env.error.remedy?.includes("choose the intended profile from a trusted source") === true && legacyRefused.env.error.remedy.includes("--profile <intended-profile>") && !legacyRefused.env.error.remedy.includes("--profile agent"), shown(legacyRefused));
     // A revoked label file is no healthy row, and --replace gives the label a new key at once.
     const labelDoctor = cli(root, "doctor", "auth", "--json");
     const labelRow = ((labelDoctor.env?.result?.items ?? []) as { label: string; state: string; problem: string | null; repair: string | null; revokedAt: number | null }[]).find((row) => row.label === "standing.creds");

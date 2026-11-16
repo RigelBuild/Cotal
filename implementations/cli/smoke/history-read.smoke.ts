@@ -358,22 +358,21 @@ try {
   check("an agent credential whose grant names no channel is refused with that grant, before any read names a subject",
     none.status === 2 && none.envelope?.error?.code === "PERMISSION_DENIED" && none.envelope.error.message === `this credential may not read #general in ${space}: its history grant is no channel`, shown(none));
 
-  // ── a write the broker refuses for the credential's grant applied nothing ───────────────────────
   // An observer credential may read but not write channel metadata or purge history. Each refusal
-  // names the profile and the write, points at the operator credential, and leaves the state that
-  // the later sections read as it was.
+  // names the refused write and subject without inferring a profile from the unverified holder name,
+  // points at the operator credential, and leaves the state that later sections read unchanged.
   const observer = join(home, "observer.creds");
   writeFileSync(observer, await mintCreds(auth, newIdentity(), "observer"), { mode: 0o600 });
   const asObserver = ["--creds", observer, "--space", space, "--server", servers, "--json"];
   const deniedWrites: [string, string[], RegExp][] = [
-    ["channel set", ["channel", "set", "general", "--desc", "x"], /^this observer credential may not write channel metadata in \S+, so nothing was saved: Permissions Violation/],
-    ["channel remove", ["channel", "remove", "general", "--yes"], /^this observer credential may not remove channel metadata in \S+, so nothing was removed: Permissions Violation/],
-    ["channel remove --purge", ["channel", "remove", "general", "--purge", "--yes"], /^this observer credential may not purge #general's history and remove its metadata in \S+, so nothing was removed: Permissions Violation/],
-    ["history clear", ["history", "clear", "--yes"], /^this observer credential may not purge retained history in \S+, so nothing was purged: Permissions Violation/],
+    ["channel set", ["channel", "set", "general", "--desc", "x"], /^this credential may not write channel metadata in \S+, so nothing was saved: Permissions Violation/],
+    ["channel remove", ["channel", "remove", "general", "--yes"], /^this credential may not remove channel metadata in \S+, so nothing was removed: Permissions Violation/],
+    ["channel remove --purge", ["channel", "remove", "general", "--purge", "--yes"], /^this credential may not purge #general's history and remove its metadata in \S+, so nothing was removed: Permissions Violation/],
+    ["history clear", ["history", "clear", "--yes"], /^this credential may not purge retained history in \S+, so nothing was purged: Permissions Violation/],
   ];
   for (const [what, args, message] of deniedWrites) {
     const r = await run([...args, ...asObserver]);
-    check(`a ${what} the broker refuses is PERMISSION_DENIED, exit 2, naming the profile and the write, with the operator credential as the Next`,
+    check(`a ${what} the broker refuses is PERMISSION_DENIED, exit 2, naming the refused write without a profile and keeping the operator credential as the Next`,
       r.status === 2 && r.envelope?.outcome === "refused" && r.envelope.error?.code === "PERMISSION_DENIED" && message.test(r.envelope.error.message) && (r.envelope.error.remedy ?? "").startsWith("run it without --creds to use the operator credential this machine records for"), shown(r));
   }
 
