@@ -553,6 +553,15 @@ try {
       claims3.sub === sub1, { sub1, sub3: claims3.sub });
     check("  and it is bounded, so the renewal seam's own remedy now has a CLI form",
       typeof claims3.exp === "number" && claims3.exp > (claims3.iat ?? 0), claims3);
+    const foreign = join(root, "foreign-authority.creds");
+    const foreignAuth = await createSpaceAuth(SPACE);
+    const foreignIdentity = newIdentity();
+    writeFileSync(foreign, await mintCreds(foreignAuth, foreignIdentity, "observer"), { mode: 0o600 });
+    const refusedForeign = await runMint(["untrusted-source", "--profile", "observer", "--identity", foreign, "--out", remint, "--json"]);
+    const refusedEnvelope = JSON.parse(refusedForeign.out) as { error?: { code?: string; message?: string; remedy?: string } };
+    check("--identity refuses a credential signed by pins other than this space's current issuer",
+      refusedForeign.code === 1 && refusedEnvelope.error?.code === "SCHEMA_INVALID" && refusedEnvelope.error.message?.includes("current issuer pins") === true &&
+        refusedEnvelope.error.remedy === "mint a fresh key: run auth mint without --identity" && !existsSync(remint), refusedEnvelope);
     const agentFirst = join(root, "incarnation-first.creds");
     const agentMint = await runMint(["incarnation", "--profile", "agent", "--out", agentFirst]);
     const firstAgentClaims = credsClaims(readFileSync(agentFirst, "utf8"));

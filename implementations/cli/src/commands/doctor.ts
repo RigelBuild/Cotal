@@ -357,7 +357,7 @@ function exportedCredentials(root: string, auth: SpaceAuth): ExportedRow[] {
     }
     const revokedAt = claims.sub === undefined ? undefined : revocations[claims.sub];
     if (revokedAt !== undefined && (claims.iat === undefined || claims.iat <= revokedAt))
-      Object.assign(row, { state: "revoked", revokedAt, repair: `${verified.profile === null ? "this credential's profile is unmarked, so its identity, grants and lifecycle UID cannot be reused safely; " : ""}its key was revoked at ${at(revokedAt)}, and auth mint --identity refuses that key; ${fresh}` });
+      Object.assign(row, { state: "revoked", revokedAt, repair: `its key was revoked at ${at(revokedAt)}, and auth mint --identity refuses that key; ${fresh}` });
     rows.push(row);
   }
   return rows.sort((x, y) => x.label.localeCompare(y.label) || x.path.localeCompare(y.path));
