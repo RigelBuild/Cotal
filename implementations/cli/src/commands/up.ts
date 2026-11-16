@@ -2135,8 +2135,7 @@ async function runUp(args: ParsedArgs, inheritedLock?: MaintenanceLock, onAdopt?
       const controlPlane = await startDeliveryWithBroker(held.space, server, wantTls, {
         open: held.mode === "open",
         runtime: values.runtime,
-        attachHost: attachHostFor(held.space, values.host),
-        seatMintCap,
+        seatMintCap: readManagerSeatMintCap({ root: cotalRoot(), space: held.space }),
       }, startAuth);
       if (!controlPlane) process.exitCode = 1;
       // #883: a refresh that HEALED a missing manager must say so — the summary line otherwise reads
@@ -3747,8 +3746,7 @@ async function upManifest(file: string, opts: UpManifestFlags): Promise<void> {
   try {
     // `m.broker?.host`, not the defaulted `host`: same reason as the flag path — only a host the
     // manifest actually declared is an exposure decision worth persisting.
-    ({ pid, controlPlane, authService, deliveryResponderBound } = await startMeshDetached({ transport: opts.transport, server, space: m.space, open, userAuth, rotateSys: opts.rotateSys, host: m.broker?.host, logFile: m.broker?.logFile, logfileSizeLimit: m.broker?.logfileSizeLimit, logfileMaxNum: m.broker?.logfileMaxNum, seed: manifestToChannels(eff), runtime, launch: specPath, maxSessions: opts.maxSessions, noManager: effectiveNoManager, quietBoot: opts.freshTeamBoot, ...(opts.storeDir ? { storeDir: opts.storeDir } : {}) }));
-  } catch (e) {
+    ({ pid, controlPlane, authService, deliveryResponderBound } = await startMeshDetached({ transport: opts.transport, server, space: m.space, open, userAuth, rotateSys, host: m.broker?.host, logFile: m.broker?.logFile, logfileSizeLimit: m.broker?.logfileSizeLimit, logfileMaxNum: m.broker?.logfileMaxNum, seed: manifestToChannels(eff), runtime, launch: specPath, maxSessions: opts.maxSessions, seatMintCap: readManagerSeatMintCap({ root: cotalRoot(), space: m.space }), noManager: effectiveNoManager, quietBoot: opts.freshTeamBoot, ...(opts.storeDir ? { storeDir: opts.storeDir } : {}) }));
     if (opts.freshTeamBoot) throw new CommandFailure("unknown", "OPERATION_UNKNOWN", "the fresh broker startup did not confirm completion after its launch spec was written; the listener or control plane may have changed state and the boot was not retried", { target: { space: m.space, deploymentId, launchSpec: specPath }, changed: [{ kind: "launch-spec-written", path: specPath }], remedy: "inspect this exact run and the recorded local listener, manager and auth state before another boot" });
     // A classified failure, such as a certificate this client refuses, keeps its code and next step.
     if (isCommandFailure(e)) throw e;
@@ -4115,7 +4113,6 @@ async function serveReadyListener(l: {
   // --preserve-state` then a bare `up`) carries the operator's `--host` only in the registry, and
   // the record below is written whole, so reading it afterwards would find the field this very call
   // had just erased.
-  const attachHost = attachHostFor(space, l.host);
   const seatMintCap = readManagerSeatMintCap({ root: cotalRoot(), space });
   recordOurMesh({
     space, server, root: cotalRoot(),
@@ -4130,7 +4127,6 @@ async function serveReadyListener(l: {
     // previous launch. The bare case stays absent rather than recording the loopback default as
     // though the operator had chosen it.
     ...(attachHost ? { attachHost } : {}),
-    ...(seatMintCap !== undefined ? { seatMintCap } : {}),
     ...(l.maxFileStore !== undefined ? { maxFileStore: l.maxFileStore } : {}),
     storeDir: l.storeDir,
     ts: new Date().toISOString(),

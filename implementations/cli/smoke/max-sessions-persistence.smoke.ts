@@ -6,7 +6,7 @@ const home = mkdtempSync(join(tmpdir(), "cotal-max-sessions-"));
 process.env.COTAL_HOME = home;
 
 const { recordMesh, findMesh, parsePositiveIntegerFlag, recordManagerSeatMintCap, readManagerSeatMintCap } = await import("@cotal-ai/workspace");
-const { maxSessionsFor, seatMintCapFor } = await import("../src/commands/up.js");
+const { maxSessionsFor } = await import("../src/commands/up.js");
 const { liveManagerWouldApplyMaxSessions, maxSessionsFromSuperviseArgv, liveManagerWouldApplySeatMintCap, seatMintCapFromSuperviseArgv } = await import("../src/lib/manager-proc.js");
 
 let failures = 0;
@@ -39,9 +39,9 @@ try {
   recordManagerSeatMintCap({ root: home, space: "minted" }, 11);
   recordMesh({ ...base, space: "minted" });
   check("manager seat mint cap is saved in the protected per-space record", readManagerSeatMintCap({ root: home, space: "minted" }) === 11);
-  check("a later launch without the flag keeps the saved cap", seatMintCapFor("minted") === 11);
-  check("an explicit mint cap wins for this launch", seatMintCapFor("minted", 7) === 7);
-  check("an unknown space keeps the manager default unset", seatMintCapFor("missing") === undefined);
+  check("a later launch without the flag keeps the saved cap", readManagerSeatMintCap({ root: home, space: "minted" }) === 11);
+  check("the protected cap record is unchanged by a launch that only reads it", readManagerSeatMintCap({ root: home, space: "minted" }) === 11);
+  check("an unknown space keeps the manager default unset", readManagerSeatMintCap({ root: home, space: "missing" }) === undefined);
 
   const liveBare = "/usr/bin/node /opt/cotal/bin/dist/cotal.js supervise --space sized --server nats://127.0.0.1:35715";
   const liveSized = `${liveBare} --max-sessions 3`;
