@@ -557,11 +557,12 @@ try {
     const foreignAuth = await createSpaceAuth(SPACE);
     const foreignIdentity = newIdentity();
     writeFileSync(foreign, await mintCreds(foreignAuth, foreignIdentity, "observer"), { mode: 0o600 });
-    const refusedForeign = await runMint(["untrusted-source", "--profile", "observer", "--identity", foreign, "--out", remint, "--json"]);
+    const refusedOutput = join(root, "untrusted-source.creds");
+    const refusedForeign = await runMint(["untrusted-source", "--profile", "observer", "--identity", foreign, "--out", refusedOutput, "--json"]);
     const refusedEnvelope = JSON.parse(refusedForeign.out) as { error?: { code?: string; message?: string; remedy?: string } };
     check("--identity refuses a credential signed by pins other than this space's current issuer",
       refusedForeign.code === 1 && refusedEnvelope.error?.code === "SCHEMA_INVALID" && refusedEnvelope.error.message?.includes("current issuer pins") === true &&
-        refusedEnvelope.error.remedy === "mint a fresh key: run auth mint without --identity" && !existsSync(remint), refusedEnvelope);
+        refusedEnvelope.error.remedy === "mint a fresh key: run auth mint without --identity" && !existsSync(refusedOutput), refusedEnvelope);
     const agentFirst = join(root, "incarnation-first.creds");
     const agentMint = await runMint(["incarnation", "--profile", "agent", "--out", agentFirst]);
     const firstAgentClaims = credsClaims(readFileSync(agentFirst, "utf8"));

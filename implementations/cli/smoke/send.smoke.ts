@@ -53,7 +53,7 @@ import { pickFreePort } from "../../../packages/core/smoke/_free-port.js";
 import { startRosterFixture } from "../../../packages/core/smoke/_roster-service.js";
 
 const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-const EXPECTED = 83;
+const EXPECTED = 84;
 let pass = 0;
 let fail = 0;
 const check = (name: string, cond: boolean, extra?: unknown) => {
