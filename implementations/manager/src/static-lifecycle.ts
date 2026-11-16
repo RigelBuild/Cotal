@@ -512,7 +512,6 @@ export async function activateStaticLifecycle(
   return { slotRevision: revision };
 }
 
-
 /** Run the terminal's footprint cleanup AT MOST ONCE across resumes, and record that it finished
  *  DURABLY on the `terminalizing` slot BEFORE the caller's final CAS to `retired`.
  *
