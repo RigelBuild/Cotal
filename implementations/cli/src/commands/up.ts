@@ -86,7 +86,6 @@ import {
   recordManagerSeatCap,
   recordManagerSeatMintCap,
   parseSeatCapFlag,
-  seatCapText,
   CommandFailure,
   codeSpan,
   commandFailureReport,
@@ -2137,9 +2136,7 @@ async function runUp(args: ParsedArgs, inheritedLock?: MaintenanceLock, onAdopt?
         open: held.mode === "open",
         runtime: values.runtime,
         attachHost: attachHostFor(held.space, values.host),
-        maxSessions: maxSessionsFor(held.space, maxSessions),
-        seatMintCap: seatMintCapFor(held.space, seatMintCap),
-        noManager,
+        seatMintCap,
       }, startAuth);
       if (!controlPlane) process.exitCode = 1;
       // #883: a refresh that HEALED a missing manager must say so — the summary line otherwise reads
@@ -3491,7 +3488,7 @@ export async function prepareResumeTeamBoot(file: string, opts: { space: string;
   if (await isReachable(server)) throw new CommandFailure("refused", "CONFLICT", "the recorded broker address already answers; the stopped stack was not resumed over it", { target: { space: m.space, server: brokerAddressForDisplay(server) ?? "not displayable" } });
   const conn = await preflightConnectors(prepared);
   if (conn) throw new CommandFailure("refused", "DEPENDENCY_UNAVAILABLE", "connector preflight failed; nothing was resumed", { target: { space: m.space }, remedy: conn });
-  return { root: canonicalRoot(cotalRoot()), space: m.space, server, host: opts.recorded.host, mode, idp: m.broker?.idp, runtime, manifestPath: resolve(file), prepared: eff, transport: assertServesDialHost(opts.transport, new URL(server).hostname), maxSessions: undefined, seatMintCap: undefined, logFile: m.broker?.logFile, logfileSizeLimit: m.broker?.logfileSizeLimit, logfileMaxNum: m.broker?.logfileMaxNum };
+  return { root: canonicalRoot(cotalRoot()), space: m.space, server, host: opts.recorded.host, mode, idp: m.broker?.idp, runtime, manifestPath: resolve(file), prepared: eff, transport: assertServesDialHost(opts.transport, new URL(server).hostname), maxSessions: undefined, seatMintCap: readManagerSeatMintCap({ root: cotalRoot(), space: m.space }), logFile: m.broker?.logFile, logfileSizeLimit: m.broker?.logfileSizeLimit, logfileMaxNum: m.broker?.logfileMaxNum };
 }
 
 /** The recorded broker transport of a prepared root, decided without persisting anything: a team
@@ -4119,8 +4116,7 @@ async function serveReadyListener(l: {
   // the record below is written whole, so reading it afterwards would find the field this very call
   // had just erased.
   const attachHost = attachHostFor(space, l.host);
-  const maxSessions = maxSessionsFor(space, l.maxSessions);
-  const seatMintCap = seatMintCapFor(space, l.seatMintCap);
+  const seatMintCap = readManagerSeatMintCap({ root: cotalRoot(), space });
   recordOurMesh({
     space, server, root: cotalRoot(),
     mode: setup?.prepared ? "user" : setup ? "auth" : "open",
@@ -4134,7 +4130,6 @@ async function serveReadyListener(l: {
     // previous launch. The bare case stays absent rather than recording the loopback default as
     // though the operator had chosen it.
     ...(attachHost ? { attachHost } : {}),
-    ...(maxSessions !== undefined ? { maxSessions } : {}),
     ...(seatMintCap !== undefined ? { seatMintCap } : {}),
     ...(l.maxFileStore !== undefined ? { maxFileStore: l.maxFileStore } : {}),
     storeDir: l.storeDir,
@@ -4636,21 +4631,7 @@ export function attachHostFor(space: string, explicit?: string): string | undefi
 export function maxSessionsFor(space: string, explicit?: number): number | undefined {
   return explicit ?? findMesh(space)?.maxSessions;
 }
-export function seatMintCapFor(space: string, explicit?: number): number | undefined {
-  return explicit ?? findMesh(space)?.seatMintCap;
-}
 
-/**
- * Did THIS launch bring the broker up, or is it re-recording one that was already there?
- *
- * The distinction is provenance, and it has to come from the call site because it cannot be
- * observed here: `started` covers the paths that spawned the broker or proved a listener this
- * attempt owns, and stamps `origin: "up"` — a record this machine can always write back, so the
- * liveness sweep and `cotal down` may drop it. `refresh` is the "a broker is already on this port"
- * branch, which concludes the mesh is up from reachability alone and starts nothing; stamping `up`
- * there would silently convert a hand-registered record into one the next sweep may delete, so it
- * keeps whatever origin the record already had.
- */
 type Provenance = "started" | "refresh";
 
 /** {@link recordOurMesh} under a name that says it is a test seam: the origin rule it enforces is

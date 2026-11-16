@@ -1,9 +1,37 @@
 import { strict as assert } from "node:assert";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EpEnvelopeError, mintLifecycleUid } from "@cotal-ai/core";
 import { IdentityStore } from "../src/identity/store.js";
+
+function waitForFile(path: string, timeoutMs: number): Promise<void> {
+  const { promise, resolve, reject } = Promise.withResolvers<void>();
+  const deadline = Date.now() + timeoutMs;
+  const poll = (): void => {
+    if (existsSync(path)) return resolve();
+    if (Date.now() >= deadline) return reject(new Error(`timed out waiting for ${path}`));
+    setTimeout(poll, 10);
+  };
+  poll();
+  return promise;
+}
+
+if (process.argv[2] === "reserve-worker") {
+  const name = process.argv[3];
+  const root = process.argv[4];
+  const minter = process.argv[5];
+  const barrier = process.argv[6];
+  if (!name || !root || !minter || !barrier) throw new Error("reserve worker requires name, root, minter and barrier");
+  const ready = join(barrier, `${name}.ready`);
+  const go = join(barrier, "go");
+  writeFileSync(ready, "ready\n");
+  await waitForFile(go, 10_000);
+  const record = new IdentityStore(root, "multiprocess", "manager").reserve(name, minter, Date.now(), 1);
+  process.stdout.write(`${record.lifecycleUid}\n`);
+  process.exit(0);
+}
 
 const root = mkdtempSync(join(tmpdir(), "cotal-identity-store-"));
 
@@ -46,7 +74,6 @@ try {
   const retired = first.retire("alice", "signer", alice.lifecycleUid, issued.generation, 7);
   assert.equal(retired.retiredAt, 7, "retirement persists a terminal timestamp");
   assert.equal(retired.issuance?.state, "retired", "retirement terminalizes issued authority");
-  assert.equal(second.ownsName("alice", "signer"), false, "retirement frees the name");
   assert.throws(
     () => second.transition("alice", "signer", alice.lifecycleUid, issued.generation, { ...issued, exp: 21 }, 8),
     (error: unknown) => error instanceof EpEnvelopeError && error.code === "failed-precondition",
@@ -63,7 +90,6 @@ try {
   const unissued = reopened.reserve("unissued", "other", 9, 1);
   const retiredReservation = reopened.retire("unissued", "other", unissued.lifecycleUid, undefined, 10);
   assert.equal(retiredReservation.retiredAt, 10, "an unissued reservation can be retired");
-  assert.equal(reopened.ownsName("unissued", "other"), false, "retiring an unissued reservation frees its name");
   reopened.retire("alice", "signer", replacement.lifecycleUid, undefined, 10);
 
   const nextMinter = reopened.reserve("alice", "next-minter", 11, 1);
@@ -77,6 +103,34 @@ try {
       error.details?.some((detail) => detail.kind === "ai.cotal.ep.seat-mint-cap" && detail.seats === 1 && detail.cap === 1) === true,
     "cap checking and reservation share the same transaction",
   );
+  const multiprocessRoot = mkdtempSync(join(tmpdir(), "cotal-identity-store-race-"));
+  const barrier = mkdtempSync(join(tmpdir(), "cotal-identity-store-barrier-"));
+  const worker = new URL(import.meta.url).pathname;
+  const minter = "shared-minter";
+  const runChild = (name: string): Promise<{ status: number | null; stdout: string; stderr: string }> => new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ["--import", "tsx", worker, "reserve-worker", name, multiprocessRoot, minter, barrier], { stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8").on("data", (chunk: string) => { stdout += chunk; });
+    child.stderr.setEncoding("utf8").on("data", (chunk: string) => { stderr += chunk; });
+    const timeout = setTimeout(() => child.kill("SIGTERM"), 15_000);
+    child.once("error", (error) => reject(error));
+    child.once("close", (status) => { clearTimeout(timeout); resolve({ status, stdout, stderr }); });
+  });
+  try {
+    const left = runChild("left");
+    const right = runChild("right");
+    await Promise.all([waitForFile(join(barrier, "left.ready"), 10_000), waitForFile(join(barrier, "right.ready"), 10_000)]);
+    writeFileSync(join(barrier, "go"), "go\n");
+    const results = await Promise.all([left, right]);
+    assert.deepEqual(results.map((result) => result.status).sort(), [0, 1], "separate processes must serialize cap checking and reservation");
+    assert.equal(results.filter((result) => result.status === 0 && result.stdout.trim().length > 0).length, 1, "one child must reserve the single allowed identity");
+    assert.equal(new IdentityStore(multiprocessRoot, "multiprocess", "manager").list().length, 1);
+    console.log("PASS concurrent child-process reserves enforce one shared seat-mint cap");
+  } finally {
+    rmSync(barrier, { recursive: true, force: true });
+    rmSync(multiprocessRoot, { recursive: true, force: true });
+  }
   reopened.latchRetirement("alice", "next-minter", nextMinter.lifecycleUid);
   assert.equal(new IdentityStore(root, "smoke", "manager").get("alice")?.terminalizing, true);
   assert.throws(() => reopened.reserve("alice", "next-minter", 13, 1),

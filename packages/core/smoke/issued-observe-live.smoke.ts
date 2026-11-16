@@ -17,9 +17,8 @@ import {
 import { SMOKE_BROKER_TOKEN, awaitBrokerReady, emitSentinel, killAndAwaitExit, teardownOnSignal } from "@cotal-ai/smoke-kit";
 import { isReachable } from "../src/index.js";
 import { pickFreePort } from "./_free-port.js";
-import { createSpaceAuth, mintPublicSeatUserJwt } from "../src/provision.js";
-import { acceptedBucket, acceptedKey } from "../src/issued-authority.js";
-import { credentialIdOf, epAuthBucket, mintLifecycleUid, newIdentity } from "../src/index.js";
+import { createSpaceAuth } from "../src/provision.js";
+import { credentialIdOf, epAuthBucket, mintLifecycleUid, mintPublicSeatUserJwt, newIdentity } from "../src/index.js";
 
 function evidenceForGeneration(actor: string, generation: string): IssuedEvidence {
   const ref: IssuedAuthorityRef = { space: "observe", owner: "local", actor, uid: "a".repeat(26), generation };

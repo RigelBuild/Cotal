@@ -66,49 +66,75 @@ function parseIssuance(raw: unknown): IdentityIssuance | undefined {
 }
 
 export function parseIdentityRecord(raw: unknown): IdentityRecord {
-  if (!object(raw) || Object.keys(raw).some((key) => !KEYS.has(key)) || raw.version !== 1 ||
-      typeof raw.name !== "string" || !raw.name || typeof raw.lifecycleUid !== "string" || !UID.test(raw.lifecycleUid) ||
-      typeof raw.minter !== "string" || !raw.minter || !Number.isSafeInteger(raw.reservedAt) || !Number.isSafeInteger(raw.touchedAt) ||
-      (raw.retiredAt !== undefined && !Number.isSafeInteger(raw.retiredAt)) ||
-      (raw.terminalizing !== undefined && raw.terminalizing !== true) ||
-      (raw.retirementExpiry !== undefined && (!Number.isSafeInteger(raw.retirementExpiry) || raw.terminalizing !== true)) ||
-      (raw.retirementError !== undefined && (typeof raw.retirementError !== "string" || raw.terminalizing !== true)) ||
-      (raw.publicKey !== undefined && (typeof raw.publicKey !== "string" || !USER_NKEY.test(raw.publicKey))))
-    throw new Error("invalid identity record");
+  if (!object(raw) || Object.keys(raw).some((key) => !KEYS.has(key))) throw new Error("invalid identity record");
+  const base = parseIdentityBase(raw);
+  const retirement = parseIdentityRetirement(raw);
+  if (raw.publicKey !== undefined && (typeof raw.publicKey !== "string" || !USER_NKEY.test(raw.publicKey)))
+    throw new Error("invalid identity record public key");
   const issuance = parseIssuance(raw.issuance);
   const initialIssuance = parseIssuance(raw.initialIssuance);
-  let renewal: IdentityRecord["renewal"];
-  if (raw.renewal !== undefined) {
-    if (!object(raw.renewal) || Object.keys(raw.renewal).some((key) => !["issuanceId", "iat", "exp"].includes(key)) ||
-        typeof raw.renewal.issuanceId !== "string" || !UID.test(raw.renewal.issuanceId) ||
-        !Number.isSafeInteger(raw.renewal.iat) || !Number.isSafeInteger(raw.renewal.exp) || issuance?.state !== "issued")
-      throw new Error("invalid identity renewal intent");
-    renewal = { issuanceId: raw.renewal.issuanceId, iat: raw.renewal.iat as number, exp: raw.renewal.exp as number };
-  }
-  if (raw.retiredAt !== undefined && issuance !== undefined && issuance.state !== "retired")
+  const renewal = requireValidRenewalIntent(raw.renewal, issuance);
+  if (retirement.retiredAt !== undefined && issuance !== undefined && issuance.state !== "retired")
     throw new Error("retired identity issuance must be terminal");
   return {
     version: 1,
-    name: raw.name,
-    lifecycleUid: raw.lifecycleUid,
-    minter: raw.minter,
-    reservedAt: raw.reservedAt as number,
-    touchedAt: raw.touchedAt as number,
-    ...(raw.retiredAt === undefined ? {} : { retiredAt: raw.retiredAt as number }),
-    ...(raw.publicKey === undefined ? {} : { publicKey: raw.publicKey as string }),
+    ...base,
+    ...retirement,
+    ...(raw.publicKey === undefined ? {} : { publicKey: raw.publicKey }),
     ...(issuance === undefined ? {} : { issuance }),
-    ...(renewal === undefined ? {} : { renewal }),
     ...(initialIssuance === undefined ? {} : { initialIssuance }),
+    ...(renewal === undefined ? {} : { renewal }),
+  };
+}
+
+
+const ISSUANCE_TRANSITIONS = new Set<string>([
+  "pending:pending", "pending:issued", "issued:issued", "issued:retiring", "retiring:retiring", "retiring:retired",
+]);
+
+function sameIssuanceAuthority(previous: IdentityIssuance, next: IdentityIssuance): boolean {
+  return previous.iat === next.iat && previous.exp === next.exp &&
+    previous.acceptedToken === next.acceptedToken && previous.issuanceId === next.issuanceId &&
+    (previous.credentialId === next.credentialId ||
+      (previous.state === "pending" && next.state === "issued" && previous.credentialId === undefined && next.credentialId !== undefined));
+}
+
+function canTransitionIssuance(previous: IdentityIssuance, next: IdentityIssuance): boolean {
+  if (previous.generation !== next.generation) return previous.state === "issued" && next.state === "issued";
+  return ISSUANCE_TRANSITIONS.has(`${previous.state}:${next.state}`) && sameIssuanceAuthority(previous, next);
+}
+
+function requireValidRenewalIntent(raw: unknown, issuance: IdentityIssuance | undefined): IdentityRecord["renewal"] {
+  if (raw === undefined) return undefined;
+  if (!object(raw) || Object.keys(raw).some((key) => !["issuanceId", "iat", "exp"].includes(key)) ||
+      typeof raw.issuanceId !== "string" || !UID.test(raw.issuanceId) ||
+      !Number.isSafeInteger(raw.iat) || !Number.isSafeInteger(raw.exp) || issuance?.state !== "issued")
+    throw new Error("invalid identity renewal intent");
+  return { issuanceId: raw.issuanceId, iat: raw.iat as number, exp: raw.exp as number };
+}
+
+function parseIdentityBase(raw: Record<string, unknown>): Pick<IdentityRecord, "name" | "lifecycleUid" | "minter" | "reservedAt" | "touchedAt"> {
+  if (raw.version !== 1 || typeof raw.name !== "string" || !raw.name || typeof raw.lifecycleUid !== "string" || !UID.test(raw.lifecycleUid) ||
+      typeof raw.minter !== "string" || !raw.minter || !Number.isSafeInteger(raw.reservedAt) || !Number.isSafeInteger(raw.touchedAt))
+    throw new Error("invalid identity record");
+  return {
+    name: raw.name, lifecycleUid: raw.lifecycleUid, minter: raw.minter,
+    reservedAt: raw.reservedAt as number, touchedAt: raw.touchedAt as number,
+  };
+}
+
+function parseIdentityRetirement(raw: Record<string, unknown>): Pick<IdentityRecord, "retiredAt" | "terminalizing" | "retirementExpiry" | "retirementError"> {
+  if ((raw.retiredAt !== undefined && !Number.isSafeInteger(raw.retiredAt)) ||
+      (raw.terminalizing !== undefined && raw.terminalizing !== true) ||
+      (raw.retirementExpiry !== undefined && (!Number.isSafeInteger(raw.retirementExpiry) || raw.terminalizing !== true)) ||
+      (raw.retirementError !== undefined && (typeof raw.retirementError !== "string" || raw.terminalizing !== true)))
+    throw new Error("invalid identity record");
+  return {
+    ...(raw.retiredAt === undefined ? {} : { retiredAt: raw.retiredAt as number }),
     ...(raw.terminalizing === true ? { terminalizing: true } : {}),
     ...(raw.retirementExpiry === undefined ? {} : { retirementExpiry: raw.retirementExpiry as number }),
     ...(raw.retirementError === undefined ? {} : { retirementError: raw.retirementError as string }),
   };
-}
-
-function sameIssuance(a: IdentityIssuance | undefined, b: IdentityIssuance | undefined): boolean {
-  return a === undefined ? b === undefined : b !== undefined &&
-    a.generation === b.generation && a.iat === b.iat && a.exp === b.exp &&
-    a.acceptedToken === b.acceptedToken && a.issuanceId === b.issuanceId && a.credentialId === b.credentialId && a.state === b.state;
 }
 
 function cloneRecord(record: IdentityRecord): IdentityRecord {
@@ -233,30 +259,6 @@ export class IdentityStore {
     });
   }
 
-  ownsName(name: string, minter: string): boolean {
-    return this.#withLock(() => {
-      const row = this.#current(name);
-      return row !== undefined && row.minter === minter && row.retiredAt === undefined && row.issuance?.state !== "retired";
-    });
-  }
-
-  put(record: IdentityRecord): void {
-    const parsed = parseIdentityRecord(record);
-    this.#withLock(() => {
-      const index = this.#indexByUid(parsed.lifecycleUid);
-      const current = index < 0 ? undefined : this.#records[index];
-      if (!current || current.name !== parsed.name || current.minter !== parsed.minter ||
-          current.reservedAt !== parsed.reservedAt || this.#current(parsed.name)?.lifecycleUid !== parsed.lifecycleUid)
-        throw identityError("conflict", "identity update does not match the current reserved UID");
-      if (parsed.publicKey !== current.publicKey || parsed.retiredAt !== current.retiredAt || !sameIssuance(parsed.issuance, current.issuance) || !sameIssuance(parsed.initialIssuance, current.initialIssuance) || JSON.stringify(parsed.renewal) !== JSON.stringify(current.renewal))
-        throw identityError("failed-precondition", "identity public-key, retirement, or issuance changes require their atomic store operation");
-      if (parsed.touchedAt < current.touchedAt)
-        throw identityError("conflict", "identity update is older than the current record");
-      if (parsed.touchedAt === current.touchedAt) return;
-      this.#records[index] = parsed;
-      this.#persist();
-    });
-  }
 
   reserve(name: string, minter: string, now = Date.now(), cap = 32): IdentityRecord {
     if (!Number.isSafeInteger(cap) || cap < 1)
@@ -360,23 +362,13 @@ export class IdentityStore {
         throw identityError("failed-precondition", "retired identity is terminal");
 
       const previous = current.issuance;
-      if (previous?.state === "retired")
-        throw identityError("failed-precondition", "retired issuance is terminal");
-      if (!previous) {
+      if (previous === undefined) {
         if (expectedGeneration !== undefined || (next.state !== "pending" && next.state !== "issued"))
           throw identityError("failed-precondition", "initial identity issuance must be pending or issued");
-      } else if (next.generation === previous.generation) {
-        const sameAuthority = next.iat === previous.iat && next.exp === previous.exp &&
-          next.acceptedToken === previous.acceptedToken && next.issuanceId === previous.issuanceId &&
-          (previous.credentialId === next.credentialId || (previous.state === "pending" && next.state === "issued" && previous.credentialId === undefined && next.credentialId !== undefined));
-        const allowed = next.state === previous.state ||
-          (previous.state === "pending" && next.state === "issued") ||
-          (previous.state === "issued" && next.state === "retiring") ||
-          (previous.state === "retiring" && next.state === "retired");
-        if (!sameAuthority || !allowed)
-          throw identityError("failed-precondition", "identity issuance transition is not allowed");
-      } else if (previous.state !== "issued" || next.state !== "issued") {
-        throw identityError("failed-precondition", "a renewed issuance must replace an issued generation");
+      } else if (!canTransitionIssuance(previous, next)) {
+        throw identityError("failed-precondition", previous.state === "retired"
+          ? "retired issuance is terminal"
+          : "identity issuance transition is not allowed");
       }
 
       const updated: IdentityRecord = {
@@ -436,7 +428,7 @@ export class IdentityStore {
       if (current.issuance?.generation !== expectedGeneration)
         throw identityError("conflict", "identity issuance generation changed before retirement");
       if (current.retiredAt !== undefined) return cloneRecord(current);
-      const { renewal: _renewal, ...settled } = current;
+      const { renewal: _renewal, retirementError: _retirementError, ...settled } = current;
       const retired: IdentityRecord = {
         ...settled,
         retiredAt: now,
@@ -450,9 +442,3 @@ export class IdentityStore {
   }
 }
 
-function recordName(name: string): string {
-  return Buffer.from(name, "utf8").toString("hex");
-}
-
-
-export function identityRecordFileName(name: string): string { return recordName(name); }

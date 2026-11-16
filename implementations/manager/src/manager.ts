@@ -96,6 +96,7 @@ import {
   withIssuerSession,
   renderOnceTask,
 } from "@cotal-ai/core";
+import { isAdoptedIdentity, readIdentitySnapshot } from "./identity/adoption.js";
 import { IdentityStore } from "./identity/store.js";
 import {
   identityMint,
@@ -107,8 +108,8 @@ import {
 } from "./identity/commands.js";
 import type { IdentityMintResult } from "./identity/commands.js";
 import { IdentityRetirementDriver, type IdentityRetirementServices } from "./identity/retirements.js";
-import { loadLaunchPersonaFile, PersonaSourceError } from "@cotal-ai/workspace";
-import { agentAuthState, agentCredsDir, agentLifecycleSecretFilePaths, agentSecretFilePaths, agentSecretKeyForFile, authDir, claimIdentityRecord, claimManagerSiblingIdentities, connectorInstallHint, DEFAULT_SEAT_CAP, DELIVERY_CREDS_KIND, extensionConnectors, findCotalRoot, getSpaceAuth, hasUserAuthState, loadExtensionsManifest, loadManagerInstanceIdentity, loadMeshes, localTrustOfSpace, manifestExtensionNames, materializeFromManifest, materializeSecretToFile, MEMBERSHIP_RW_CREDS_KIND, mergeLaunchOptions, probeLiveness, remintDaemonCreds, resolveAgentType, resolveOnPath, runtimeInstallHint, createManagerInstanceIdentity, SEAT_CAP_UNLIMITED, spaceKey, spaceMaterialKey, SYSTEM_CREDS_FILES, userAuthStateDir, workspaceSecretStore, writeRenewalRecord, type ManagerInstanceIdentity, type MeshEntry, type RenewalRecord, type SeatCap, type UserAuthInfo } from "@cotal-ai/workspace";
+import { loadLaunchPersonaFile, PersonaSourceError, DEFAULT_SEAT_MINT_CAP } from "@cotal-ai/workspace";
+import type { IdentityRecord } from "./identity/store.js";
 import type { ActionContext, AgentDef, RunAdmission, RunRevocation, AttachSession, Connector, ConnectorModelCatalog, ControlReply, CredHealth, DaemonStoreAnswer, DelegatedGrant, DeliveryLeaseInfo, EpCaller, EpErrorCode, EpErrorDetail, GrantOverreach, InlinePersona, IssuedSubjectPermissions, LaunchOpts, LaunchSpec, ManagedLifecycleHandoff, ManagerLeaseInfo, MeshLaunchAgent, Presence, RuntimeProvider, RuntimeReference, SecretStore, SecretStoreIdentity, SpaceAuth, StartupOutcome, UserAuthLaunch } from "@cotal-ai/core";
 import {
   createRuntime,
@@ -2015,7 +2016,7 @@ export class Manager {
   private readonly identityMintFlights = new Map<string, Promise<IdentityMintResult>>();
   private readonly identityRenewFlights = new Map<string, Promise<IdentityMintResult>>();
   private identityRetirementClock = () => Date.now();
-  private readonly identityRetirementDriver = new IdentityRetirementDriver(() => this.identityRetirementServices());
+  private readonly identityRetirementDriver = new IdentityRetirementDriver(() => this.identityServices());
   /** Readiness-race backstop (#159 B1) — the {@link READINESS_TIMEOUT_MS} constant, held as an instance
    *  field so a test can shorten it (the join/exit signals are event-driven; only the backstop is timed).
    *  Production leaves it at the constant. */
@@ -2131,7 +2132,7 @@ export class Manager {
       }
     }
     this.maxSessions = opts.maxSessions;
-    this.seatMintCap = opts.seatMintCap ?? 32;
+    this.seatMintCap = opts.seatMintCap ?? DEFAULT_SEAT_MINT_CAP;
     this.seatCap = opts.seatCap ?? DEFAULT_SEAT_CAP;
     this.remoteAuthority = opts.remoteAuthority;
     this.remoteExecutorCreds = opts.remoteAuthority?.executorCreds;
@@ -2670,7 +2671,7 @@ export class Manager {
     const startupReconcile = this.auth && !this.userMode ? this.reconcileStaticLifecycles() : undefined;
     if (startupReconcile)
       void startupReconcile.catch((e) => console.error(`! ${STARTUP_RECONCILING}: ${rejectionText(e)} - no per-alias retry could be planned; a later manager start re-reads unfinished durable terminals`));
-    if (this.identityStore) void this.recheckIdentityRetirements().catch((error) => console.error(`identity retirement sweep: ${rejectionText(error)}`));
+    if (this.identityStore) void this.identityRetirementDriver.recheckIdentityRetirements().catch((error) => console.error(`identity retirement sweep: ${rejectionText(error)}`));
     // A default stop records a user-mode seat it released while the seat was still running. This
     // start adopts that seat, or retires it when the runtime proves it gone. Static seats stay on
     // the sweep above.
@@ -4020,6 +4021,7 @@ export class Manager {
     if (this.leaseTimer) clearInterval(this.leaseTimer);
     await this.awaitStaticReconcileDrain();
     await starting?.catch(() => {});
+    if (this.leaseTimer) clearInterval(this.leaseTimer);
     if (this.credRenewTimer) clearInterval(this.credRenewTimer);
     if (this.endpointServeRenewalTimer) clearTimeout(this.endpointServeRenewalTimer);
     if (this.daemonRenewalLeaseTimer) clearInterval(this.daemonRenewalLeaseTimer);
@@ -5048,11 +5050,11 @@ export class Manager {
           throw new EpEnvelopeError("failed-precondition", "transcript-receive: this manager does not receive carried transcripts (its remote authority issues no transfer reader)");
         return this.transcripts.receive(args(ctx) as unknown as TranscriptReceiveInput);
       })),
-      identityReserve: (ctx) => this.serveGated(ctx, () => this.identityReserve(ctx)),
-      identityMint: (ctx) => this.serveGated(ctx, () => this.identityMint(ctx)),
-      identityRenew: (ctx) => this.serveGated(ctx, () => this.identityRenew(ctx)),
-      identityRetire: (ctx) => this.serveGated(ctx, () => this.identityRetire(ctx)),
-      identityRetireAdmin: (ctx) => this.serveGated(ctx, () => adminGated(ctx, () => this.identityRetireAdmin(ctx))),
+      identityReserve: (ctx) => this.serveGated(ctx, () => identityReserve(this.identityServices(), ctx)),
+      identityMint: (ctx) => this.serveGated(ctx, () => identityMint(this.identityServices(), ctx)),
+      identityRenew: (ctx) => this.serveGated(ctx, () => identityRenew(this.identityServices(), ctx)),
+      identityRetire: (ctx) => this.serveGated(ctx, () => identityRetire(this.identityServices(), ctx)),
+      identityRetireAdmin: (ctx) => this.serveGated(ctx, () => adminGated(ctx, () => identityRetireAdmin(this.identityServices(), ctx))),
     });
   }
 
@@ -9744,9 +9746,18 @@ export class Manager {
       failures.some((item) => item.disposition === "refused" || item.disposition === "refused-foreign" || item.disposition === "retry-exhausted") ? "failed" :
       this.staticReconcileSweepsInFlight > 0 ? "running" :
       failures.some((item) => item.disposition === "recovered") ? "recovered" : "idle";
+    let identityRetirementErrors: Array<{ name: string; message: string }> | undefined;
+    try {
+      identityRetirementErrors = this.identityStore?.list()
+        .flatMap((record) => record.retirementError === undefined ? [] : [{ name: record.name, message: record.retirementError }])
+        .sort((a, b) => a.name.localeCompare(b.name));
+    } catch (error) {
+      console.error(`identity retirement status: ${rejectionText(error)}`);
+    }
     return {
       state,
       ...(this.staticReconcileLastSweep ? { lastSweep: { ...this.staticReconcileLastSweep } } : {}),
+      ...(identityRetirementErrors === undefined || identityRetirementErrors.length === 0 ? {} : { identityRetirementErrors }),
       failures,
       retainedCustody: failures.filter((item) => item.retainedReason !== undefined && item.disposition !== "recovered").length,
       deferredSeats: failures.filter((item) => item.disposition === "deferred").length,
@@ -12467,31 +12478,6 @@ export class Manager {
     }
   }
 
-  private identityStoreForCommand(): IdentityStore {
-    if (this.remoteAuthority || this.userMode || !this.auth || !this.identityStore)
-      throw new EpEnvelopeError("unavailable", "manager identity commands require a local static-auth manager", undefined, "not-executed");
-    return this.identityStore;
-  }
-
-  private identityReserve(ctx: EpServeContext): { name: string; lifecycleUid: string } {
-    return identityReserve(this.identityCommandServices(), ctx);
-  }
-
-  private identityRetire(ctx: EpServeContext): Promise<Record<string, never>> {
-    return identityRetire(this.identityCommandServices(), ctx);
-  }
-
-  private identityRetireAdmin(ctx: EpServeContext): Promise<Record<string, never>> {
-    return identityRetireAdmin(this.identityCommandServices(), ctx);
-  }
-
-  private identityMint(ctx: EpServeContext): Promise<IdentityMintResult> {
-    return identityMint(this.identityCommandServices(), ctx);
-  }
-
-  private identityRenew(ctx: EpServeContext): Promise<IdentityMintResult> {
-    return identityRenew(this.identityCommandServices(), ctx);
-  }
 
   /** `chat-session-open`: admit one static chat session. The manager draws the `chat_` alias and a
    *  fresh nkey identity, then runs the same native steps a static spawn does: the slot intent and
@@ -12797,15 +12783,6 @@ export class Manager {
     }
   }
 
-  /** An unadopted live-phase row with credentials and no custody reference, on a runtime that cannot
-   *  prove its seat gone, terminalizes only once its credentials have expired. */
-  private isAdoptedIdentity(row: StaticManagedSlotRow): boolean {
-    const record = this.identityStore?.getByUid(row.lifecycleUid);
-    return record !== undefined && record.name === row.alias && record.publicKey === row.actor && row.owner === DEV_OWNER &&
-      record.retiredAt === undefined &&
-      (record.issuance?.state === "pending" ||
-        (record.issuance?.state === "issued" && row.phase === "active" && record.issuance.credentialId !== undefined && row.credentialIds.includes(record.issuance.credentialId)));
-  }
 
   private credentialGateApplies(row: StaticManagedSlotRow, adopted: boolean): boolean {
     if (adopted || (row.phase !== "active" && row.phase !== "provisioning")) return false;
@@ -12866,48 +12843,40 @@ export class Manager {
   private onCredRenewTick(): void {
     void this.renewDaemonCreds();
     void this.recheckDeferredSeats();
-    void this.recheckIdentityRetirements().catch((error) => console.error(`identity retirement sweep: ${rejectionText(error)}`));
+    void this.identityRetirementDriver.recheckIdentityRetirements().catch((error) => console.error(`identity retirement sweep: ${rejectionText(error)}`));
   }
 
-  private identityCommandServices(): IdentityCommandServices {
+  private identityStoreForCommand(): IdentityStore {
+    if (!this.identityStore || !this.auth || this.userMode)
+      throw new EpEnvelopeError("unavailable", "identity commands require a local static-auth manager with an identity store", undefined, "not-executed");
+    return this.identityStore;
+  }
+
+  private identityServices(): IdentityCommandServices & IdentityRetirementServices {
     return {
       managerName: this.name,
       seatMintCap: this.seatMintCap,
+      identityStore: this.identityStore,
       auth: this.auth,
       managerLifecycleUid: this.managerLifecycleUid,
       managerInstanceId: this.managerInstanceId,
       identityMintFlights: this.identityMintFlights,
       identityRenewFlights: this.identityRenewFlights,
-      identityStoreForCommand: () => this.identityStoreForCommand(),
-      withLifecycleExecutor: (pin, fn) => this.withLifecycleExecutor(pin, fn),
-      withProvisioner: (fn) => this.withProvisioner(fn),
-      withIssuer: (fn) => this.withIssuer(fn),
-      issuanceSeam: (issuer, mode, identity, exp) => this.issuanceSeam(issuer, mode, identity, exp),
-      recheckIdentityRetirements: () => this.recheckIdentityRetirements(),
-    };
-  }
-
-  private identityRetirementServices(): IdentityRetirementServices {
-    return {
-      identityStore: this.identityStore,
-      auth: this.auth,
-      identityRenewFlights: this.identityRenewFlights,
       staticReconcileStopping: this.staticReconcileStopping,
-      managerLifecycleUid: this.managerLifecycleUid,
-      managerInstanceId: this.managerInstanceId,
       space: this.space,
       servers: this.servers,
       staticLifecycleEvict: this.staticLifecycleEvict,
       retiredPrincipals: this.retiredPrincipals,
       identityRetirementClock: this.identityRetirementClock,
+      identityStoreForCommand: () => this.identityStoreForCommand(),
       withLifecycleExecutor: (pin, fn) => this.withLifecycleExecutor(pin, fn),
+      withProvisioner: (fn) => this.withProvisioner(fn),
       withIssuer: (fn) => this.withIssuer(fn),
+      issuanceSeam: (issuer, mode, identity, exp) => this.issuanceSeam(issuer, mode, identity, exp),
+      recheckIdentityRetirements: () => this.identityRetirementDriver.recheckIdentityRetirements(),
     };
   }
 
-  private recheckIdentityRetirements(): Promise<void> {
-    return this.identityRetirementDriver.recheckIdentityRetirements();
-  }
 
   /** The renewal tick's re-check: a deferred seat whose credential has expired takes the terminal. */
   private recheckDeferredSeats(): Promise<void> {
@@ -12919,6 +12888,14 @@ export class Manager {
 
   private async driveDeferredRecheck(): Promise<void> {
     if (!this.auth || this.staticReconcileStopping) return;
+    let identityByUid: ReadonlyMap<string, IdentityRecord> = new Map();
+    let identitySnapshotAvailable = true;
+    try {
+      identityByUid = readIdentitySnapshot(this.identityStore);
+    } catch (error) {
+      identitySnapshotAvailable = false;
+      console.error(`deferred re-check identity snapshot failed; identity slots will remain deferred: ${rejectionText(error)}`);
+    }
     const due = [...this.staticReconcileItems].filter(([, item]) =>
       // Same whole-second test as credentialDeferral, so a due seat is never deferred again.
       item.disposition === "deferred" && (item.deferUntil === undefined || Math.floor(Date.parse(item.deferUntil) / 1000) < Math.floor(Date.now() / 1000)));
@@ -12931,7 +12908,11 @@ export class Manager {
           const row = await this.readStaticReconcileSlot(item.alias);
           if (this.staticReconcileItems.get(key) !== item || item.disposition !== "deferred" || item.flight !== undefined) continue;
           const live = row === undefined ? undefined : this.agents.get(row.alias);
-          if (row === undefined || row.lifecycleUid !== item.lifecycleUid || row.actor !== item.actor || (row.phase !== "active" && row.phase !== "provisioning") || live?.lifecycleUid === row.lifecycleUid || this.isAdoptedIdentity(row)) {
+          if (!identitySnapshotAvailable && row?.alias.startsWith(`${this.name}-`)) {
+            item.lastError = "identity backing store is unreadable; retry after repairing it";
+            continue;
+          }
+          if (row === undefined || row.lifecycleUid !== item.lifecycleUid || row.actor !== item.actor || (row.phase !== "active" && row.phase !== "provisioning") || live?.lifecycleUid === row.lifecycleUid || this.isAdoptedIdentity(row, identityByUid)) {
             this.staticReconcileItems.delete(key);
             console.error(`static reconcile deferred alias=${item.alias} uid=${item.lifecycleUid} left the deferred set: the durable slot is ${row === undefined ? "absent" : `${row.phase} at uid ${row.lifecycleUid}`}`);
             continue;
@@ -13214,7 +13195,14 @@ export class Manager {
       const terminalRows: StaticManagedSlotRow[] = [];
       const plannedRows: Array<{ row: StaticManagedSlotRow; adopted: boolean }> = [];
       const joinedFlights: Array<Promise<StaticReconcileAttempt>> = [];
-      const restartRows: Array<{ row: StaticManagedSlotRow; record: SeatRecord }> = [];
+      let identityByUid: ReadonlyMap<string, IdentityRecord> = new Map();
+      let identitySnapshotAvailable = true;
+      try {
+        identityByUid = readIdentitySnapshot(this.identityStore);
+      } catch (error) {
+        identitySnapshotAvailable = false;
+        console.error(`static reconcile identity snapshot failed; identity slots will be deferred: ${rejectionText(error)}`);
+      }
       for (const row of slotRows) {
         if (row.phase === "retired") {
           // A retirement is a GLOBAL refusal fact — seed the retired-principal index for EVERY retired incarnation
@@ -13247,7 +13235,12 @@ export class Manager {
         // at the SAME uid is never an orphan (empty at boot; exactly the adopted set at the
         // post-adoption sweep — the fix for the resume hole).
         const live = this.agents.get(row.alias);
-        const adopted = live !== undefined && live.lifecycleUid === row.lifecycleUid || this.isAdoptedIdentity(row);
+        if (!identitySnapshotAvailable && row.alias.startsWith(`${this.name}-`)) {
+          deferredSlots++;
+          console.error(`static reconcile deferred alias=${row.alias} uid=${row.lifecycleUid}: identity backing store is unreadable; retry after repairing it`);
+          continue;
+        }
+        const adopted = live !== undefined && live.lifecycleUid === row.lifecycleUid || this.isAdoptedIdentity(row, identityByUid);
         if (adopted) {
           preservedAdopted++;
         }

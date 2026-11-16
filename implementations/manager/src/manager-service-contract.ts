@@ -225,6 +225,7 @@ const STATUS_OUTPUT_SCHEMA = {
         retainedCustody: { type: "integer", minimum: 0 },
         /** Items held `deferred`: an unreachable seat whose credential has not expired. */
         deferredSeats: { type: "integer", minimum: 0 },
+        identityRetirementErrors: { type: "array", items: { type: "object", additionalProperties: false, required: ["name", "message"], properties: { name: { type: "string" }, message: { type: "string" } } } },
         lastSweep: {
           type: "object",
           additionalProperties: false,
@@ -355,6 +356,7 @@ export interface ManagerStaticReconciliationStatus {
   /** Items with disposition `deferred`. */
   deferredSeats: number;
   lastSweep?: ManagerStaticReconciliationSweep;
+  identityRetirementErrors?: Array<{ name: string; message: string }>;
   failures: ManagerStaticReconciliationFailure[];
 }
 
