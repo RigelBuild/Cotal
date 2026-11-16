@@ -353,6 +353,7 @@ try {
     channels: [],
     consume: false,
     watchChannels: false,
+    watchPresence: false,
     card: { owner: payload.sub, actor: payload.act.actor, name: "registered-participant", kind: "endpoint" },
   });
   endpoint.on("error", () => {});

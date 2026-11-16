@@ -26,10 +26,11 @@ The output schemas below describe successful command results, not the protocol e
 
 ## manager
 
-Cluster `ai.cotal.manager`, revision 51. 46 commands.
+Cluster `ai.cotal.manager`, revision 52. 47 commands.
 
 | Command                                                   | Capability          | Class     | Target modes |
 | --------------------------------------------------------- | ------------------- | --------- | ------------ |
+| [`roster`](#manager-roster)                               | `manager.read`      | ephemeral | untargeted   |
 | [`vitals`](#manager-vitals)                               | `manager.vitals`    | ephemeral | untargeted   |
 | [`status`](#manager-status)                               | `manager.read`      | ephemeral | untargeted   |
 | [`ps`](#manager-ps)                                       | `manager.read`      | ephemeral | untargeted   |
@@ -76,6 +77,105 @@ Cluster `ai.cotal.manager`, revision 51. 46 commands.
 | [`release-seat`](#manager-release-seat)                   | `manager.admin`     | ephemeral | untargeted   |
 | [`attest-gone`](#manager-attest-gone)                     | `manager.admin`     | ephemeral | untargeted   |
 | [`allowlist-set`](#manager-allowlist-set)                 | `manager.admin`     | ephemeral | untargeted   |
+
+### manager roster
+
+Registered declaration:
+
+```json
+{
+  "name": "roster",
+  "class": "ephemeral",
+  "targeted": false,
+  "capability": "manager.read",
+  "inputDigest": "sha256:e04e68c50257f2baddf6c91a3db7a6b1d275b539ea8c153bc39c193559c74ce4",
+  "outputDigest": "sha256:020e87b7d5643ec8e6638cd5138acd5eae9b9a38935bcbb1b52526002ef68cc7"
+}
+```
+
+Input schema:
+
+```json
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "limit": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 100
+    },
+    "after": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    }
+  }
+}
+```
+
+Output schema:
+
+```json
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "rows"
+  ],
+  "properties": {
+    "rows": {
+      "type": "array",
+      "maxItems": 100,
+      "items": {
+        "type": "object",
+        "required": [
+          "card",
+          "status",
+          "ts"
+        ],
+        "properties": {
+          "card": {
+            "type": "object",
+            "required": [
+              "id",
+              "name"
+            ],
+            "properties": {
+              "id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "name": {
+                "type": "string"
+              }
+            }
+          },
+          "lifecycleUid": {
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "idle",
+              "waiting",
+              "working",
+              "offline"
+            ]
+          },
+          "ts": {
+            "type": "number"
+          }
+        }
+      }
+    },
+    "next": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    }
+  }
+}
+```
 
 ### manager vitals
 
@@ -4804,7 +4904,7 @@ Output schema:
 
 ## auth
 
-Cluster `ai.cotal.auth`, revision 2. 5 commands.
+Cluster `ai.cotal.auth`, revision 3. 6 commands.
 
 | Command                                                            | Capability       | Class     | Target modes |
 | ------------------------------------------------------------------ | ---------------- | --------- | ------------ |
@@ -4813,6 +4913,7 @@ Cluster `ai.cotal.auth`, revision 2. 5 commands.
 | [`enrollment-effect-status`](#auth-enrollment-effect-status)       | `auth.placement` | ephemeral | untargeted   |
 | [`close-enrollment-effect`](#auth-close-enrollment-effect)         | `auth.placement` | ephemeral | untargeted   |
 | [`retire-placement-enrollment`](#auth-retire-placement-enrollment) | `auth.placement` | ephemeral | untargeted   |
+| [`roster`](#auth-roster)                                           | `auth.roster`    | ephemeral | untargeted   |
 
 ### auth retire-lifecycle
 
@@ -5624,6 +5725,105 @@ Output schema:
       }
     }
   ]
+}
+```
+
+### auth roster
+
+Registered declaration:
+
+```json
+{
+  "name": "roster",
+  "class": "ephemeral",
+  "targeted": false,
+  "capability": "auth.roster",
+  "inputDigest": "sha256:e04e68c50257f2baddf6c91a3db7a6b1d275b539ea8c153bc39c193559c74ce4",
+  "outputDigest": "sha256:020e87b7d5643ec8e6638cd5138acd5eae9b9a38935bcbb1b52526002ef68cc7"
+}
+```
+
+Input schema:
+
+```json
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "limit": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 100
+    },
+    "after": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    }
+  }
+}
+```
+
+Output schema:
+
+```json
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "rows"
+  ],
+  "properties": {
+    "rows": {
+      "type": "array",
+      "maxItems": 100,
+      "items": {
+        "type": "object",
+        "required": [
+          "card",
+          "status",
+          "ts"
+        ],
+        "properties": {
+          "card": {
+            "type": "object",
+            "required": [
+              "id",
+              "name"
+            ],
+            "properties": {
+              "id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "name": {
+                "type": "string"
+              }
+            }
+          },
+          "lifecycleUid": {
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "idle",
+              "waiting",
+              "working",
+              "offline"
+            ]
+          },
+          "ts": {
+            "type": "number"
+          }
+        }
+      }
+    },
+    "next": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    }
+  }
 }
 ```
 

@@ -84,6 +84,7 @@ const { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, readdir
  *  production cannot emit. Widening the method to public would be a shipped-source change made for a
  *  test's convenience, which is not this change's business. */
 type PresenceStatus = import("@cotal-ai/core").PresenceStatus;
+import type { Presence } from "@cotal-ai/core";
 type PsRow = { name: string; id: string; mesh: PresenceStatus | "absent"; pid?: number; authHealth?: "auth-renewal-failed" | "auth-unknown" | "auth-stale" };
 const psList = (m: object, ownerFilter?: string): PsRow[] =>
   (m as unknown as { list: (o?: string) => PsRow[] }).list(ownerFilter);
@@ -552,13 +553,21 @@ try {
   const opCreds = await cotalAuthProvider.userCredentials({ store, dir, space: SPACE, actor: "cli" });
   observer = new CotalEndpoint({
     space: SPACE, servers: SERVER, bearer: opCreds.bearer, sentinelCreds: opCreds.sentinelCreds,
-    channels: [], consume: false, registerPresence: false, watchPresence: true,
+    channels: [], consume: false, registerPresence: false, watchPresence: false,
     card: { name: "observer", kind: "endpoint" },
   });
   observer.on("error", () => {});
   await observer.start();
-  const seen = await until(() => observer!.getRoster().some((p) => p.card.id === alphaPrincipal && p.card.name === "alpha"));
-  check("observer (operator user bearer) sees alpha join as the owner.actor principal", seen, observer.getRoster().map((p) => p.card.id));
+  // A user bearer may not open the raw presence watch. Each check re-reads the granted
+  // roster command, then reads the view that read filled.
+  const observerView = async (): Promise<Presence[]> => { await observer!.readPresence(); return observer!.getRoster(); };
+  const awaitObserver = async (cond: (view: Presence[]) => boolean, ms = 8000): Promise<boolean> => {
+    const end = Date.now() + ms;
+    while (Date.now() < end) { if (cond(await observerView())) return true; await wait(100); }
+    return cond(await observerView());
+  };
+  const seen = await awaitObserver((view) => view.some((p) => p.card.id === alphaPrincipal && p.card.name === "alpha"));
+  check("observer (operator user bearer) sees alpha join as the owner.actor principal", seen, (await observerView()).map((p) => p.card.id));
 
   // ---- B1b. THE SECOND SPAWN OF THE SAME NAME (the arm nothing covered) ----------------------
   // Every other spawn in this suite uses a DISTINCT name — alpha, iota, kappa. That is exactly why
@@ -614,8 +623,8 @@ try {
     try { return principalKey(OWNER, secondName).key; } catch { return "<ungrammatical actor: the allocator emitted a name the mesh cannot mint>"; }
   })();
   check("...and the child JOINED presence as owner.<numbered> (end to end, not a string check)",
-    accepted && await until(() => observer!.getRoster().some((r) => r.card.id === secondPrincipal && r.card.name === secondName), 20000),
-    observer.getRoster().map((r) => r.card.id));
+    accepted && await awaitObserver((view) => view.some((r) => r.card.id === secondPrincipal && r.card.name === secondName), 20000),
+    (await observerView()).map((r) => r.card.id));
   // RESTORE. The sections below assert over the managed-row set and the live roster, so the extra
   // seat is torn down and its teardown is WAITED FOR rather than assumed — a stop that had not
   // landed yet would silently widen every set those sections measure.
@@ -625,9 +634,9 @@ try {
   };
   if (accepted) await mAny.opStop({ name: secondName, graceful: false }, mAny.ep.ref().id, true).catch(() => undefined);
   check("...and the numbered seat leaves no trace, so the sections below see the state they expect",
-    await until(() => !existsSync(rowFile("managed", OWNER, secondName))
-      && !observer!.getRoster().some((r) => r.card.name === secondName && r.status !== "offline"), 20000),
-    { row: existsSync(rowFile("managed", OWNER, secondName)), roster: observer.getRoster().map((r) => `${r.card.name}:${r.status}`) });
+    await awaitObserver((view) => !existsSync(rowFile("managed", OWNER, secondName))
+      && !view.some((r) => r.card.name === secondName && r.status !== "offline"), 20000),
+    { row: existsSync(rowFile("managed", OWNER, secondName)), roster: (await observerView()).map((r) => `${r.card.name}:${r.status}`) });
   // `mesh !== "absent"` accepted ANY other string, so a row carrying a value no roster can produce
   // read as live. The reach is a cast through `unknown`, which severs the local view from the real
   // return type, so no width declared above can catch that: the closed set has to be asserted here.
