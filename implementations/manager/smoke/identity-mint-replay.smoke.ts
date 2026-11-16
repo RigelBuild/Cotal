@@ -38,10 +38,8 @@ import { bootDeliveryDaemon, type DeliveryDaemon } from "./_boot-delivery.js";
 type LifecyclePin = { owner: string; actor: string; lifecycleUid: string; alias: string };
 type LifecycleExecutor = <T>(pin: LifecyclePin, fn: (transport: LifecycleStateTransport) => Promise<T>) => Promise<T>;
 type ManagerInternals = {
-  identityStore: IdentityStore;
+  identityRuntime: { store: IdentityStore; clock: () => number; driver: { recheckIdentityRetirements(): Promise<void>; start(uid: string): void } };
   withLifecycleExecutor: LifecycleExecutor;
-  identityRetirementClock: () => number;
-  identityRetirementDriver: { recheckIdentityRetirements(): Promise<void>; start(uid: string): void };
   withProvisioner<T>(fn: (provisioner: CotalEndpoint) => Promise<T>): Promise<T>;
   managerServeIdentity?: unknown;
   staticReconcileSweepsInFlight: number;
@@ -124,7 +122,7 @@ try {
     (transport) => readStaticSlot(transport, DEV_OWNER, alias),
   );
   const assertReplayConverged = async (alias: string, lifecycleUid: string, actor: string): Promise<void> => {
-    const identity = internals(manager).identityStore.get(alias);
+    const identity = internals(manager).identityRuntime.store.get(alias);
     assert.equal(identity?.issuance?.state, "issued", "replay must persist the issued identity");
     const credentialId = identity?.issuance?.credentialId;
     assert.ok(credentialId, "replay must record the credential id on the identity");
@@ -146,7 +144,7 @@ try {
   const pendingReservation = await reserve("crash-pending");
   const pendingSeat = newIdentity();
   const pendingInput = mintInput("crash-pending", pendingReservation.lifecycleUid, pendingSeat.id);
-  const pendingStore = internals(manager).identityStore;
+  const pendingStore = internals(manager).identityRuntime.store;
   const transition = pendingStore.transition.bind(pendingStore);
   let pendingCrashInjected = false;
   pendingStore.transition = (...args) => {
@@ -161,7 +159,7 @@ try {
   pendingStore.transition = transition;
   assert.equal(pendingFailure.reply.ok, false, "the injected crash must interrupt the first mint");
   assert.equal(pendingCrashInjected, true);
-  assert.equal(internals(manager).identityStore.get(pendingReservation.name)?.issuance?.state, "pending");
+  assert.equal(internals(manager).identityRuntime.store.get(pendingReservation.name)?.issuance?.state, "pending");
   assert.equal(await slotFor(pendingReservation.name, pendingReservation.lifecycleUid, pendingSeat.id), undefined,
     "the crash must occur before a static slot exists");
   await restartManager();
@@ -195,7 +193,7 @@ try {
   activeControl.withLifecycleExecutor = originalExecutor;
   assert.equal(activeFailure.reply.ok, false, "the injected crash must interrupt the first mint response");
   assert.equal(activeCrashInjected, true);
-  assert.equal(internals(manager).identityStore.get(activeReservation.name)?.issuance?.state, "pending");
+  assert.equal(internals(manager).identityRuntime.store.get(activeReservation.name)?.issuance?.state, "pending");
   const activeSlotAtCrash = await slotFor(activeReservation.name, activeReservation.lifecycleUid, activeSeat.id);
   assert.equal(activeSlotAtCrash?.row.phase, "active", "the crash must land after the slot CAS");
   await restartManager();
@@ -216,7 +214,7 @@ try {
     bootExecutor(pin, async (transport) => {
       const result = await fn(transport);
       if (!activationCrashInjected && pin.alias === bootReservation.name &&
-          bootControl.identityStore.get(bootReservation.name)?.issuance?.state === "pending") {
+          bootControl.identityRuntime.store.get(bootReservation.name)?.issuance?.state === "pending") {
         const slot = await readStaticSlot(transport, DEV_OWNER, bootReservation.name);
         if (slot?.row.phase === "provisioning" && slot.row.credentialIds.length === 0) {
           activationCrashInjected = true;
@@ -246,7 +244,7 @@ try {
 
   const expiredReservation = await reserve("crash-expired");
   const expiredSeat = newIdentity();
-  const expiredStore = internals(manager).identityStore;
+  const expiredStore = internals(manager).identityRuntime.store;
   const expiredMinter = principalKey(caller.owner, caller.actor).key;
   expiredStore.bindPublicKey(expiredReservation.name, expiredMinter, expiredReservation.lifecycleUid, expiredSeat.id);
   const expiredNow = Math.floor(Date.now() / 1000);
@@ -265,7 +263,7 @@ try {
   // issuance expiry, then settles the identity and its newly-created terminal slot.
   const noSlotReservation = await reserve("retire-no-slot");
   const noSlotSeat = newIdentity();
-  const noSlotStore = internals(manager).identityStore;
+  const noSlotStore = internals(manager).identityRuntime.store;
   noSlotStore.bindPublicKey(noSlotReservation.name, principalKey(caller.owner, caller.actor).key, noSlotReservation.lifecycleUid, noSlotSeat.id);
   const now = Math.floor(Date.now() / 1000);
   const noSlotIssuance = {
@@ -280,12 +278,12 @@ try {
   assert.equal(await slotFor(noSlotReservation.name, noSlotReservation.lifecycleUid, noSlotSeat.id), undefined,
     "retirement fixture must have no static slot");
   const retirementControl = internals(manager);
-  const normalRetirementClock = retirementControl.identityRetirementClock;
-  retirementControl.identityRetirementClock = () => (noSlotIssuance.exp + 61) * 1000;
+  const normalRetirementClock = retirementControl.identityRuntime.clock;
+  retirementControl.identityRuntime.clock = () => (noSlotIssuance.exp + 61) * 1000;
   const retirement = await invokeCommand(nc, space, service, "identity-retire", { name: "retire-no-slot" }, callOptions);
   assert.equal(retirement.reply.ok, true, JSON.stringify(retirement.reply));
-  await retirementControl.identityRetirementDriver.recheckIdentityRetirements();
-  retirementControl.identityRetirementClock = normalRetirementClock;
+  await retirementControl.identityRuntime.driver.recheckIdentityRetirements();
+  retirementControl.identityRuntime.clock = normalRetirementClock;
   assert.equal(noSlotStore.get(noSlotReservation.name)?.issuance?.state, "retired");
   assert.ok(noSlotStore.get(noSlotReservation.name)?.retiredAt);
   const retiredSlot = await slotFor(noSlotReservation.name, noSlotReservation.lifecycleUid, noSlotSeat.id);
@@ -315,20 +313,20 @@ try {
       });
     const mint = invokeCommand(nc, space, service, "identity-mint", mintInput(slug, reservation.lifecycleUid, seat.id), callOptions);
     await provisioned;
-    const record = control.identityStore.get(reservation.name);
+    const record = control.identityRuntime.store.get(reservation.name);
     assert.ok(record?.issuance);
-    const oldClock = control.identityRetirementClock;
+    const oldClock = control.identityRuntime.clock;
     const retirementTime = (record.issuance.exp + 61) * 1000;
-    control.identityRetirementClock = () => retirementTime;
+    control.identityRuntime.clock = () => retirementTime;
     let mintHeld = true;
     let passedBarrierWhileHeld = false;
     let signalSweep!: () => void;
     const sweepStarted = new Promise<void>((resolve) => { signalSweep = resolve; });
-    const driver = control.identityRetirementDriver;
+    const driver = control.identityRuntime.driver;
     const originalStart = driver.start.bind(driver);
     driver.start = (uid) => { originalStart(uid); if (uid === reservation.lifecycleUid) signalSweep(); };
-    const originalExpiry = control.identityStore.recordRetirementExpiry.bind(control.identityStore);
-    control.identityStore.recordRetirementExpiry = (...args) => {
+    const originalExpiry = control.identityRuntime.store.recordRetirementExpiry.bind(control.identityRuntime.store);
+    control.identityRuntime.store.recordRetirementExpiry = (...args) => {
       if (args[2] === reservation.lifecycleUid && mintHeld) passedBarrierWhileHeld = true;
       return originalExpiry(...args);
     };
@@ -336,11 +334,11 @@ try {
     if (mode === "command") {
       retirement = invokeCommand(nc, space, service, "identity-retire", { name: slug }, callOptions);
       const latchDeadline = Date.now() + 5_000;
-      while (!control.identityStore.get(reservation.name)?.terminalizing && Date.now() < latchDeadline) await delay(10);
-      assert.equal(control.identityStore.get(reservation.name)?.terminalizing, true);
+      while (!control.identityRuntime.store.get(reservation.name)?.terminalizing && Date.now() < latchDeadline) await delay(10);
+      assert.equal(control.identityRuntime.store.get(reservation.name)?.terminalizing, true);
       void driver.recheckIdentityRetirements();
     } else {
-      control.identityStore.latchRetirement(reservation.name, record.minter, reservation.lifecycleUid);
+      control.identityRuntime.store.latchRetirement(reservation.name, record.minter, reservation.lifecycleUid);
       retirement = driver.recheckIdentityRetirements();
     }
     await sweepStarted;
@@ -350,12 +348,12 @@ try {
     await mint.catch(() => undefined);
     await retirement;
     driver.start = originalStart;
-    control.identityStore.recordRetirementExpiry = originalExpiry;
+    control.identityRuntime.store.recordRetirementExpiry = originalExpiry;
     assert.equal(passedBarrierWhileHeld, false, `sweep during ${mode} retirement passed the flight barrier while mint was held`);
-    await control.identityRetirementDriver.recheckIdentityRetirements();
+    await control.identityRuntime.driver.recheckIdentityRetirements();
     control.withProvisioner = originalProvisioner;
-    control.identityRetirementClock = oldClock;
-    assert.ok(control.identityStore.get(reservation.name)?.retiredAt, `${mode} retirement must finish`);
+    control.identityRuntime.clock = oldClock;
+    assert.ok(control.identityRuntime.store.get(reservation.name)?.retiredAt, `${mode} retirement must finish`);
     const probeId = newIdentity();
     const probe = await connect({ servers, ...standaloneConnectOpts({ creds: await mintCreds(auth, probeId, "provisioner"), tls: false }), maxReconnectAttempts: 0 });
     try {
@@ -392,7 +390,7 @@ try {
   assert.equal(refusals.length, count - cap);
   assert.ok(refusals.every((result) => result.reply.error?.code === "resource-exhausted"),
     "every losing parallel reservation must be refused by the cap");
-  const persisted = internals(manager).identityStore.list().filter((row) => row.minter === principalKey(caller.owner, caller.actor).key);
+  const persisted = internals(manager).identityRuntime.store.list().filter((row) => row.minter === principalKey(caller.owner, caller.actor).key);
   assert.equal(persisted.length, cap, "the identity store must persist exactly the cap's grants");
   console.log("PASS parallel reserves grant exactly the configured cap");
   if (bootSweepReplayFailure !== undefined) process.exitCode = 1;

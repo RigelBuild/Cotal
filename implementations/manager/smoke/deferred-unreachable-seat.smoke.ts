@@ -67,7 +67,7 @@ mkdirSync(join(workspaceRoot, ".cotal", "agents"), { recursive: true });
 const mgr = new Manager({ space, servers: SERVERS, runtime: "pty", workspaceRoot });
 type Executor = <T>(pin: { owner: string; actor: string; lifecycleUid: string; alias: string }, fn: (t: LifecycleStateTransport) => Promise<T>) => Promise<T>;
 type Seams = {
-  identityStore?: { list: () => unknown[] };
+  identityRuntime: { store?: { list: () => unknown[] } };
   auth: unknown;
   runtime: unknown;
   ep: Record<string, unknown>;
@@ -197,7 +197,7 @@ try {
   await plant("tick", tickExp);
   await plant("worker_2", nowSec() + 3600);
   const managerIdentity = await plant("manager-identity", nowSec() - 120);
-  M.identityStore = { list: () => { throw new Error("smoke: identity backing store is unreadable"); } };
+  M.identityRuntime.store = { list: () => { throw new Error("smoke: identity backing store is unreadable"); } };
   await plant("attest", nowSec() + 3600);
   await plant("plain", nowSec() + 3600);
   await plant("busy", nowSec() + 3600);

@@ -104,6 +104,39 @@ function canTransitionIssuance(previous: IdentityIssuance, next: IdentityIssuanc
   return ISSUANCE_TRANSITIONS.has(`${previous.state}:${next.state}`) && sameIssuanceAuthority(previous, next);
 }
 
+function validatePublicKeyBinding(current: IdentityRecord | undefined, minter: string, lifecycleUid: string, publicKey: string): asserts current is IdentityRecord {
+  if (!current || current.lifecycleUid !== lifecycleUid)
+    throw identityError("conflict", "public-key binding does not match the current lifecycle UID");
+  if (current.terminalizing) throw identityError("failed-precondition", "identity is terminalizing");
+  if (current.minter !== minter)
+    throw identityError("permission-denied", "public-key binding is not owned by this minter");
+  if (current.retiredAt !== undefined || current.issuance?.state === "retired")
+    throw identityError("failed-precondition", "a retired identity cannot bind a public key");
+  if (!USER_NKEY.test(publicKey)) throw identityError("bad-request", "public-key binding is invalid");
+  if (current.publicKey !== undefined && current.publicKey !== publicKey)
+    throw identityError("already-exists", "identity public key is already bound");
+}
+
+function validateIssuanceTransition(current: IdentityRecord | undefined, minter: string, lifecycleUid: string, expectedGeneration: string | undefined, next: IdentityIssuance): asserts current is IdentityRecord {
+  if (!current || current.lifecycleUid !== lifecycleUid)
+    throw identityError("conflict", "issuance transition does not match the current lifecycle UID");
+  if (current.minter !== minter)
+    throw identityError("permission-denied", "issuance transition is not owned by this minter");
+  if (current.issuance?.generation !== expectedGeneration)
+    throw identityError("conflict", "identity issuance generation changed before transition");
+  if (current.retiredAt !== undefined)
+    throw identityError("failed-precondition", "retired identity is terminal");
+  const previous = current.issuance;
+  if (previous === undefined) {
+    if (expectedGeneration !== undefined || (next.state !== "pending" && next.state !== "issued"))
+      throw identityError("failed-precondition", "initial identity issuance must be pending or issued");
+  } else if (!canTransitionIssuance(previous, next)) {
+    throw identityError("failed-precondition", previous.state === "retired"
+      ? "retired issuance is terminal"
+      : "identity issuance transition is not allowed");
+  }
+}
+
 function requireValidRenewalIntent(raw: unknown, issuance: IdentityIssuance | undefined): IdentityRecord["renewal"] {
   if (raw === undefined) return undefined;
   if (!object(raw) || Object.keys(raw).some((key) => !["issuanceId", "iat", "exp"].includes(key)) ||
@@ -294,16 +327,7 @@ export class IdentityStore {
   bindPublicKey(name: string, minter: string, lifecycleUid: string, publicKey: string, now = Date.now()): IdentityRecord {
     return this.#withLock(() => {
       const current = this.#current(name);
-      if (!current || current.lifecycleUid !== lifecycleUid)
-        throw identityError("conflict", "public-key binding does not match the current lifecycle UID");
-      if (current.terminalizing) throw identityError("failed-precondition", "identity is terminalizing");
-      if (current.minter !== minter)
-        throw identityError("permission-denied", "public-key binding is not owned by this minter");
-      if (current.retiredAt !== undefined || current.issuance?.state === "retired")
-        throw identityError("failed-precondition", "a retired identity cannot bind a public key");
-      if (!USER_NKEY.test(publicKey)) throw identityError("bad-request", "public-key binding is invalid");
-      if (current.publicKey !== undefined && current.publicKey !== publicKey)
-        throw identityError("already-exists", "identity public key is already bound");
+      validatePublicKeyBinding(current, minter, lifecycleUid, publicKey);
       if (current.publicKey === publicKey) return cloneRecord(current);
       const bound = { ...current, publicKey, touchedAt: Math.max(current.touchedAt, now) };
       this.#records[this.#indexByUid(current.lifecycleUid)] = bound;
@@ -352,24 +376,7 @@ export class IdentityStore {
     if (next === undefined) throw identityError("bad-request", "identity issuance is required");
     return this.#withLock(() => {
       const current = this.#current(name);
-      if (!current || current.lifecycleUid !== lifecycleUid)
-        throw identityError("conflict", "issuance transition does not match the current lifecycle UID");
-      if (current.minter !== minter)
-        throw identityError("permission-denied", "issuance transition is not owned by this minter");
-      if (current.issuance?.generation !== expectedGeneration)
-        throw identityError("conflict", "identity issuance generation changed before transition");
-      if (current.retiredAt !== undefined)
-        throw identityError("failed-precondition", "retired identity is terminal");
-
-      const previous = current.issuance;
-      if (previous === undefined) {
-        if (expectedGeneration !== undefined || (next.state !== "pending" && next.state !== "issued"))
-          throw identityError("failed-precondition", "initial identity issuance must be pending or issued");
-      } else if (!canTransitionIssuance(previous, next)) {
-        throw identityError("failed-precondition", previous.state === "retired"
-          ? "retired issuance is terminal"
-          : "identity issuance transition is not allowed");
-      }
+      validateIssuanceTransition(current, minter, lifecycleUid, expectedGeneration, next);
 
       const updated: IdentityRecord = {
         ...current,

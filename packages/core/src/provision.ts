@@ -105,6 +105,7 @@ import { epsSubject, epCallerReplyFilter, assertGeneration, isIssuedCaller, AUTH
 import { managerRegistrationFamilySubject } from "./endpoint-subjects.js";
 import { acceptedKey, acceptedReadGrant, acceptedBucket, importNativeSubjectPermissions, issuedBucket, issuedHorizon, issuedPermitsPattern, issuedStoreStreamNames, prepareListing, writeAcceptedRow, type IssuanceSeam, type IssuedAuthorityRef, type IssuedSubjectPermissions, type IssuedSourceRef, type ListingBinding, type ListingSeam, type PreparedListing } from "./issued-authority.js";
 import { signIssuedUserJwt } from "./issued-user-jwt.js";
+import { publicSeatPermissions } from "./public-seat-permissions.js";
 import { REGISTRY_ENDPOINTS_GRANT } from "./registry-contract.js";
 import { admissionBucket, admissionKey, revocationKey } from "./run-admission.js";
 import { runSubmissionKey } from "./run-submission.js";
@@ -1615,19 +1616,7 @@ export function permissionsFor(
   // than mint it agent perms by accident (the no-fallbacks rule; matches the deleted `manager`'s intent).
   if (profile !== "agent")
     throw new Error(`permissionsFor: unhandled profile "${profile}" - add an explicit arm, do not fall through to agent`);
-  if (opts.dmOnly) {
-    if (opts.endpointCapabilities !== undefined || opts.capabilities !== undefined || opts.role !== undefined ||
-        opts.allowPublish !== undefined || opts.allowSubscribe !== undefined || opts.listing !== undefined || opts.listingSeam !== undefined)
-      throw new Error("permissionsFor(agent): dmOnly cannot carry other permission options");
-    if (!pr.lifecycleUid)
-      throw new Error("permissionsFor(agent): dmOnly requires lifecycleUid");
-    const dm = dmStream(space);
-    const durable = dmDurable(pr.owner, pr.actor, assertLifecycleToken(pr.lifecycleUid));
-    return {
-      pub: { allow: [unicastSubject(space, "*", "*", pr.owner, pr.actor), `$JS.API.CONSUMER.INFO.${dm}.${durable}`, `$JS.API.CONSUMER.MSG.NEXT.${dm}.${durable}`, `$JS.ACK.${dm}.${durable}.>`] },
-      sub: { allow: [inbox] },
-    };
-  }
+  if (opts.dmOnly) return publicSeatPermissions(space, pr, opts, inbox);
   const allowPublish = opts.allowPublish ?? []; // post ACL — DEFAULT-DENY (publish must be declared)
   // Read ACL — DEFAULT-DENY for channels, exactly like allowPublish above. Omitted or empty mints
   // NO channel row: no per-channel history-consumer create grant and no `chat.*.<ch>` sub.allow.
