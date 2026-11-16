@@ -42,11 +42,11 @@ import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  isReachable, registry, parseCommandArgs, parsePositiveIntegerFlag, seatCapFrom, serverConfig, setupSpaceStreams, mintCreds, newIdentity, createSpaceAuth, DEV_OWNER,
+  isReachable, registry, parseCommandArgs, serverConfig, setupSpaceStreams, mintCreds, newIdentity, createSpaceAuth, DEV_OWNER,
   type Command, type Connector, type ControlReply, type LaunchOpts, type LaunchSpec,
 } from "@cotal-ai/core";
 import {
-  authDir, parseSeatCapFlag, readManagerSeatCap, recordManagerSeatCap, recordMesh, saveSpaceAuth,
+  authDir, parseSeatCapFlag, parsePositiveIntegerFlag, seatCapFrom, readManagerSeatCap, recordManagerSeatCap, recordMesh, saveSpaceAuth,
   SEAT_CAP_UNLIMITED, isCommandFailure, DEFAULT_SEAT_MINT_CAP, readManagerSeatMintCap, recordManagerSeatMintCap,
 } from "@cotal-ai/workspace";
 import { launchEnv } from "@cotal-ai/connector-core";
