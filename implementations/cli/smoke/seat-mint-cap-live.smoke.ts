@@ -64,7 +64,7 @@ async function reserveIdentity(space: string, name: string, creds: string, calle
   const nc = await connect({ servers: server, ...standaloneConnectOpts({ creds, tls: false }), maxReconnectAttempts: 0 });
   try {
     const service = await resolveService(nc, space, "manager", caller, { deadlineMs: 10_000 });
-    return await invokeCommand(nc, space, service, "identity-reserve", { name }, { currentEpoch: async () => 0 });
+    return await invokeCommand(nc, space, service, "identity-reserve", { name }, {});
   } finally { await nc.close(); }
 }
 
@@ -95,14 +95,18 @@ try {
   sandbox = defaultSandbox;
   await run(["space", "create", "defaultcap", "--root", defaultRoot]);
   await run(["up", "--detach", "--space", "defaultcap", "--server", server]);
-  assert.equal(readManagerSeatMintCap({ root: defaultRoot, space: "defaultcap" }), DEFAULT_SEAT_MINT_CAP);
+  assert.equal(readManagerSeatMintCap({ root: defaultRoot, space: "defaultcap" }), undefined);
   const defaultAuth = loadSpaceAuth(authDir(defaultRoot), "defaultcap");
   assert.ok(defaultAuth);
   const defaultIdentity = newIdentity();
   const defaultCaller = { owner: DEV_OWNER, actor: defaultIdentity.id, uid: mintLifecycleUid() };
   const defaultCreds = await mintCreds(defaultAuth, defaultIdentity, "agent", { principal: defaultCaller, lifecycleUid: defaultCaller.uid, endpointCapabilities: [{ endpoint: "manager", command: "identity-reserve" }] });
-  const defaultReservation = await reserveIdentity("defaultcap", "default-one", defaultCreds, defaultCaller);
-  assert.equal(defaultReservation.reply.ok, true);
+  for (let index = 0; index < DEFAULT_SEAT_MINT_CAP; index++) {
+    const reservation = await reserveIdentity("defaultcap", `default-${index}`, defaultCreds, defaultCaller);
+    assert.equal(reservation.reply.ok, true, JSON.stringify(reservation.reply));
+  }
+  const overDefault = await reserveIdentity("defaultcap", "default-over", defaultCreds, defaultCaller);
+  assert.equal(overDefault.reply.error?.code, "resource-exhausted");
   console.log(`PASS up without flag enforces cap ${DEFAULT_SEAT_MINT_CAP}`);
 } finally {
   await stopManualManager();
