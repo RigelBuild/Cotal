@@ -32,11 +32,7 @@ async function run(args: string[]) {
   await once(child, "exit");
   assert.equal(child.exitCode, 0, output);
 }
-const sleep = async (ms: number) => {
-  const { promise, resolve: done } = Promise.withResolvers<void>();
-  setTimeout(done, ms);
-  await promise;
-};
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 let manualManager: ReturnType<typeof spawn> | undefined;
 let manualManagerOutput = "";
 function startManualManager(args: string[]): void {
