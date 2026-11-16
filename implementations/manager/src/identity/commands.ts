@@ -7,6 +7,7 @@ import {
   mintPublicSeatUserJwt,
   principalKey,
   STATIC_GENERATION_HORIZON_SEC,
+  runActivationSagaAtUid,
   STANDING_RENEWABLE_TTL_SEC as MANAGED_STATIC_TTL_SEC,
   issuedHorizon,
   credentialIdOf,
@@ -20,8 +21,8 @@ import type { CotalEndpoint } from "@cotal-ai/core";
 import type { KV } from "@nats-io/kv";
 import {
   casStaticSlot,
+  activateStaticLifecycle,
   readStaticSlot,
-  resumeIdentityActivation,
 } from "../static-lifecycle.js";
 import { IdentityStore, type IdentityRecord } from "./store.js";
 export type IdentityMintResult = { name: string; jwt: string; lifecycleUid: string; exp: number; acceptedToken: string };
@@ -42,6 +43,17 @@ export interface IdentityCommandServices {
   withIssuer<T>(fn: (issuer: IdentityIssuerContext) => Promise<T>): Promise<T>;
   issuanceSeam(issuer: IdentityIssuerContext, mode: "issue" | "renew", identity: { name: string; id: string; lifecycleUid: string }, exp: number): IssuanceSeam;
   recheckIdentityRetirements(): Promise<void>;
+}
+/** Resume activation of the exact persisted identity slot after interruption. */
+export async function resumeIdentityActivation(t: LifecycleStateTransport, args: { owner: string; alias: string; actor: string; lifecycleUid: string; managerInstance: string; ownerInstanceId: string }): Promise<void> {
+  const slot = await readStaticSlot(t, args.owner, args.alias);
+  if (!slot || slot.row.phase === "retired" && slot.row.lifecycleUid !== args.lifecycleUid) {
+    await activateStaticLifecycle(t, args);
+    return;
+  }
+  if (slot.row.lifecycleUid !== args.lifecycleUid || slot.row.actor !== args.actor || (slot.row.phase !== "provisioning" && slot.row.phase !== "active"))
+    throw new EpEnvelopeError("failed-precondition", "identity static slot does not match its issuance", undefined, "not-executed");
+  await runActivationSagaAtUid(t, { owner: args.owner, actor: args.actor, lifecycleUid: args.lifecycleUid, managerInstance: slot.row.managerInstance });
 }
 
 /** Parse a compact identity command name before deriving its durable alias. */

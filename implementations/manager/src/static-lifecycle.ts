@@ -512,17 +512,6 @@ export async function activateStaticLifecycle(
   return { slotRevision: revision };
 }
 
-/** Resume activation of the exact persisted identity slot after interruption. */
-export async function resumeIdentityActivation(t: LifecycleStateTransport, args: { owner: string; alias: string; actor: string; lifecycleUid: string; managerInstance: string; ownerInstanceId: string }): Promise<void> {
-  const slot = await readStaticSlot(t, args.owner, args.alias);
-  if (!slot || slot.row.phase === "retired" && slot.row.lifecycleUid !== args.lifecycleUid) {
-    await activateStaticLifecycle(t, args);
-    return;
-  }
-  if (slot.row.lifecycleUid !== args.lifecycleUid || slot.row.actor !== args.actor || (slot.row.phase !== "provisioning" && slot.row.phase !== "active"))
-    throw new EpEnvelopeError("failed-precondition", "identity static slot does not match its issuance", undefined, "not-executed");
-  await runActivationSagaAtUid(t, { owner: args.owner, actor: args.actor, lifecycleUid: args.lifecycleUid, managerInstance: slot.row.managerInstance });
-}
 
 /** Run the terminal's footprint cleanup AT MOST ONCE across resumes, and record that it finished
  *  DURABLY on the `terminalizing` slot BEFORE the caller's final CAS to `retired`.
