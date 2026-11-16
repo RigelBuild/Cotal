@@ -98,7 +98,6 @@ export const QUARANTINED = {
   "smoke:lang-supervise-live": { reason: "RIG-10098 upstream: stock pty gives no work closure, so supervised spawn is refused; suite unchanged from sync 82a97c1f, fixed upstream later; runs 43570538335 and 43575622507", recheckBy: "2026-12-31" },
   "smoke:linear-hosted-renewal:live": { reason: "RIG-10098 upstream: serveLinearUserAuth ignores transport reconnect after bearer renewal, so ready never follows; suite and source unchanged from sync 82a97c1f, fixed upstream in 093e70d5; runs 43570538335 and 43575622507", recheckBy: "2026-12-31" },
   "smoke:web-openapi": { reason: "RIG-10098 upstream: sync-docs needs website deps and generated TypeDoc that the smoke shard lacks; upstream later made the TypeDoc copy optional; runs 43570538335 and 43575622507", recheckBy: "2026-12-31" },
-  "smoke:auth-revoke-credential:live": { reason: "RIG-10099 fork: mint stamps the holder label into JWT name, and doctor/connect/send detect agent creds by name === agent; interim ruling I2 quarantines it until the signed profile marker (ruling A) lands", recheckBy: "2026-12-31" },
 };
 
 /** ci.yml smoke steps marked `continue-on-error`; gate-inventory requires the two sets to match. */
