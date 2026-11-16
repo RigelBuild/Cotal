@@ -1,5 +1,11 @@
 # @cotal-ai/cli
 
+## Unreleased
+
+### Patch Changes
+
+- Keep the manager seat-mint cap in its protected per-space record only. Ordinary starts, repairs, and manifest starts now pass that value to the manager without mirroring it in the mesh registry.
+
 ## 0.151.2
 
 ### Patch Changes
