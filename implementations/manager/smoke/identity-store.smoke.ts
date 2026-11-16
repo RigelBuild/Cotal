@@ -4,6 +4,7 @@ import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EpEnvelopeError, mintLifecycleUid } from "@cotal-ai/core";
+import { isAdoptedIdentity } from "../src/identity/adoption.js";
 import { IdentityStore } from "../src/identity/store.js";
 
 function waitForFile(path: string, timeoutMs: number): Promise<void> {
@@ -57,6 +58,13 @@ try {
     state: "pending" as const,
   };
   first.transition("alice", "signer", alice.lifecycleUid, undefined, pending, 4);
+  const pendingRecord = first.get("alice");
+  assert.ok(pendingRecord);
+  const pendingSlot = { owner: "local", alias: "alice", actor: publicKey, lifecycleUid: alice.lifecycleUid, managerInstance: "manager", ownerInstanceId: "manager", phase: "provisioning" as const, credentialIds: [] };
+  const identities = new Map([[alice.lifecycleUid, pendingRecord]]);
+  assert.equal(isAdoptedIdentity(pendingSlot, identities), true, "pending provisioning slot remains adopted");
+  assert.equal(isAdoptedIdentity({ ...pendingSlot, phase: "terminalizing" }, identities), false, "pending terminalizing slot is not adopted");
+  console.log("PASS pending terminalizing identity slot is not adopted");
   const issued = { ...pending, state: "issued" as const };
   second.transition("alice", "signer", alice.lifecycleUid, pending.generation, issued, 5);
   assert.throws(
