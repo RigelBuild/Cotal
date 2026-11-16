@@ -223,11 +223,12 @@ try {
     { deferred, slot: await readSlot("unexpired") });
   check("unexpired: status counts it in staticReconciliation.deferredSeats",
     M.managerStatusData().staticReconciliation.deferredSeats === 8, M.managerStatusData().staticReconciliation);
+  // manager-identity is already deferred on the unreadable store before expiry reads.
   check("fence: every plannable alias is fenced before the first expiry read, and a deferred alias leaves it",
-    ["unexpired", "expired", "tick", "attest", "plain", "busy", "unreadable", "worker_2", "manager-identity"].every((a) => fencedDuringRead.has(a)) && !M.reconcilingAliases.has("unexpired"),
+    ["unexpired", "expired", "tick", "attest", "plain", "busy", "unreadable", "worker_2"].every((a) => fencedDuringRead.has(a)) && !M.reconcilingAliases.has("unexpired"),
     { fenced: [...fencedDuringRead], after: [...M.reconcilingAliases] });
   check("initial identity snapshot failure defers the manager identity slot without blocking ordinary rows",
-    item("manager-identity")?.disposition === "deferred" && (await readSlot("manager-identity"))?.phase === "active" && (await readSlot("expired"))?.phase === "retired",
+    item("manager-identity")?.disposition === "deferred" && /identity backing store is unreadable/.test(item("manager-identity")?.lastError ?? "") && (await readSlot("manager-identity"))?.phase === "active" && (await readSlot("expired"))?.phase === "retired",
     { item: item("manager-identity"), expired: await readSlot("expired") });
   await M.recheckDeferredSeats();
   check("deferred identity snapshot failure keeps the slot deferred with the unreadable store error",
