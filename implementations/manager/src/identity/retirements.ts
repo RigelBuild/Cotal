@@ -59,30 +59,73 @@ export interface IdentityRetirementServices {
 /** One single-flight retirement sweep with bounded exponential retry delays per identity UID. */
 export class IdentityRetirementDriver {
   #sweep?: Promise<void>;
+  #rerunAfterSweep = false;
   readonly #inFlight = new Set<string>();
   readonly #backoff = new IdentityRetirementBackoff();
   readonly #retryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  readonly #dueTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
   constructor(private readonly services: () => IdentityRetirementServices) {}
 
   recheckIdentityRetirements(): Promise<void> {
-    if (this.#sweep) return this.#sweep;
+    if (this.#sweep) {
+      this.#rerunAfterSweep = true;
+      return this.#sweep;
+    }
     const flight = driveIdentityRetirements(this.services(), this);
     this.#sweep = flight;
     void flight.finally(() => {
-      if (this.#sweep === flight) this.#sweep = undefined;
+      if (this.#sweep !== flight) return;
+      this.#sweep = undefined;
+      if (this.#rerunAfterSweep) {
+        this.#rerunAfterSweep = false;
+        queueMicrotask(() => void this.recheckIdentityRetirements().catch((error) => console.error(`identity retirement sweep: ${rejectionText(error)}`)));
+      }
     }).catch(() => {});
     return flight;
   }
 
   stop(): void {
-    for (const timer of this.#retryTimers.values()) clearTimeout(timer);
+    for (const timer of [...this.#retryTimers.values(), ...this.#dueTimers.values()]) clearTimeout(timer);
     this.#retryTimers.clear();
+    this.#dueTimers.clear();
   }
 
   isWaiting(lifecycleUid: string): boolean {
-    return this.#retryTimers.has(lifecycleUid);
+    return this.#retryTimers.has(lifecycleUid) || this.#dueTimers.has(lifecycleUid);
   }
+
+  scheduleDue(lifecycleUid: string, dueAtMs: number): void {
+    const delayMs = Math.max(0, dueAtMs - Date.now());
+    const previous = this.#dueTimers.get(lifecycleUid);
+    if (previous !== undefined) clearTimeout(previous);
+    const timer = setTimeout(() => {
+      this.#dueTimers.delete(lifecycleUid);
+      void this.recheckIdentityRetirements().catch((error) => console.error(`identity retirement sweep: ${rejectionText(error)}`));
+    }, delayMs);
+    timer.unref?.();
+    this.#dueTimers.set(lifecycleUid, timer);
+  }
+  scheduleRetry(lifecycleUid: string, name: string, error: unknown): void {
+    const delayMs = this.#backoff.nextDelay(lifecycleUid);
+    console.error(`identity retirement ${name}: ${rejectionText(error)}; retrying in ${delayMs} ms`);
+    clearTimeout(this.#retryTimers.get(lifecycleUid));
+    const timer = setTimeout(() => {
+      this.#retryTimers.delete(lifecycleUid);
+      void this.recheckIdentityRetirements().catch((retryError) => console.error(`identity retirement sweep: ${rejectionText(retryError)}`));
+    }, delayMs);
+    timer.unref?.();
+    this.#retryTimers.set(lifecycleUid, timer);
+  }
+
+  completed(lifecycleUid: string): void {
+    this.#backoff.reset(lifecycleUid);
+    clearTimeout(this.#retryTimers.get(lifecycleUid));
+    clearTimeout(this.#dueTimers.get(lifecycleUid));
+    this.#retryTimers.delete(lifecycleUid);
+    this.#dueTimers.delete(lifecycleUid);
+  }
+
 
   isInFlight(lifecycleUid: string): boolean {
     return this.#inFlight.has(lifecycleUid);
@@ -96,113 +139,85 @@ export class IdentityRetirementDriver {
     this.#inFlight.delete(lifecycleUid);
   }
 
-  failed(lifecycleUid: string, name: string, error: unknown): void {
-    const delayMs = this.#backoff.nextDelay(lifecycleUid);
-    console.error(`identity retirement ${name}: ${rejectionText(error)}; retrying in ${delayMs} ms`);
-    const previous = this.#retryTimers.get(lifecycleUid);
-    if (previous !== undefined) clearTimeout(previous);
-    const timer = setTimeout(() => {
-      this.#retryTimers.delete(lifecycleUid);
-      void this.recheckIdentityRetirements().catch((retryError) => console.error(`identity retirement sweep: ${rejectionText(retryError)}`));
-    }, delayMs);
-    timer.unref?.();
-    this.#retryTimers.set(lifecycleUid, timer);
-  }
-
-  completed(lifecycleUid: string): void {
-    this.#backoff.reset(lifecycleUid);
-    const timer = this.#retryTimers.get(lifecycleUid);
-    if (timer !== undefined) clearTimeout(timer);
-    this.#retryTimers.delete(lifecycleUid);
-  }
 }
 
 export async function driveIdentityRetirements(services: IdentityRetirementServices, driver: IdentityRetirementDriver): Promise<void> {
   const store = services.identityStore;
   if (!store || !services.auth || services.staticReconcileStopping) return;
   for (const row of store.list()) {
-    if (!row.terminalizing && row.retiredAt === undefined && identityIdleRetireDue(
-      Math.max(row.issuance?.exp ?? 0, row.renewal?.exp ?? 0, Math.floor(row.touchedAt / 1000)),
-      Math.floor(services.identityRetirementClock() / 1000),
-    )) {
-      store.latchRetirement(row.name, row.minter, row.lifecycleUid);
-      row.terminalizing = true;
-    }
-    if (!row.terminalizing || row.retiredAt !== undefined || driver.isWaiting(row.lifecycleUid) || driver.isInFlight(row.lifecycleUid)) continue;
-    driver.start(row.lifecycleUid);
+    if (driver.isInFlight(row.lifecycleUid)) continue;
     try {
-      await retireIdentity(services, store, row, driver);
-    } finally {
-      driver.finish(row.lifecycleUid);
+      await driveIdentityRetirementRow(services, store, row, driver);
+    } catch (error) {
+      try { store.recordRetirementError(row.name, row.minter, row.lifecycleUid, rejectionText(error)); }
+      catch (recordError) { error = recordError; }
+      driver.scheduleRetry(row.lifecycleUid, row.name, error);
     }
   }
 }
 
-async function retireIdentity(
-  services: IdentityRetirementServices,
-  store: IdentityStore,
-  row: IdentityRecord,
-  driver: IdentityRetirementDriver,
-): Promise<void> {
+async function driveIdentityRetirementRow(services: IdentityRetirementServices, store: IdentityStore, row: IdentityRecord, driver: IdentityRetirementDriver): Promise<void> {
+  if (driver.isWaiting(row.lifecycleUid)) return;
+  if (!row.terminalizing && row.retiredAt === undefined && identityIdleRetireDue(
+    Math.max(row.issuance?.exp ?? 0, row.renewal?.exp ?? 0, Math.floor(row.touchedAt / 1000)),
+    Math.floor(services.identityRetirementClock() / 1000),
+  )) {
+    store.latchRetirement(row.name, row.minter, row.lifecycleUid);
+    row.terminalizing = true;
+  }
+  if (!row.terminalizing || row.retiredAt !== undefined) return;
+  driver.start(row.lifecycleUid);
+  try { await retireIdentity(services, store, row, driver); }
+  finally { driver.finish(row.lifecycleUid); }
+
+}
+
+async function retireIdentity(services: IdentityRetirementServices, store: IdentityStore, row: IdentityRecord, driver: IdentityRetirementDriver): Promise<void> {
   const active = services.identityRenewFlights.get(row.lifecycleUid);
   if (active) await active.catch(() => {});
   const current = store.recordRetirementExpiry(row.name, row.minter, row.lifecycleUid);
-  if (services.identityRetirementClock() < ((current.retirementExpiry ?? 0) + 60) * 1000) return;
-  if (!current.publicKey) {
-    store.retire(current.name, current.minter, current.lifecycleUid, current.issuance?.generation);
-    driver.completed(current.lifecycleUid);
+  const dueAt = ((current.retirementExpiry ?? 0) + 61) * 1000;
+  if (services.identityRetirementClock() < dueAt) {
+    driver.scheduleDue(current.lifecycleUid, dueAt);
     return;
   }
-  const actor = current.publicKey;
-  try {
-    await services.withLifecycleExecutor({ owner: DEV_OWNER, actor, lifecycleUid: current.lifecycleUid, alias: current.name }, async (transport) => {
-      const slot = await readStaticSlot(transport, DEV_OWNER, current.name);
-      if (!slot) await activateStaticLifecycle(transport, {
-        owner: DEV_OWNER,
-        alias: current.name,
-        actor,
-        lifecycleUid: current.lifecycleUid,
-        managerInstance: services.managerLifecycleUid,
-        ownerInstanceId: services.managerInstanceId,
-      });
-      await runStaticTerminal(transport, {
-        owner: DEV_OWNER,
-        alias: current.name,
-        actor,
-        lifecycleUid: current.lifecycleUid,
-        opId: managedRetirementOpId(current.lifecycleUid),
-        managerInstance: services.managerInstanceId,
-        managerProcessUid: services.managerLifecycleUid,
-      }, {
-        evict: services.staticLifecycleEvict ?? makeManagerEndpointEvictionEvidence({
-          space: services.space,
-          servers: services.servers ?? DEFAULT_SERVER,
-          auth: services.auth!,
-          log: (line) => console.error(line),
-          unreachableWaitMs: DEPROVISION_TIMEOUT_MS,
-        }),
-        log: (line) => console.error(`identity retirement ${current.name}: ${line}`),
-        cleanup: async () => {
-          await services.withIssuer((issuer) => issuer.store.retireSource({ space: services.space, bucket: epAuthBucket(services.space), key: `cred.${current.lifecycleUid}` }));
-          const creds = await mintCreds(services.auth!, newIdentity(), "deprovisioner", {
-            deprovisionTarget: { principal: actor, lifecycleUid: current.lifecycleUid, memberChannels: [] },
-          });
-          await deprovisionAgent({
-            servers: services.servers ?? DEFAULT_SERVER,
-            space: services.space,
-            targetId: actor,
-            lifecycleUid: current.lifecycleUid,
-            memberChannels: [],
-            creds,
-          });
-        },
-      });
-    });
+  if (!current.publicKey) {
+    store.retire(current.name, current.minter, current.lifecycleUid, current.issuance?.generation);
+  } else {
+    const actor = current.publicKey;
+    await runIdentityRetirement(services, current, actor);
     store.retire(current.name, current.minter, current.lifecycleUid, current.issuance?.generation);
     services.retiredPrincipals.add(principalKey(DEV_OWNER, actor).key);
-    driver.completed(current.lifecycleUid);
-  } catch (error) {
-    store.recordRetirementError(current.name, current.minter, current.lifecycleUid, rejectionText(error));
-    driver.failed(current.lifecycleUid, current.name, error);
   }
+  driver.completed(current.lifecycleUid);
+}
+async function runIdentityRetirement(services: IdentityRetirementServices, current: IdentityRecord, actor: string): Promise<void> {
+  await services.withLifecycleExecutor({ owner: DEV_OWNER, actor, lifecycleUid: current.lifecycleUid, alias: current.name }, async (transport) => {
+    const slot = await readStaticSlot(transport, DEV_OWNER, current.name);
+    if (!slot) await activateStaticLifecycle(transport, {
+      owner: DEV_OWNER, alias: current.name, actor, lifecycleUid: current.lifecycleUid,
+      managerInstance: services.managerLifecycleUid, ownerInstanceId: services.managerInstanceId,
+    });
+    await runStaticTerminal(transport, {
+      owner: DEV_OWNER, alias: current.name, actor, lifecycleUid: current.lifecycleUid,
+      opId: managedRetirementOpId(current.lifecycleUid), managerInstance: services.managerInstanceId,
+      managerProcessUid: services.managerLifecycleUid,
+    }, {
+      evict: services.staticLifecycleEvict ?? makeManagerEndpointEvictionEvidence({
+        space: services.space, servers: services.servers ?? DEFAULT_SERVER, auth: services.auth!,
+        log: (line) => console.error(line), unreachableWaitMs: DEPROVISION_TIMEOUT_MS,
+      }),
+      log: (line) => console.error(`identity retirement ${current.name}: ${line}`),
+      cleanup: () => cleanupIdentityAuthority(services, current, actor),
+    });
+  });
+}
+
+async function cleanupIdentityAuthority(services: IdentityRetirementServices, current: IdentityRecord, actor: string): Promise<void> {
+  await services.withIssuer((issuer) => issuer.store.retireSource({ space: services.space, bucket: epAuthBucket(services.space), key: `cred.${current.lifecycleUid}` }));
+  const creds = await mintCreds(services.auth!, newIdentity(), "deprovisioner", {
+    deprovisionTarget: { principal: actor, lifecycleUid: current.lifecycleUid, memberChannels: [] },
+  });
+  await deprovisionAgent({ servers: services.servers ?? DEFAULT_SERVER, space: services.space, targetId: actor,
+    lifecycleUid: current.lifecycleUid, memberChannels: [], creds });
 }
