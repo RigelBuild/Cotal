@@ -75,6 +75,8 @@ async function retireIdentity(services: IdentityCommandServices, ctx: EpServeCon
   const caller = record.minter;
   if (record.retiredAt !== undefined || record.issuance?.state === "retired") return {};
   store.latchRetirement(name, caller, record.lifecycleUid);
+  const mint = services.identityMintFlights.get(record.lifecycleUid);
+  if (mint) await mint.catch(() => {});
   const renewal = services.identityRenewFlights.get(record.lifecycleUid);
   if (renewal) await renewal.catch(() => {});
   store.recordRetirementExpiry(name, caller, record.lifecycleUid);
@@ -113,10 +115,15 @@ async function mintIdentityFlight(
   }
   if (issuance.state !== "pending" && issuance.state !== "issued")
     throw new EpEnvelopeError("failed-precondition", "identity issuance is terminalizing", undefined, "not-executed");
+  if (issuance.state === "pending" && issuance.exp <= now)
+    throw new EpEnvelopeError("failed-precondition", "pending identity issuance has expired; retire the identity before reserving again", undefined, "not-executed");
   if (issuance.state === "pending") {
     await services.withLifecycleExecutor({ owner: DEV_OWNER, actor: publicKey, lifecycleUid: record.lifecycleUid, alias: name }, (transport) =>
       resumeIdentityActivation(transport, { owner: DEV_OWNER, alias: name, actor: publicKey, lifecycleUid: record.lifecycleUid, managerInstance: services.managerLifecycleUid, ownerInstanceId: services.managerInstanceId }));
   }
+  const current = store.get(name);
+  if (!current || current.terminalizing || current.retiredAt !== undefined)
+    throw new EpEnvelopeError("failed-precondition", "identity is terminalizing", undefined, "not-executed");
   await services.withProvisioner((provisioner) => provisioner.provisionDmInbox(DEV_OWNER, publicKey, record.lifecycleUid));
   const minted = await services.withIssuer((issuer) => mintPublicSeatUserJwt(services.auth!, publicKey, {
     name,

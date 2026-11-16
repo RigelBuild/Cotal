@@ -239,6 +239,23 @@ try {
     ? undefined
     : `boot sweep left slot ${afterBootSweep?.row.phase ?? "missing"}; replay failed: ${JSON.stringify(bootReplay.reply)}`;
 
+  const expiredReservation = await reserve("crash-expired");
+  const expiredSeat = newIdentity();
+  const expiredStore = internals(manager).identityStore;
+  const expiredMinter = principalKey(caller.owner, caller.actor).key;
+  expiredStore.bindPublicKey(expiredReservation.name, expiredMinter, expiredReservation.lifecycleUid, expiredSeat.id);
+  const expiredNow = Math.floor(Date.now() / 1000);
+  const expiredIssuance = {
+    generation: "e".repeat(32), iat: expiredNow - 3600, exp: expiredNow - 1,
+    acceptedToken: "f".repeat(32), issuanceId: mintLifecycleUid(), state: "pending" as const,
+  };
+  expiredStore.transition(expiredReservation.name, expiredMinter, expiredReservation.lifecycleUid, undefined, expiredIssuance);
+  const expiredReplay = await invokeCommand(nc, space, service, "identity-mint", mintInput("crash-expired", expiredReservation.lifecycleUid, expiredSeat.id), callOptions);
+  assert.equal(expiredReplay.reply.ok, false, "an expired pending issuance must refuse replay");
+  assert.equal(expiredReplay.reply.error?.code, "failed-precondition", JSON.stringify(expiredReplay.reply));
+  assert.match(expiredReplay.reply.error?.message ?? "", /retire/);
+  assert.equal(expiredStore.get(expiredReservation.name)?.issuance?.state, "pending");
+  console.log("PASS replay after pending issuance expiry returns failed-precondition");
   // A bound pending identity with no slot is a valid retirement input. Retirement waits through its
   // issuance expiry, then settles the identity and its newly-created terminal slot.
   const noSlotReservation = await reserve("retire-no-slot");
