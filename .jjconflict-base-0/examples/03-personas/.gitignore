@@ -1,5 +1,0 @@
-# Personal material — research drops and derived personas stay local.
-research/*
-!research/README.md
-agents/*
-!agents/_template.md

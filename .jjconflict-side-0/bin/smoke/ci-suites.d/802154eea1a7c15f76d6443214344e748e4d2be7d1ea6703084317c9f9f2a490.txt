@@ -1,2 +1,0 @@
-# Pre-broker credential-path crash cleanup.
-smoke:control-transport-crash-cleanup

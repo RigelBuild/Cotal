@@ -1,2 +1,0 @@
-# Answering Manager host and running package version through verified browser status.
-smoke:manager-status-metadata

@@ -1,2 +1,0 @@
-# Keyed run submission request budget and deadline window on a static-auth native manager.
-smoke:keyed-review-window

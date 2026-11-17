@@ -1,2 +1,0 @@
-# Retain pull-only mentions when focus exclusion recall is unsafe.
-smoke:focus-exclusion-mention

@@ -1,2 +1,0 @@
-# Permanent Harness replacement refusals terminate instead of consuming the recovery window.
-smoke:jcode-provider-permanent-refusal

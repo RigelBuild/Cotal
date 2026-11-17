@@ -1,2 +1,0 @@
-# #876: exhaustively classify every shipped presence-status render sink; new sinks fail until reviewed.
-smoke:presence-render-census

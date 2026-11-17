@@ -1,2 +1,0 @@
-# A presence watch whose consumer died under a live connection rebinds instead of staying stale.
-smoke:presence-watch-rebind

@@ -1,3 +1,0 @@
-# Every shipped endpoint consumer explicitly surfaces or ignores recoverable warnings. The suite
-# rebuilds and checks both source and the published artifacts, with one named cell per registration.
-smoke:endpoint-warning-consumers
