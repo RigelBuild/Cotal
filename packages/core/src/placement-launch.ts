@@ -4,8 +4,9 @@ import { isAccountNkey } from "./identity.js";
 import type { ManagedLifecycleTarget } from "./managed-handoff.js";
 import { assertLifecycleToken } from "./subjects.js";
 
-/** The placement-only launch records (RIG-8502 launch protocol § Placement and launch intent). These
- *  are closed: every parser refuses an unknown field, and the field names are the protocol's exactly. */
+/** The placement-only launch records (launch protocol § Placement and launch intent, § Execution
+ *  admission and launch fence). These are closed: every parser refuses an unknown field, and the field
+ *  names are the protocol's exactly. */
 
 export interface ManagerClaim {
   accountPublicKey: string;
@@ -27,11 +28,18 @@ export interface Placement {
   workspace: string;
 }
 
-export interface ExecutionSubject {
-  acceptanceId: string;
-  enrollmentOperationId: string;
-  phase: "accepted";
+/** The protocol's `AgentKeyTarget`: the seat, its lifecycle and its generation. */
+export interface AgentKeyTarget {
+  seatName: string;
+  lifecycle: ManagedLifecycleTarget;
+  generation: number;
 }
+
+/** The accepted arm exists before binding. The bound arm exists after `bind-enrollment` verifies the
+ *  binding. The gate carries whichever arm is current, so replay never returns a stale subject. */
+export type ExecutionSubject =
+  | { acceptanceId: string; enrollmentOperationId: string; phase: "accepted" }
+  | { acceptanceId: string; enrollmentOperationId: string; phase: "bound"; bindingId: string; target: AgentKeyTarget };
 
 export interface ExecutionAuthority {
   subject: ExecutionSubject;
@@ -111,6 +119,7 @@ export interface LaunchIntent {
   workspaceDigest: string;
   persona: string;
   personaDigest: string;
+  cardRole?: string;
   profile: ProfileSnapshot;
   role: string;
   roleTreeRevision: number;
@@ -121,12 +130,57 @@ export interface LaunchIntent {
   handoff?: HandoffInput;
   digest: string;
 }
-/** Loose by protocol: the observation state is closed but its optional fields are carried as the
- *  reconciler reports them, so the typed shape here is the required core only. */
+
+/** The reconciler's `KeyObservation`, filled from authenticated gateway state. */
+export interface KeyObservation {
+  desiredAuthorizationRevision: number;
+  appliedAuthorizationRevision?: number;
+  settingsRevision?: number;
+  operationId?: string;
+  condition: "effective" | "pending" | "unknown" | "rejected";
+  observedAt: string;
+}
+
+/** One open obligation on a seat generation (§ Retirement obligations). */
+export interface RetirementObligation {
+  obligationId: string;
+  name: string;
+  generation: number;
+  reason: "pause" | "remove" | "replace";
+  committedRevision: number;
+  state: "pending" | "unknown" | "terminal";
+  deathProofId?: string;
+  keyDenialProofId?: string;
+}
+
+export interface CleanupStep {
+  kind: "push" | "handoff" | "archive" | "pvc-delete";
+  state: "pending" | "unknown" | "done" | "parked";
+  attemptId?: string;
+  proofId?: string;
+  reason?: string;
+}
+
+/** The seat's data cleanup after `remove` (§ Seat data cleanup after remove). */
+export interface SeatDataCleanup {
+  name: string;
+  retiredRevision: number;
+  state: "pending" | "parked" | "done";
+  steps: CleanupStep[];
+}
+
 export interface SeatObservation {
   placement: Placement;
+  lifecycle?: ManagedLifecycleTarget;
   state: "pending" | "starting" | "running" | "stopping" | "stopped" | "unknown" | "parked";
+  executionIdentity?: string;
+  keyId?: string;
+  reason?: string;
+  key?: KeyObservation;
+  obligations: RetirementObligation[];
+  cleanup?: SeatDataCleanup;
 }
+
 export interface AcceptedIntent {
   acceptanceId: string;
   intent: LaunchIntent;
@@ -136,12 +190,12 @@ export interface AcceptedIntent {
   executionGate: ExecutionGate;
 }
 
-/** The accept-intent request the reconciler's transport sends. The caller's claim must be the
- *  selected manager's claim, so the builder refuses any other. */
+/** The accept-intent request the reconciler's transport sends. `claim` is taken from the intent's own
+ *  `placement.claim`; `buildAcceptIntentRequest` refuses unless it equals the manager's current claim. */
 export interface AcceptIntentRequest {
   operationId: string;
   claim: ManagerClaim;
-  intent: unknown;
+  intent: LaunchIntent;
 }
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -156,9 +210,8 @@ function objectOf(raw: unknown, what: string): Record<string, unknown> {
   return raw as Record<string, unknown>;
 }
 
-/** The ManagerClaim parser, mirrored from placement-enrollment.ts (not exported there). Same shape,
- *  same refusals; keep the two in step. */
-function parseClaim(raw: unknown, what: string): ManagerClaim {
+/** Parse one `ManagerClaim` (§ Placement and launch intent). Shared with `placement-enrollment.ts`. */
+export function parseManagerClaim(raw: unknown, what = "manager claim"): ManagerClaim {
   const value = objectOf(raw, what);
   exactKeys(value, ["accountPublicKey", "instanceId", "managerLifecycleUid", "assignmentRevision", "currentRegistrationRevision", "serveEpoch"], what);
   if (!isAccountNkey(value.accountPublicKey) || typeof value.instanceId !== "string" || typeof value.managerLifecycleUid !== "string" ||
@@ -179,25 +232,52 @@ export function parsePlacement(raw: unknown): Placement {
   if (typeof value.operationId !== "string" || !UUID.test(value.operationId)) fail(what, "operationId must be a UUID");
   if (typeof value.workspace !== "string" || value.workspace.length === 0) fail(what, "workspace is malformed");
   return { space: "main", name: value.name, desiredRevision: value.desiredRevision, seatRevision: value.seatRevision,
-    claim: parseClaim(value.claim, `${what} claim`), generation: value.generation, operationId: value.operationId, workspace: value.workspace };
+    claim: parseManagerClaim(value.claim, `${what} claim`), generation: value.generation, operationId: value.operationId, workspace: value.workspace };
 }
 
+function parseManagedLifecycleTarget(raw: unknown, what: string): ManagedLifecycleTarget {
+  const value = objectOf(raw, what);
+  exactKeys(value, ["space", "owner", "actor", "lifecycleUid"], what);
+  if (typeof value.space !== "string" || value.space.length === 0 || typeof value.owner !== "string" || value.owner.length === 0 ||
+      typeof value.actor !== "string" || value.actor.length === 0 || typeof value.lifecycleUid !== "string") fail(what, "lifecycle target is malformed");
+  try { assertLifecycleToken(value.lifecycleUid, `${what} lifecycleUid`); }
+  catch { fail(what, "lifecycle target uid is malformed"); }
+  return { space: value.space, owner: value.owner, actor: value.actor, lifecycleUid: value.lifecycleUid };
+}
+
+function parseAgentKeyTarget(raw: unknown, what: string): AgentKeyTarget {
+  const value = objectOf(raw, what);
+  exactKeys(value, ["seatName", "lifecycle", "generation"], what);
+  if (typeof value.seatName !== "string" || value.seatName.length === 0 || !uint(value.generation)) fail(what, "seat name or generation is malformed");
+  return { seatName: value.seatName, lifecycle: parseManagedLifecycleTarget(value.lifecycle, `${what} lifecycle`), generation: value.generation };
+}
+
+/** Parse an `ExecutionSubject`. Both arms are valid: `accepted` before binding, `bound` after. */
 function parseSubject(raw: unknown, what: string): ExecutionSubject {
   const value = objectOf(raw, what);
-  exactKeys(value, ["acceptanceId", "enrollmentOperationId", "phase"], what);
   if (typeof value.acceptanceId !== "string" || !UUID.test(value.acceptanceId) || typeof value.enrollmentOperationId !== "string" ||
-      !UUID.test(value.enrollmentOperationId) || value.phase !== "accepted") fail(what, "must identify an accepted enrollment");
-  return { acceptanceId: value.acceptanceId, enrollmentOperationId: value.enrollmentOperationId, phase: "accepted" };
+      !UUID.test(value.enrollmentOperationId)) fail(what, "must identify an enrollment by UUID ids");
+  if (value.phase === "accepted") {
+    exactKeys(value, ["acceptanceId", "enrollmentOperationId", "phase"], what);
+    return { acceptanceId: value.acceptanceId, enrollmentOperationId: value.enrollmentOperationId, phase: "accepted" };
+  }
+  if (value.phase === "bound") {
+    exactKeys(value, ["acceptanceId", "enrollmentOperationId", "phase", "bindingId", "target"], what);
+    if (typeof value.bindingId !== "string" || !UUID.test(value.bindingId)) fail(what, "bindingId must be a UUID");
+    return { acceptanceId: value.acceptanceId, enrollmentOperationId: value.enrollmentOperationId, phase: "bound",
+      bindingId: value.bindingId, target: parseAgentKeyTarget(value.target, `${what} target`) };
+  }
+  return fail(what, "phase must be accepted or bound");
 }
 
-export function parseExecutionAuthority(raw: unknown): ExecutionAuthority {
-  const what = "execution authority";
+/** Parse an `ExecutionAuthority`. Shared with `placement-enrollment.ts`. */
+export function parseExecutionAuthority(raw: unknown, what = "execution authority"): ExecutionAuthority {
   const value = objectOf(raw, what);
   exactKeys(value, ["subject", "placementOperationId", "intentDigest", "claim", "launchRevision"], what);
   if (typeof value.placementOperationId !== "string" || !UUID.test(value.placementOperationId) || !isContractDigest(value.intentDigest) ||
       !uint(value.launchRevision) || value.launchRevision < 1) fail(what, "placement, digest, or launch revision is malformed");
   return { subject: parseSubject(value.subject, `${what} subject`), placementOperationId: value.placementOperationId,
-    intentDigest: value.intentDigest, claim: parseClaim(value.claim, `${what} claim`), launchRevision: value.launchRevision };
+    intentDigest: value.intentDigest, claim: parseManagerClaim(value.claim, `${what} claim`), launchRevision: value.launchRevision };
 }
 
 export function parseExecutionGate(raw: unknown): ExecutionGate {
@@ -215,16 +295,179 @@ export function parseExecutionGate(raw: unknown): ExecutionGate {
   return { authority, state: value.state, fenceId };
 }
 
-/** Build the accept-intent request. The selected manager is the only caller allowed to send it, so
- *  the claim must equal the selected manager's claim by canonical JSON, and any difference refuses. */
+/** Build the accept-intent request. The intent is parsed with the closed `LaunchIntent` shape. The claim
+ *  is taken from the intent's own `placement.claim` and must equal the manager's `current` claim. Any
+ *  difference refuses. This builder does not authenticate the caller. The transport that authenticates
+ *  the selected manager is not built yet (tracked by the reconciler principal work). */
 export function buildAcceptIntentRequest(input: {
   operationId: string;
-  claim: ManagerClaim;
   intent: unknown;
-  selected: ManagerClaim;
+  current: ManagerClaim;
 }): AcceptIntentRequest {
-  if (canonicalJson(input.claim) !== canonicalJson(input.selected))
-    fail("accept-intent", "claim must equal the selected manager claim");
   if (typeof input.operationId !== "string" || !UUID.test(input.operationId)) fail("accept-intent", "operationId must be a UUID");
-  return { operationId: input.operationId, claim: input.claim, intent: input.intent };
+  const intent = parseLaunchIntent(input.intent);
+  const claim = intent.placement.claim;
+  const current = parseManagerClaim(input.current, "accept-intent current claim");
+  if (canonicalJson(claim) !== canonicalJson(current)) fail("accept-intent", "intent placement claim must equal the manager's current claim");
+  return { operationId: input.operationId, claim, intent };
+}
+
+/** Parse a closed `LaunchIntent`. Used by `buildAcceptIntentRequest` before it binds the claim. */
+function parseLaunchIntent(raw: unknown): LaunchIntent {
+  const what = "launch intent";
+  const value = objectOf(raw, what);
+  const keys = ["placement", "cwd", "workspaceDigest", "persona", "personaDigest", "profile", "role", "roleTreeRevision", "assets", "key", "policyRevision", "restartGeneration", "digest"];
+  const allowed = [...keys, "cardRole", "handoff"];
+  for (const key of Object.keys(value)) if (!allowed.includes(key)) fail(what, `has unknown field ${key}`);
+  for (const key of keys) if (!(key in value)) fail(what, `is missing ${key}`);
+  if (typeof value.cwd !== "string" || value.cwd.length === 0 || !isContractDigest(value.workspaceDigest) ||
+      typeof value.persona !== "string" || value.persona.length === 0 || !isContractDigest(value.personaDigest) ||
+      typeof value.role !== "string" || value.role.length === 0 || !uint(value.roleTreeRevision) || !uint(value.policyRevision) ||
+      !uint(value.restartGeneration) || !isContractDigest(value.digest)) fail(what, "scalar fields are malformed");
+  if ("cardRole" in value && (typeof value.cardRole !== "string" || value.cardRole.length === 0)) fail(what, "cardRole must be a non-empty string");
+  const cardRole = typeof value.cardRole === "string" ? { cardRole: value.cardRole } : {};
+  return {
+    placement: parsePlacement(value.placement),
+    cwd: value.cwd,
+    workspaceDigest: value.workspaceDigest,
+    persona: value.persona,
+    personaDigest: value.personaDigest,
+    ...cardRole,
+    profile: parseProfileSnapshot(value.profile, `${what} profile`),
+    role: value.role,
+    roleTreeRevision: value.roleTreeRevision,
+    assets: parseRuntimeAssets(value.assets, `${what} assets`),
+    key: parseKeySettings(value.key, `${what} key`),
+    policyRevision: value.policyRevision,
+    restartGeneration: value.restartGeneration,
+    ...("handoff" in value ? { handoff: parseHandoffInput(value.handoff, `${what} handoff`) } : {}),
+    digest: value.digest,
+  };
+}
+
+const isString = (value: unknown): value is string => typeof value === "string" && value.length > 0;
+
+function parseProfileSnapshot(raw: unknown, what: string): ProfileSnapshot {
+  const value = objectOf(raw, what);
+  exactKeys(value, ["name", "revision", "configRevision", "modelRoles", "sha256"], what);
+  if (!isString(value.name) || !isString(value.revision) || !isString(value.configRevision) || !isContractDigest(value.sha256)) fail(what, "fields are malformed");
+  const roles = objectOf(value.modelRoles, `${what} modelRoles`);
+  const modelRoles: Record<string, string> = {};
+  for (const [role, model] of Object.entries(roles)) {
+    if (!isString(model)) fail(what, "modelRoles values must be non-empty strings");
+    modelRoles[role] = model;
+  }
+  return { name: value.name, revision: value.revision, configRevision: value.configRevision, modelRoles, sha256: value.sha256 };
+}
+
+function parseRuntimeAssets(raw: unknown, what: string): RuntimeAssets {
+  const value = objectOf(raw, what);
+  exactKeys(value, ["revision", "digest", "imageDigest", "baselineConfigDigest", "modelCatalogDigest", "personaCatalogDigest", "extensionsDigest", "rulesSkillsDigest", "cliClosureDigest", "toolBindings"], what);
+  if (!isString(value.revision) || !isString(value.imageDigest) || !Array.isArray(value.toolBindings)) fail(what, "fields are malformed");
+  if (!isContractDigest(value.digest) || !isContractDigest(value.baselineConfigDigest) || !isContractDigest(value.modelCatalogDigest) ||
+      !isContractDigest(value.personaCatalogDigest) || !isContractDigest(value.extensionsDigest) || !isContractDigest(value.rulesSkillsDigest) ||
+      !isContractDigest(value.cliClosureDigest)) fail(what, "digest fields are malformed");
+  const toolBindings = value.toolBindings.map((entry, index) => {
+    const binding = objectOf(entry, `${what} toolBindings[${index}]`);
+    exactKeys(binding, ["id", "endpoint", "entitlementRef"], `${what} toolBindings[${index}]`);
+    if (!isString(binding.id) || !isString(binding.endpoint) || !isString(binding.entitlementRef)) fail(what, "toolBindings entries are malformed");
+    return { id: binding.id, endpoint: binding.endpoint, entitlementRef: binding.entitlementRef };
+  });
+  return { revision: value.revision, digest: value.digest, imageDigest: value.imageDigest,
+    baselineConfigDigest: value.baselineConfigDigest, modelCatalogDigest: value.modelCatalogDigest,
+    personaCatalogDigest: value.personaCatalogDigest, extensionsDigest: value.extensionsDigest,
+    rulesSkillsDigest: value.rulesSkillsDigest, cliClosureDigest: value.cliClosureDigest, toolBindings };
+}
+
+function parseHandoffInput(raw: unknown, what: string): HandoffInput {
+  const value = objectOf(raw, what);
+  if (value.mode === "none") {
+    exactKeys(value, ["mode", "reason"], what);
+    if (value.reason !== "skip" && value.reason !== "not-running" && value.reason !== "superseded") fail(what, "reason is malformed");
+    return { mode: "none", reason: value.reason };
+  }
+  if (value.mode !== "document") fail(what, "mode must be document or none");
+  exactKeys(value, ["mode", "receipt"], what);
+  const receipt = objectOf(value.receipt, `${what} receipt`);
+  exactKeys(receipt, ["receiptId", "request", "lifecycle", "artifactRef", "artifactDigest", "sizeBytes", "at"], `${what} receipt`);
+  const request = objectOf(receipt.request, `${what} receipt request`);
+  exactKeys(request, ["restartOperationId", "name", "predecessorGeneration", "restartGeneration"], `${what} receipt request`);
+  const artifactRef = objectOf(receipt.artifactRef, `${what} receipt artifactRef`);
+  exactKeys(artifactRef, ["kind", "id"], `${what} receipt artifactRef`);
+  if (typeof receipt.receiptId !== "string" || !UUID.test(receipt.receiptId) || typeof request.restartOperationId !== "string" ||
+      !UUID.test(request.restartOperationId) || !isString(request.name) || !uint(request.predecessorGeneration) || !uint(request.restartGeneration) ||
+      artifactRef.kind !== "wave-handoff/v1" || typeof artifactRef.id !== "string" || !UUID.test(artifactRef.id) ||
+      !isContractDigest(receipt.artifactDigest) || !uint(receipt.sizeBytes) || !isString(receipt.at)) fail(what, "receipt fields are malformed");
+  return { mode: "document", receipt: {
+    receiptId: receipt.receiptId,
+    request: { restartOperationId: request.restartOperationId, name: request.name, predecessorGeneration: request.predecessorGeneration, restartGeneration: request.restartGeneration },
+    lifecycle: parseManagedLifecycleTarget(receipt.lifecycle, `${what} receipt lifecycle`),
+    artifactRef: { kind: "wave-handoff/v1", id: artifactRef.id },
+    artifactDigest: receipt.artifactDigest, sizeBytes: receipt.sizeBytes, at: receipt.at,
+  } };
+}
+
+function parseKeySettings(raw: unknown, what: string): KeySettings {
+  const value = objectOf(raw, what);
+  exactKeys(value, ["routing", "limits", "policyId"], what);
+  if (!isString(value.policyId)) fail(what, "policyId must be a non-empty string");
+  return { routing: parseRoutingMap(value.routing, `${what} routing`), limits: parseKeyLimits(value.limits, `${what} limits`), policyId: value.policyId };
+}
+
+const isProvider = (value: string): value is Provider => value === "claude" || value === "codex";
+
+function parseRoutingMap(raw: unknown, what: string): RoutingMap {
+  const value = objectOf(raw, what);
+  const routing: RoutingMap = {};
+  for (const key of Object.keys(value)) {
+    if (!isProvider(key)) fail(what, `has unknown provider ${key}`);
+    const selection = value[key];
+    if (selection === "shared") routing[key] = "shared";
+    else if (Array.isArray(selection) && selection.every(isString)) routing[key] = selection;
+    else fail(what, `${key} must be shared or a list of account ids`);
+  }
+  return routing;
+}
+
+function parseKeyLimits(raw: unknown, what: string): KeyLimits {
+  const value = objectOf(raw, what);
+  for (const key of Object.keys(value)) if (key !== "keyCap" && key !== "perModel") fail(what, `has unknown field ${key}`);
+  const limits: KeyLimits = {};
+  if (value.keyCap !== undefined) limits.keyCap = parseCap(value.keyCap, `${what} keyCap`);
+  if (value.perModel !== undefined) {
+    const perModel = objectOf(value.perModel, `${what} perModel`);
+    const models: NonNullable<KeyLimits["perModel"]> = {};
+    for (const [model, entry] of Object.entries(perModel)) models[model] = parseModelCounts(entry, `${what} perModel.${model}`);
+    limits.perModel = models;
+  }
+  return limits;
+}
+
+function parseModelCounts(raw: unknown, what: string): { tokens?: number; tpm?: number; rpm?: number } {
+  const value = objectOf(raw, what);
+  for (const key of Object.keys(value)) if (key !== "tokens" && key !== "tpm" && key !== "rpm") fail(what, `has unknown field ${key}`);
+  const counts: { tokens?: number; tpm?: number; rpm?: number } = {};
+  const { tokens, tpm, rpm } = value;
+  if (tokens !== undefined) { if (!uint(tokens)) fail(what, "tokens must be an unsigned integer"); counts.tokens = tokens; }
+  if (tpm !== undefined) { if (!uint(tpm)) fail(what, "tpm must be an unsigned integer"); counts.tpm = tpm; }
+  if (rpm !== undefined) { if (!uint(rpm)) fail(what, "rpm must be an unsigned integer"); counts.rpm = rpm; }
+  return counts;
+}
+
+function parseCap(raw: unknown, what: string): Cap {
+  const value = objectOf(raw, what);
+  exactKeys(value, ["usd", "window"], what);
+  if (typeof value.usd !== "number" || !Number.isFinite(value.usd) || value.usd < 0) fail(what, "usd must be a non-negative number");
+  const window = objectOf(value.window, `${what} window`);
+  if (window.kind === "fixed") {
+    exactKeys(window, ["kind", "seconds", "anchorUtc", "timezone"], `${what} window`);
+    if (!uint(window.seconds) || !isString(window.anchorUtc) || !isString(window.timezone)) fail(what, "fixed window fields are malformed");
+    return { usd: value.usd, window: { kind: "fixed", seconds: window.seconds, anchorUtc: window.anchorUtc, timezone: window.timezone } };
+  }
+  if (window.kind === "rolling") {
+    exactKeys(window, ["kind", "seconds"], `${what} window`);
+    if (!uint(window.seconds)) fail(what, "rolling window seconds must be an unsigned integer");
+    return { usd: value.usd, window: { kind: "rolling", seconds: window.seconds } };
+  }
+  return fail(what, "window kind must be fixed or rolling");
 }

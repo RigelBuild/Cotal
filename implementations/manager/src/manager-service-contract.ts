@@ -441,7 +441,7 @@ const RESOLVE_AGENT_OUTPUT_SCHEMA = {
   properties: { agent: { type: "string" } },
 } as const;
 
-// The placement-only launch vocabulary (RIG-8502 launch protocol § Placement and launch intent). Every
+// The placement-only launch vocabulary (launch protocol § Placement and launch intent). Every
 // object is closed. The shared field constants below are copied per node by the canonicalizer, which
 // has no cycle check, so reusing one here is safe.
 const SHA256_DIGEST = { type: "string", pattern: "^sha256:[0-9a-f]{64}$" } as const;
@@ -565,20 +565,32 @@ const LAUNCH_INTENT_SCHEMA = {
   required: ["placement", "cwd", "workspaceDigest", "persona", "personaDigest", "profile", "role", "roleTreeRevision", "assets", "key", "policyRevision", "restartGeneration", "digest"],
   properties: {
     placement: PLACEMENT_SCHEMA, cwd: { type: "string", minLength: 1 }, workspaceDigest: SHA256_DIGEST,
-    persona: { type: "string", minLength: 1 }, personaDigest: SHA256_DIGEST,
+    persona: { type: "string", minLength: 1 }, personaDigest: SHA256_DIGEST, cardRole: { type: "string", minLength: 1 },
     profile: PROFILE_SNAPSHOT_SCHEMA, role: { type: "string", minLength: 1 }, roleTreeRevision: UINT_FIELD,
     assets: RUNTIME_ASSETS_SCHEMA, key: KEY_SETTINGS_SCHEMA, policyRevision: UINT_FIELD, restartGeneration: UINT_FIELD,
     handoff: HANDOFF_INPUT_SCHEMA, digest: SHA256_DIGEST,
+  },
+} as const;
+const AGENT_KEY_TARGET_SCHEMA = {
+  type: "object", additionalProperties: false, required: ["seatName", "lifecycle", "generation"],
+  properties: { seatName: { type: "string", minLength: 1 }, lifecycle: MANAGED_LIFECYCLE_TARGET_SCHEMA, generation: UINT_FIELD },
+} as const;
+const EXECUTION_SUBJECT_ACCEPTED_SCHEMA = {
+  type: "object", additionalProperties: false, required: ["acceptanceId", "enrollmentOperationId", "phase"],
+  properties: { acceptanceId: UUID_FIELD, enrollmentOperationId: UUID_FIELD, phase: { const: "accepted" } },
+} as const;
+const EXECUTION_SUBJECT_BOUND_SCHEMA = {
+  type: "object", additionalProperties: false, required: ["acceptanceId", "enrollmentOperationId", "phase", "bindingId", "target"],
+  properties: {
+    acceptanceId: UUID_FIELD, enrollmentOperationId: UUID_FIELD, phase: { const: "bound" }, bindingId: UUID_FIELD,
+    target: AGENT_KEY_TARGET_SCHEMA,
   },
 } as const;
 const EXECUTION_AUTHORITY_SCHEMA = {
   type: "object", additionalProperties: false,
   required: ["subject", "placementOperationId", "intentDigest", "claim", "launchRevision"],
   properties: {
-    subject: {
-      type: "object", additionalProperties: false, required: ["acceptanceId", "enrollmentOperationId", "phase"],
-      properties: { acceptanceId: UUID_FIELD, enrollmentOperationId: UUID_FIELD, phase: { const: "accepted" } },
-    },
+    subject: { oneOf: [EXECUTION_SUBJECT_ACCEPTED_SCHEMA, EXECUTION_SUBJECT_BOUND_SCHEMA] },
     placementOperationId: UUID_FIELD, intentDigest: SHA256_DIGEST, claim: MANAGER_CLAIM_SCHEMA,
     launchRevision: { type: "integer", minimum: 1, maximum: Number.MAX_SAFE_INTEGER },
   },
@@ -597,17 +609,50 @@ const ACCEPTED_INTENT_SCHEMA = {
     acceptedSeatRevision: UINT_FIELD, enrollmentOperationId: UUID_FIELD, executionGate: EXECUTION_GATE_SCHEMA,
   },
 } as const;
-// LOOSE BY PROTOCOL: SeatObservation carries optional lifecycle, key, obligations and cleanup fields
-// whose shapes are not yet frozen here, so this object is closed on the required core only.
-const SEAT_OBSERVATION_SCHEMA = {
-  type: "object", additionalProperties: false, required: ["placement", "state"],
+const KEY_OBSERVATION_SCHEMA = {
+  type: "object", additionalProperties: false, required: ["desiredAuthorizationRevision", "condition", "observedAt"],
   properties: {
-    placement: PLACEMENT_SCHEMA,
-    state: { enum: ["pending", "starting", "running", "stopping", "stopped", "unknown", "parked"] },
+    desiredAuthorizationRevision: UINT_FIELD, appliedAuthorizationRevision: UINT_FIELD, settingsRevision: UINT_FIELD,
+    operationId: UUID_FIELD, condition: { enum: ["effective", "pending", "unknown", "rejected"] },
+    observedAt: { type: "string", minLength: 1 },
   },
 } as const;
-// SeatEntryV2 as the protocol names it. `expiresAt` (RIG-8659 T7) is deliberately absent: closed JSON
-// refuses it until T7 lands.
+const RETIREMENT_OBLIGATION_SCHEMA = {
+  type: "object", additionalProperties: false,
+  required: ["obligationId", "name", "generation", "reason", "committedRevision", "state"],
+  properties: {
+    obligationId: UUID_FIELD, name: { type: "string", minLength: 1 }, generation: UINT_FIELD,
+    reason: { enum: ["pause", "remove", "replace"] }, committedRevision: UINT_FIELD,
+    state: { enum: ["pending", "unknown", "terminal"] }, deathProofId: UUID_FIELD, keyDenialProofId: UUID_FIELD,
+  },
+} as const;
+const CLEANUP_STEP_SCHEMA = {
+  type: "object", additionalProperties: false, required: ["kind", "state"],
+  properties: {
+    kind: { enum: ["push", "handoff", "archive", "pvc-delete"] }, state: { enum: ["pending", "unknown", "done", "parked"] },
+    attemptId: UUID_FIELD, proofId: UUID_FIELD, reason: { type: "string", minLength: 1 },
+  },
+} as const;
+const SEAT_DATA_CLEANUP_SCHEMA = {
+  type: "object", additionalProperties: false, required: ["name", "retiredRevision", "state", "steps"],
+  properties: {
+    name: { type: "string", minLength: 1 }, retiredRevision: UINT_FIELD, state: { enum: ["pending", "parked", "done"] },
+    steps: { type: "array", items: CLEANUP_STEP_SCHEMA },
+  },
+} as const;
+// SeatObservation as the protocol names it (§ Placement and launch intent). `obligations` is required.
+const SEAT_OBSERVATION_SCHEMA = {
+  type: "object", additionalProperties: false, required: ["placement", "state", "obligations"],
+  properties: {
+    placement: PLACEMENT_SCHEMA, lifecycle: MANAGED_LIFECYCLE_TARGET_SCHEMA,
+    state: { enum: ["pending", "starting", "running", "stopping", "stopped", "unknown", "parked"] },
+    executionIdentity: { type: "string", minLength: 1 }, keyId: { type: "string", minLength: 1 },
+    reason: { type: "string", minLength: 1 }, key: KEY_OBSERVATION_SCHEMA,
+    obligations: { type: "array", items: RETIREMENT_OBLIGATION_SCHEMA }, cleanup: SEAT_DATA_CLEANUP_SCHEMA,
+  },
+} as const;
+// SeatEntryV2 as the launch protocol names it (§ Placement and launch intent). `expiresAt` is
+// deliberately absent: closed JSON refuses it until the seat-card field lands.
 const SEAT_ENTRY_V2_SCHEMA = {
   type: "object", additionalProperties: false,
   required: ["name", "seatRevision", "cwd", "tab", "state", "restartGeneration", "updatedAt", "profile", "role", "roleTreeRevision", "key", "workspace", "persona"],
@@ -1459,7 +1504,7 @@ export const MANAGER_STATUS_CONTRACT: { input: CompiledContract; output: Compile
  *  48 adds retained-custody and deferred-seat reconciliation status; 49 adds `release-seat`;
  *  50 adds `attest-gone`; 51 adds `allowlist-set` and the fork's blank continuation refusal;
  *  52 adds `roster` for static agent presence reads; 53 adds `prepare-launch` and `place`, the
- *  placement-only launch contract (RIG-10267). A new served command is what a revision is for.
+ *  placement-only launch contract (§ Placement and launch intent). A new served command is what a revision is for.
  */
 export function managerClusterDocument(): ClusterDocument {
   return buildClusterDocument(MANAGER_CLUSTER_URN, 53, ROWS);

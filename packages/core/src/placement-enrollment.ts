@@ -1,21 +1,13 @@
-import { isContractDigest } from "./canonical-json.js";
 import { EpEnvelopeError } from "./endpoint-error.js";
-import { isAccountNkey } from "./identity.js";
+import { parseExecutionAuthority, type ExecutionAuthority } from "./placement-launch.js";
 import { parseRemoteManagedAgentEnrollmentRequest, type RemoteManagedAgentEnrollmentRequest, type RemoteManagedAgentEnrollmentResult } from "./remote-manager-authority.js";
-import { assertLifecycleToken } from "./subjects.js";
 
 export interface PlacementEnrollmentRequest {
   v: 1;
   kind: "auth.enroll-placement";
   acceptanceId: string;
   enrollmentOperationId: string;
-  authority: {
-    subject: { acceptanceId: string; enrollmentOperationId: string; phase: "accepted" };
-    placementOperationId: string;
-    intentDigest: string;
-    claim: { accountPublicKey: string; instanceId: string; managerLifecycleUid: string; assignmentRevision: number; currentRegistrationRevision: number; serveEpoch: number };
-    launchRevision: number;
-  };
+  authority: ExecutionAuthority;
   actorTokenHash: string;
   enrollment: RemoteManagedAgentEnrollmentRequest;
 }
@@ -36,33 +28,6 @@ function exactKeys(value: Record<string, unknown>, expected: readonly string[], 
   if (keys.join(",") !== [...expected].sort().join(",")) fail(what, `must contain exactly ${expected.join(", ")}`);
 }
 
-function parseClaim(raw: unknown, what: string): PlacementEnrollmentRequest["authority"]["claim"] {
-  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) fail(what, "claim must be an object");
-  const value = raw as Record<string, unknown>;
-  exactKeys(value, ["accountPublicKey", "instanceId", "managerLifecycleUid", "assignmentRevision", "currentRegistrationRevision", "serveEpoch"], what);
-  if (!isAccountNkey(value.accountPublicKey) || typeof value.instanceId !== "string" || typeof value.managerLifecycleUid !== "string" ||
-      !uint(value.assignmentRevision) || !uint(value.currentRegistrationRevision) || !uint(value.serveEpoch)) fail(what, "claim fields are malformed");
-  try { assertLifecycleToken(value.instanceId, "manager claim instanceId"); assertLifecycleToken(value.managerLifecycleUid, "manager claim lifecycle uid"); }
-  catch { fail(what, "claim lifecycle tokens are malformed"); }
-  return { accountPublicKey: value.accountPublicKey, instanceId: value.instanceId, managerLifecycleUid: value.managerLifecycleUid,
-    assignmentRevision: value.assignmentRevision, currentRegistrationRevision: value.currentRegistrationRevision, serveEpoch: value.serveEpoch };
-}
-
-function parseAuthority(raw: unknown, what: string): PlacementEnrollmentRequest["authority"] {
-  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) fail(what, "authority must be an object");
-  const value = raw as Record<string, unknown>;
-  exactKeys(value, ["subject", "placementOperationId", "intentDigest", "claim", "launchRevision"], what);
-  if (value.subject === null || typeof value.subject !== "object" || Array.isArray(value.subject)) fail(what, "authority subject must be an object");
-  const subject = value.subject as Record<string, unknown>;
-  exactKeys(subject, ["acceptanceId", "enrollmentOperationId", "phase"], what);
-  if (typeof subject.acceptanceId !== "string" || !UUID.test(subject.acceptanceId) || typeof subject.enrollmentOperationId !== "string" ||
-      !UUID.test(subject.enrollmentOperationId) || subject.phase !== "accepted") fail(what, "authority subject must identify an accepted enrollment");
-  if (typeof value.placementOperationId !== "string" || !UUID.test(value.placementOperationId) || !isContractDigest(value.intentDigest) ||
-      !uint(value.launchRevision) || value.launchRevision < 1) fail(what, "authority placement, digest, or launch revision is malformed");
-  return { subject: { acceptanceId: subject.acceptanceId, enrollmentOperationId: subject.enrollmentOperationId, phase: "accepted" },
-    placementOperationId: value.placementOperationId, intentDigest: value.intentDigest, claim: parseClaim(value.claim, `${what} authority`), launchRevision: value.launchRevision };
-}
-
 export function parsePlacementEnrollmentRequest(raw: unknown): PlacementEnrollmentRequest {
   const what = "placement enrollment request";
   if (raw === null || typeof raw !== "object" || Array.isArray(raw)) fail(what, "must be an object");
@@ -71,7 +36,7 @@ export function parsePlacementEnrollmentRequest(raw: unknown): PlacementEnrollme
   if (value.v !== 1 || value.kind !== "auth.enroll-placement") fail(what, "has an unsupported version or kind");
   if (typeof value.acceptanceId !== "string" || !UUID.test(value.acceptanceId) || typeof value.enrollmentOperationId !== "string" || !UUID.test(value.enrollmentOperationId))
     fail(what, "requires UUID acceptance and enrollment operation ids");
-  const authority = parseAuthority(value.authority, what);
+  const authority = parseExecutionAuthority(value.authority, `${what} authority`);
   if (authority.subject.acceptanceId !== value.acceptanceId || authority.subject.enrollmentOperationId !== value.enrollmentOperationId)
     fail(what, "ids differ from the accepted execution subject");
   if (typeof value.actorTokenHash !== "string" || !TOKEN_HASH.test(value.actorTokenHash)) fail(what, "requires a lowercase SHA-256 actor token hash");

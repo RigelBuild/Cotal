@@ -27,7 +27,7 @@ export interface AcceptedPlacementView {
 }
 
 export interface PlacementAuthorityView {
-  subject: { acceptanceId: string; enrollmentOperationId: string; phase: "accepted" };
+  subject: { acceptanceId: string; enrollmentOperationId: string; phase: "accepted" } | { acceptanceId: string; enrollmentOperationId: string; phase: "bound"; bindingId: string; target: { seatName: string; lifecycle: { space: string; owner: string; actor: string; lifecycleUid: string }; generation: number } };
   placementOperationId: string;
   intentDigest: string;
   claim: ManagerClaimView;
