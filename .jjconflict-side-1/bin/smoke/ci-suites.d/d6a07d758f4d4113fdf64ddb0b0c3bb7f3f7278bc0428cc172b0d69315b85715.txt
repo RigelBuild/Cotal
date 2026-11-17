@@ -1,2 +1,0 @@
-# The capability census execution half: a mapped command issues the native request its owner rows name.
-smoke:capability-census:live

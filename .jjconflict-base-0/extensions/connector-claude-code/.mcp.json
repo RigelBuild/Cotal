@@ -1,8 +1,0 @@
-{
-  "mcpServers": {
-    "cotal": {
-      "command": "node",
-      "args": ["--optimize-for-size", "--max-semi-space-size=1", "${CLAUDE_PLUGIN_ROOT}/dist/seat.cjs"]
-    }
-  }
-}

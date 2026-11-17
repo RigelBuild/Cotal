@@ -1,3 +1,0 @@
-# A foreground spawn and a bare join issue their seat against its lifecycle gate and retire the
-# issuance on a clean exit. Added with the suite, which defined the script but not this fragment.
-smoke:foreground-issuance:live

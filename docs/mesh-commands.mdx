@@ -26,7 +26,7 @@ The output schemas below describe successful command results, not the protocol e
 
 ## manager
 
-Cluster `ai.cotal.manager`, revision 46. 43 commands.
+Cluster `ai.cotal.manager`, revision 51. 46 commands.
 
 | Command                                                   | Capability          | Class     | Target modes |
 | --------------------------------------------------------- | ------------------- | --------- | ------------ |
@@ -73,6 +73,9 @@ Cluster `ai.cotal.manager`, revision 46. 43 commands.
 | [`commit-preservation`](#manager-commit-preservation)     | `manager.admin`     | ephemeral | untargeted   |
 | [`abort-preservation`](#manager-abort-preservation)       | `manager.admin`     | ephemeral | untargeted   |
 | [`transcript-receive`](#manager-transcript-receive)       | `manager.admin`     | ephemeral | untargeted   |
+| [`release-seat`](#manager-release-seat)                   | `manager.admin`     | ephemeral | untargeted   |
+| [`attest-gone`](#manager-attest-gone)                     | `manager.admin`     | ephemeral | untargeted   |
+| [`allowlist-set`](#manager-allowlist-set)                 | `manager.admin`     | ephemeral | untargeted   |
 
 ### manager vitals
 
@@ -208,7 +211,7 @@ Registered declaration:
   "targeted": false,
   "capability": "manager.read",
   "inputDigest": "sha256:1db0472aaee8e6b9d8d3d430ee021a1b6efc559ab7c0b99186898c972c53dd2d",
-  "outputDigest": "sha256:20fcd4978ef14fa010b0da9c704fc0289d9cc8b4ee290ac388d47cb09db81362"
+  "outputDigest": "sha256:e8cd021a8d73bf6dde4b89dda608518f41cf1ba3f478a33070a5c908b9b82190"
 }
 ```
 
@@ -447,7 +450,9 @@ Output schema:
       "additionalProperties": false,
       "required": [
         "state",
-        "failures"
+        "failures",
+        "retainedCustody",
+        "deferredSeats"
       ],
       "properties": {
         "state": {
@@ -459,6 +464,14 @@ Output schema:
             "recovered",
             "failed"
           ]
+        },
+        "retainedCustody": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "deferredSeats": {
+          "type": "integer",
+          "minimum": 0
         },
         "lastSweep": {
           "type": "object",
@@ -547,7 +560,8 @@ Output schema:
                   "recovered",
                   "refused",
                   "refused-foreign",
-                  "retry-exhausted"
+                  "retry-exhausted",
+                  "deferred"
                 ]
               },
               "lastError": {
@@ -560,6 +574,20 @@ Output schema:
                 "type": "string"
               },
               "remedy": {
+                "type": "string"
+              },
+              "retainedReason": {
+                "enum": [
+                  "absent",
+                  "no-reference",
+                  "unprovable",
+                  "members-remain"
+                ]
+              },
+              "deferUntil": {
+                "type": "string"
+              },
+              "attestedGone": {
                 "type": "string"
               }
             }
@@ -1332,7 +1360,7 @@ Registered declaration:
   "class": "ephemeral",
   "targeted": false,
   "capability": "manager.spawn",
-  "inputDigest": "sha256:fdb061219ac54df53789b2dfba3ff709271075e4115be6f5142d731b609269fe",
+  "inputDigest": "sha256:63a293f555d4a89919e3d498ba4c81721a8747ab2985b68b5a1eccd19a2c1591",
   "outputDigest": "sha256:d883a9f97f7c034772c7cbc28b22d63cf69870ba072d470c2f7b104f455e2e83"
 }
 ```
@@ -1391,6 +1419,10 @@ Input schema:
       "pattern": "^\\s*\\S"
     },
     "resumeAgent": {
+      "type": "string",
+      "pattern": "^\\s*\\S"
+    },
+    "continueSession": {
       "type": "string",
       "pattern": "^\\s*\\S"
     },
@@ -4561,6 +4593,210 @@ Output schema:
     },
     "fetched": {
       "type": "boolean"
+    }
+  }
+}
+```
+
+### manager release-seat
+
+Registered declaration:
+
+```json
+{
+  "name": "release-seat",
+  "class": "ephemeral",
+  "targeted": false,
+  "capability": "manager.admin",
+  "inputDigest": "sha256:45dd4fa7fb316c7976309a2831bfce02d9e4c34b352b0feedfd17cce6ca21b84",
+  "outputDigest": "sha256:3ecbaa16372c05668645e52a9646b7634e7860dbf0d294044208cf7571b82535"
+}
+```
+
+Input schema:
+
+```json
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "alias",
+    "lifecycleUid",
+    "reason"
+  ],
+  "properties": {
+    "alias": {
+      "type": "string",
+      "minLength": 1
+    },
+    "lifecycleUid": {
+      "type": "string",
+      "minLength": 1
+    },
+    "reason": {
+      "type": "string",
+      "minLength": 1
+    }
+  }
+}
+```
+
+Output schema:
+
+```json
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "alias",
+    "lifecycleUid",
+    "phase",
+    "advisory"
+  ],
+  "properties": {
+    "alias": {
+      "type": "string"
+    },
+    "lifecycleUid": {
+      "type": "string"
+    },
+    "phase": {
+      "type": "string"
+    },
+    "advisory": {
+      "type": "string"
+    }
+  }
+}
+```
+
+### manager attest-gone
+
+Registered declaration:
+
+```json
+{
+  "name": "attest-gone",
+  "class": "ephemeral",
+  "targeted": false,
+  "capability": "manager.admin",
+  "inputDigest": "sha256:50930c6c161404afe70b1c58d5e27c7fa4734b327ab85afd95bd432dcc873cef",
+  "outputDigest": "sha256:b9c8bbdaedc4f87a64ac706909af94c95aafcc7da7658dc20651fbe860f6c77b"
+}
+```
+
+Input schema:
+
+```json
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "name",
+    "attestGone"
+  ],
+  "properties": {
+    "name": {
+      "type": "string",
+      "minLength": 1
+    },
+    "attestGone": {
+      "type": "string",
+      "maxLength": 500,
+      "allOf": [
+        {
+          "pattern": "^\\s*\\S"
+        },
+        {
+          "pattern": "^[^\\r\\n]+$"
+        }
+      ]
+    }
+  }
+}
+```
+
+Output schema:
+
+```json
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "name",
+    "lifecycleUid",
+    "phase",
+    "attestedGone"
+  ],
+  "properties": {
+    "name": {
+      "type": "string"
+    },
+    "lifecycleUid": {
+      "type": "string"
+    },
+    "phase": {
+      "type": "string"
+    },
+    "attestedGone": {
+      "type": "string"
+    }
+  }
+}
+```
+
+### manager allowlist-set
+
+Registered declaration:
+
+```json
+{
+  "name": "allowlist-set",
+  "class": "ephemeral",
+  "targeted": false,
+  "capability": "manager.admin",
+  "inputDigest": "sha256:f2fa365b2d31d62218557795a9c7389fffc855e2c88e40959f7d85aa5c3e3d2e",
+  "outputDigest": "sha256:8d1959677b5baef544795b2a12a30899f33c524edcedf55b5bc9d8eabad55d6b"
+}
+```
+
+Input schema:
+
+```json
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "names"
+  ],
+  "properties": {
+    "names": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "uniqueItems": true
+    }
+  }
+}
+```
+
+Output schema:
+
+```json
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "names"
+  ],
+  "properties": {
+    "names": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
     }
   }
 }

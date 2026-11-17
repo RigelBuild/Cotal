@@ -1,2 +1,0 @@
-# An agent's frames and posts fold into the session view's steps.
-smoke:web-session

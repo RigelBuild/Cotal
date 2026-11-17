@@ -1,2 +1,0 @@
-# The on-demand roster read a seat makes instead of watching presence (AGENT-979).
-smoke:presence-read

@@ -1,3 +1,0 @@
-# Every tracked mutation config passes the coverage auditor's metadata and gradability validation,
-# or is a refusal pinned in scripts/mutation-coverage.recorded.json. Nothing is executed.
-smoke:mutation-metadata

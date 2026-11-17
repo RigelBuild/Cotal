@@ -1,2 +1,0 @@
-# journal fuzz vocabulary walk. Registered as a fragment (ci-suites.txt frozen since #1052).
-smoke:lang-fuzz-journal

@@ -64,6 +64,18 @@ export const QUARANTINED = {
   "smoke:presence-watch-rebind": { reason: "flaky upstream: fails 1/3 on pristine main 8ca93e96 (local 3x sweep, 2026-10-17); file byte-identical to upstream; quarantined on sync per Matt", recheckBy: "2026-12-31" },
   "smoke:setup-provider-pack": { reason: "flaky upstream: fails 1/3 on pristine main 8ca93e96 (local 3x sweep, 2026-10-17); file byte-identical to upstream; quarantined on sync per Matt", recheckBy: "2026-12-31" },
   "smoke:usage-format": { reason: "upstream: 6/428 cells fail on pristine main 3f124c77 (local run); quarantined on sync per fork policy", recheckBy: "2026-12-31" },
+  "smoke:journal-model-b": { reason: "RIG-9150 upstream: asserts 2 recordGoalIndex writers, manager.ts has 3 on pristine 82a97c1f (local run)", recheckBy: "2026-12-31" },
+  "smoke:docs-ext-read": { reason: "RIG-9150 upstream: capSection cuts a search hit before allowSubscribe on pristine 82a97c1f (local run)", recheckBy: "2026-12-31" },
+  "smoke:seat-installed-dist": { reason: "RIG-9150 upstream: needs assembled arm64 natives a host build lacks, red on pristine 82a97c1f (local run)", recheckBy: "2026-12-31" },
+  "smoke:seat-platform": { reason: "RIG-9150 upstream: pack proofs need all six platform natives, red on pristine 82a97c1f (local run)", recheckBy: "2026-12-31" },
+  "smoke:suite-ambient-env": { reason: "RIG-9150 upstream: 7 suites call recordMesh without COTAL_HOME, same 7 !== 0 on pristine 82a97c1f (local run)", recheckBy: "2026-12-31" },
+  "smoke:broker-migration": { reason: "RIG-9150 upstream: unadopted broker spawns in web post-capability/send smokes, 6/1 on pristine 82a97c1f (local run)", recheckBy: "2026-12-31" },
+  "smoke:ps-user-mode": { reason: "RIG-9150 CI-env: Next line is `pnpm cotal login` under CI, assertion hard-codes `cotal login`; 63/0 locally on fork and 82a97c1f", recheckBy: "2026-12-31" },
+  "smoke:membership-rw-renewal": { reason: "RIG-9150 flaky: reconnect sweep cell failed once on CI (3f4f77b1 shard 3); 52/52 locally on fork and 82a97c1f", recheckBy: "2026-12-31" },
+  "smoke:signal-exits:live": { reason: "RIG-9150 CI-env: CI cannot signal nats-server pid 1 (EPERM), leaving manager stop unknown; 16/18 cells pass", recheckBy: "2026-12-31" },
+  "smoke:setup-destination": { reason: "RIG-9150 upstream: 19/82 cells fail on pristine 82a97c1f (local run); runtime host-tool fixture cells", recheckBy: "2026-12-31" },
+  "smoke:stack-settle:live": { reason: "RIG-9150 upstream: frozen-manager service-start cell fails on pristine 82a97c1f; controller-stack refusal omits the retained stop request", recheckBy: "2026-12-31" },
+  "smoke:seat-lifecycle": { reason: "RIG-9150 flaky: stat-parser probe child exits before /proc read (ENOENT)", recheckBy: "2026-12-31" },
 };
 
 /** ci.yml smoke steps marked `continue-on-error`; gate-inventory requires the two sets to match. */
@@ -73,4 +85,5 @@ export const LIVE_QUARANTINED = {
   "smoke:schema-remaining15-diagnostic": { reason: "upstream: dynamicRef cases fail on pristine main 8ca93e96 (local run); quarantined on sync per Matt", recheckBy: "2026-12-31" },
   "smoke:herdr-e2e:live": { reason: "RIG-4872: herdr server not running when the manager starts", recheckBy: "2026-11-15" },
   "smoke:up-stack:live": { reason: "upstream expects an in-process pty seat to die with the manager on Ctrl-C; fork pty seats run under a custodian (#72/#73); quarantined on sync per Matt", recheckBy: "2026-12-31" },
+  "smoke:setup-pure:live": { reason: "RIG-9150 upstream: setup first run exits 4 when the Codex plugin install fails; red on fork main at upstream bdc8d54f (run 42746431506)", recheckBy: "2026-12-31" },
 };

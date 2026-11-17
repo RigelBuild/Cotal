@@ -1,2 +1,0 @@
-# Manager pty runtime: Linux production adopt through the custodial seat; off Linux spawn stays in-process.
-smoke:custodial-pty

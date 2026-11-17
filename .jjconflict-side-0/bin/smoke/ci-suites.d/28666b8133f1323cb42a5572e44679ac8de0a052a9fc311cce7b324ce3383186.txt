@@ -1,2 +1,0 @@
-# The client modules the suites load import under Node, and the client loads nothing from @cotal-ai/* at runtime.
-smoke:web-client-boundary

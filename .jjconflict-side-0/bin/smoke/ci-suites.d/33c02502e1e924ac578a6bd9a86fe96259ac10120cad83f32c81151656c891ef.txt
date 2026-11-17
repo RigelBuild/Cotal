@@ -1,2 +1,0 @@
-# Upstream seat reap-group identity cells (quarantined on the fork; see ci-quarantine.mjs).
-smoke:seat-reap-group-identity

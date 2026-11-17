@@ -1,2 +1,0 @@
-# M1 residual: a manager-owned PTY child dies with the worker.
-smoke:legacy-pty-custody

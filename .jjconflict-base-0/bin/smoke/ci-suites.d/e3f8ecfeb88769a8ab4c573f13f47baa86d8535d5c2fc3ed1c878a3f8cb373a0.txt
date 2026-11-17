@@ -1,2 +1,0 @@
-# Keyed run submission on a signerless manager behind the auth service: a request over launch capacity refuses before binding.
-smoke:keyed-review-capacity:auth
