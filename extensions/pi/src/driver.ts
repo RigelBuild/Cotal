@@ -121,6 +121,8 @@ export class PiDriver {
   private knownAtErrorEnd = new Set<string>();
   private startHoldBatchId?: string;
   private runSeq = 0;
+  // Counts holds. A lost-steer watch stands down once a later hold replaces the one it was armed for.
+  private holdSeq = 0;
 
   constructor(
     private readonly mesh: MeshAgent,
@@ -612,6 +614,7 @@ export class PiDriver {
    *  working with a softer reason than a fault. The hold itself is unchanged. */
   private hold(reason: string, queuedBatchId?: string): void {
     if (this._state === "shuttingDown") return;
+    this.holdSeq++;
     this.retryableErrorHold = false;
     this.startHoldBatchId = undefined;
     this._state = "held";
@@ -633,9 +636,11 @@ export class PiDriver {
     const bound = this.context;
     if (!bound) return;
     const seq = this.runSeq;
+    // Any later hold is terminal for its own reason (abort, refusal, attempt limit): never re-dispatch it here.
+    const armedHold = this.holdSeq;
     let settledSince: number | undefined;
     const check = (): void => {
-      if (this._state !== "held" || this.runSeq !== seq || this.context !== bound) return;
+      if (this._state !== "held" || this.runSeq !== seq || this.context !== bound || this.holdSeq !== armedHold) return;
       // The window covers post-run work (auto-compaction) before a host drains a steer it does not count.
       if (!bound.isIdle() || bound.hasPendingMessages()) settledSince = undefined;
       else settledSince ??= Date.now();

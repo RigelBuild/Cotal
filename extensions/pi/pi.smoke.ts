@@ -1426,6 +1426,51 @@ for (const assistant of [
   );
 }
 
+// The lost-steer watch re-dispatches only the hold it was armed for. A terminal hold that lands later
+// in the same run (a user abort, or a history refusal) must stand: once the settle window passes,
+// nothing is re-dispatched and the terminal hold keeps the seat.
+for (const ending of [
+  {
+    label: "a user abort",
+    assistant: { role: "assistant", stopReason: "aborted" },
+    abort: true,
+    reason: /Pi turn was aborted/,
+  },
+  {
+    label: "a history refusal",
+    assistant: { role: "assistant", stopReason: "error", errorMessage: "Refusal (reasoning_extraction)" },
+    abort: false,
+    reason: /provider refused this session's history/,
+  },
+]) {
+  const mesh = new FakeMesh();
+  const host = new FakeHost();
+  const controller = new AbortController();
+  const ctx = context(controller.signal);
+  const driver = new PiDriver(mesh as unknown as MeshAgent, 20, 50);
+  driver.bind(host);
+  driver.onSessionStart(ctx);
+  driver.onAgentStart(ctx);
+  driver.onToolStart("bash");
+  mesh.items.push(item("m1"));
+  driver.onIncoming(mesh.items.at(-1)!);
+  await delay(60);
+  ok(driver.state === "held" && host.sent.length === 1, `${ending.label}: the watchdog holds the mid-run steer`);
+  if (ending.abort) controller.abort();
+  ctx.idle = true;
+  ctx.pending = false;
+  driver.onAgentEnd([ending.assistant], ctx);
+  await delay(400);
+  ok(host.sent.length === 1 && mesh.drained.length === 0,
+    `${ending.label} is not re-dispatched after the lost-steer settle window`);
+  ok(driver.state === "held" && ending.reason.test(driver.reason ?? ""), `${ending.label} keeps its own terminal hold`);
+  await driver.flushPresence();
+  ok(
+    mesh.statuses.at(-1)?.status === "waiting" && ending.reason.test(mesh.statuses.at(-1)?.activity ?? ""),
+    `${ending.label} shows its own terminal hold as waiting`,
+  );
+}
+
 // Presence writes complete in callback invocation order despite asynchronous operations.
 {
   const mesh = new FakeMesh();
