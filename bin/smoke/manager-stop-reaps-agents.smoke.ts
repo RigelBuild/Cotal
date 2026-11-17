@@ -61,7 +61,10 @@ import { makeScratch } from "./_scratch.js";
 // session whose COTAL_* names a live mesh; nothing may leak into the rig or its children.
 const scratch = makeScratch("cotal-964-scratch-");
 const home = mkdtempSync(join(scratch, "home-"));
+// The delegation flag is the one COTAL_ name a delegated CI step sets on purpose; keep it through the scrub.
+const delegated = process.env.COTAL_SEAT_CGROUP_DELEGATED;
 for (const k of Object.keys(process.env)) if (k.startsWith("COTAL_")) delete process.env[k];
+if (delegated !== undefined) process.env.COTAL_SEAT_CGROUP_DELEGATED = delegated;
 process.env.COTAL_HOME = home;
 process.env.XDG_CONFIG_HOME = join(home, "xdg");
 // The spare phase's custodial seat keeps its custody record in this run's scratch.

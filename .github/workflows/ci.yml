@@ -290,6 +290,11 @@ jobs:
           BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
           HEAD: ${{ github.sha }}
         run: /usr/bin/git --no-replace-objects show "$GITHUB_SHA:bin/smoke/verify-shard-inputs.sh" | /usr/bin/bash --noprofile --norc -s -- "$GITHUB_SHA" ${{ matrix.shard }} 4 ci "${{ steps.smoke-tools.outputs.node_path }}" "${{ steps.smoke-tools.outputs.node_target }}" "${{ steps.smoke-tools.outputs.node_sha }}" "${{ steps.smoke-tools.outputs.pnpm_path }}" "${{ steps.smoke-tools.outputs.pnpm_target }}" "${{ steps.smoke-tools.outputs.pnpm_sha }}"
+      # The shard runner quarantines smoke:manager-stop-reap, so the shard never grades its #4005 cell.
+      # This step runs it on a Delegate=yes scope with a delegated cgroup base, and fails the job on red.
+      - name: Manager stop-reap, delegated (seat retirement needs a cgroup base)
+        if: ${{ matrix.shard == 1 }}
+        run: sudo systemd-run --scope -p Delegate=yes --quiet -- env "PATH=$PATH" COTAL_SEAT_CGROUP_DELEGATED=1 pnpm smoke:manager-stop-reap
 
   live:
     if: ${{ github.event_name != 'workflow_dispatch' }}
