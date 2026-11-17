@@ -22,6 +22,7 @@ import {
   parseCommandArgs,
   token,
   writePrivateRecord,
+  writeSecretFileAtomic,
   type Command,
   type FlagSpec,
   type ParsedArgs,
@@ -29,7 +30,8 @@ import {
   rejectionText,
 } from "@cotal-ai/core";
 import {
-  assertManagerName, authDir, canonicalLocalProcessPath, canonicalRoot, claimServicePid, consumeManagerShutdownIntent, findCotalRoot, getSpaceAuth, hasUserAuthState, isWorkspaceTargetError, listenForLocalStop, loadManagerInstanceIdentity, loadSpaceAccountAuth, parsePositiveIntegerFlag, parseSeatCapFlag, publishManagerSpareCapability, readManagerName, readManagerSeatCap, reclaimDeadPreUpgradeRecord, recordManagerName, recordManagerSeatCap, removePidPair, resolveMeshTarget, soleSpaceOf, userAuthStateDir, workspaceSecretStore, writePidPair,
+  assertManagerName, authDir, canonicalLocalProcessPath, canonicalRoot, claimServicePid, consumeManagerShutdownIntent, findCotalRoot, getSpaceAuth, hasUserAuthState, isWorkspaceTargetError, listenForLocalStop, loadManagerInstanceIdentity, loadSpaceAccountAuth, parsePositiveIntegerFlag, parseSeatCapFlag, publishManagerSpareCapability, readManagerName, readManagerSeatCap, readManagerSeatMintCap, reclaimDeadPreUpgradeRecord, recordManagerName, recordManagerSeatCap, recordManagerSeatMintCap, removePidPair, resolveMeshTarget, soleSpaceOf, userAuthStateDir, workspaceSecretStore, writePidPair,
+  DEFAULT_SEAT_MINT_CAP,
   c, MANAGER_DELIVERY_AWARE_MARKER, MANAGER_PIDFILE, stderrLines, UNTRUSTED_CERTIFICATE, untilInputEnds,
   brokerAddressForDisplay, brokerUrlCredentialRefusal, brokerUrlHasUserinfo, CommandFailure, exitCode, inputDisabledByFlag, isCommandFailure, jsonFlag, plainFlag, presentationOf, renderReport, resolveNativeServiceTarget, writeResult, type Report,
   refreshRegistrationPolicy, publishServiceStartup, serviceStartupPath, publishServiceStopReceipt, publishServedContract, protectedCredentialReference, readLocalRecordSource, type NativeServiceStopRequest,
@@ -662,6 +664,14 @@ async function runManager(args: ParsedArgs, defaultRuntime: RuntimeMode, service
     console.error(c.red(`✗ ${rejectionText(e)}`));
     process.exit(1);
   }
+  let seatMintCap: number;
+  try {
+    seatMintCap = parsePositiveIntegerFlag("--seat-mint-cap", v["seat-mint-cap"]) ?? readManagerSeatMintCap({ root: managerRoot, space }) ?? DEFAULT_SEAT_MINT_CAP;
+  } catch (e) {
+    if (service) throw unconfirmedStart(e);
+    console.error(c.red(`✗ ${rejectionText(e)}`));
+    process.exit(1);
+  }
   // A name given here is recorded for this root's manager once it is up, so a restart keeps it.
   // Without one, the name an earlier start recorded applies.
   let name: string | undefined;
@@ -691,6 +701,7 @@ async function runManager(args: ParsedArgs, defaultRuntime: RuntimeMode, service
       attachHost,
       maxSessions,
       ...(seatCap !== undefined ? { seatCap } : {}),
+      seatMintCap,
       ...(name !== undefined ? { name } : {}),
       installedExtensions: true,
       resumeAttemptId: v["resume-attempt"],
@@ -791,6 +802,13 @@ async function runManager(args: ParsedArgs, defaultRuntime: RuntimeMode, service
   if (v.name !== undefined && name !== undefined) {
     try { if (readManagerName(managerContext) !== name) recordManagerName(managerContext, name); }
     catch (e) { console.error(c.yellow(`! the manager name was not recorded, so the next start does not keep it: ${(e as Error).message}`)); }
+  }
+  if (v["seat-mint-cap"] !== undefined) {
+    try {
+      if (readManagerSeatMintCap(managerContext) !== seatMintCap) recordManagerSeatMintCap(managerContext, seatMintCap);
+    } catch (e) {
+      console.error(c.yellow(`! the manager seat-mint cap was not recorded, so the next start does not keep it: ${(e as Error).message}`));
+    }
   }
   if (v["seat-cap"] !== undefined && seatCap !== undefined) {
     try { if (readManagerSeatCap(managerContext) !== seatCap) recordManagerSeatCap(managerContext, seatCap); }
@@ -1017,6 +1035,7 @@ const managerCommands: Command[] = [
       { name: "ws-port", type: "string", description: "the prepared broker websocket port" },
       { name: "max-sessions", type: "string", description: "explicit positive native session ceiling" },
       { name: "seat-cap", type: "string", description: "explicit native per-owner seat ceiling, or unlimited" },
+      { name: "seat-mint-cap", type: "string", description: "explicit positive native seat-mint ceiling" },
       { name: "launch", type: "string", description: "private native launch spec for this selected space" },
       { name: "launch-sha256", type: "string", description: "full digest pinned by the saved service definition" },
       { name: "roster", type: "string", description: "absolute roster file whose agents start at launch" },
@@ -1028,7 +1047,10 @@ const managerCommands: Command[] = [
       { name: "resume-commit-file", type: "string", description: "protected one-read resume commit handoff file" },
       { name: "resume-commit-sha256", type: "string", description: "full digest of the resume commit handoff" },
     ],
-    validate: (args) => { managerServiceChild(args); },
+    validate: (args) => {
+      managerServiceChild(args);
+      parsePositiveIntegerFlag("--seat-mint-cap", args.values["seat-mint-cap"] as string | undefined);
+    },
     requiredExtensions: (args) => typeof args.values.runtime === "string" && args.values.runtime !== "pty" ? [{ kind: "runtime", name: args.values.runtime }] : [],
     run: async (args) => {
       const service = managerServiceChild(args);
@@ -1061,6 +1083,7 @@ const managerCommands: Command[] = [
       { name: "ws-port", type: "string", value: "<n>", description: "broker ws listener port for the console session client" },
       { name: "max-sessions", type: "string", value: "<n>", description: "live-session ceiling (default 64; one session per console pane, so size for agents × panes)" },
       { name: "seat-cap", type: "string", value: "<n|unlimited>", description: "live seats this manager admits per owner (default unlimited); kept for later starts in this root" },
+      { name: "seat-mint-cap", type: "string", value: "<n>", description: "positive seat-mint ceiling (default 32); kept for later starts in this root" },
       { name: "name", type: "string", value: "<name>", description: "the name who --all, the manager choice and --on use for this manager; kept for later starts in this root" },
       { name: "spawn-allowlist", type: "string", value: "<path>", description: "JSON file of the exact names this manager may spawn (default: no allowlist)" },
       { name: "roster", type: "string", value: "<file>", description: "declarative roster to boot at startup" },
@@ -1076,6 +1099,7 @@ const managerCommands: Command[] = [
       // COTAL_SERVER stands in for --server (see superviseTarget), so it is refused as the flag is.
       const server = process.env.COTAL_SERVER;
       if (args.values.server === undefined && server !== undefined && brokerUrlHasUserinfo(server)) throw brokerUrlCredentialRefusal("COTAL_SERVER");
+      parsePositiveIntegerFlag("--seat-mint-cap", args.values["seat-mint-cap"] as string | undefined);
     },
     requiredExtensions: (args) => {
       if (superviseExecution(args.values as Values) === "none") return [];

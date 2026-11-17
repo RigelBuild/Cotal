@@ -64,6 +64,8 @@ export interface MeshEntry {
    * The browser console opens one session per pane, so the right number is roughly agents × panes.
    */
   maxSessions?: number;
+  /** Per-minter reservation limit enforced by the manager (`cotal up --seat-mint-cap`). */
+  seatMintCap?: number;
   /** The JetStream file storage cap in bytes the running broker was started with (`cotal up
    *  --max-file-store`). `down --preserve-state` copies it into the preserved launch so the resume
    *  re-renders it, and a refresh compares a requested cap against it. Absent means the broker runs
@@ -500,6 +502,9 @@ function assertMeshEntryShape(entry: MeshEntry, file: string): void {
     throw new MeshRegistryError(file, `${file} is not a usable mesh record: catalogRoot is valid only as a non-empty absolute path on a catalog entry - restore the record or remove it`);
   if (entry.storeDir !== undefined && (typeof entry.storeDir !== "string" || entry.storeDir.length === 0 || !isAbsolute(entry.storeDir)))
     throw new MeshRegistryError(file, `${file} is not a usable mesh record: storeDir "${entry.storeDir}" is not a non-empty absolute path - restore the record or remove it`);
+
+  if (entry.seatMintCap !== undefined && (typeof entry.seatMintCap !== "number" || !Number.isSafeInteger(entry.seatMintCap) || entry.seatMintCap < 1))
+    throw new MeshRegistryError(file, `${file} is not a usable mesh record: seatMintCap must be a positive integer - restore the record or remove it`);
   try {
     spaceSegment(entry.space);
   } catch (e) {

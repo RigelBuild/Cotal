@@ -398,17 +398,14 @@ reader's roster.
 
 A watch delivers every member's heartbeat to every watcher, so a space of K watching members moves
 K² deliveries per heartbeat interval. A participant that needs the roster only when it acts (an
-agent resolving a DM target, checking an `@mention`, listing who is present) SHOULD read on demand
-instead. User-mode clients call the paged `auth.roster` command; static clients call `manager.roster`.
-Static managers use a separate read-only credential; token-mode managers serve from their existing
-presence watch cache. Both return validated rows, never raw KV bytes. Replies use the authenticated
-request's derived reply rail. Authenticated agent credentials have no raw presence read. Open and
-shared broker-token meshes have no per-profile grant boundary; open agents retain direct presence
-reads, while token-authenticated agents use `manager.roster`.
-A reader applies its liveness window; a record whose `ts` is older reads `offline`. Only a read that
-completed supports an absence verdict; if a read fails, the client MUST report it as a failure, not
-"no such peer". Observers that act on liveness transitions (supervision, delivery `@mention`
-resolution, dashboards) watch.
+agent resolving a DM target, checking an `@mention`, listing who is present) SHOULD read it on
+demand instead. User-mode clients call the paged `auth.roster` command; static clients call
+`manager.roster`. The service reads presence through a separate read-only credential and returns
+validated rows, never raw KV bytes. Replies use the authenticated request's derived reply rail.
+Open and shared broker-token meshes have no per-profile grant boundary and retain direct presence reads. A reader applies its liveness window;
+a record whose `ts` is older reads `offline`. Only a read that completed supports an absence verdict; a failed
+read MUST NOT be reported as "no such peer". Observers that act on liveness transitions
+(supervision, delivery `@mention` resolution, dashboards) watch.
 
 `PresenceCondition`:
 
@@ -4466,11 +4463,9 @@ command, the target components each mode pins statically (§13.2: the full tripl
 the caller's own, and for `handle`, redemption-pinned; the owner for
 `owner`/`any`/`child`/`ledger`), serve identity, reply
 **attribution**, and plane writer ownership.
-The `roster` command serves validated, paged presence rows. Static managers use a separate
-`auth-roster-reader` credential holding presence stream info and Direct Get, with no presence write.
-Token-mode managers use their existing endpoint presence watch cache. Auth serves user-mode callers;
-manager serves static and token-authenticated callers. Authenticated agent credentials have no raw
-presence read.
+The `roster` command serves validated, paged presence rows from a separate `auth-roster-reader`
+credential. It holds presence stream info, Direct Get and its own inbox, but no presence write.
+Auth serves user-mode callers; manager serves static callers. Agent credentials have no raw presence read.
 
 Reply **addressing** is the one deliberate exception: it is capability-by-secret (the
 per-request nonce, §13.2), not a broker grant, and it is sound precisely because serve
@@ -6754,8 +6749,7 @@ placeholders:
 Grouped placeholders such as `<CHAT|DM|TASK>` mean one concrete subject per listed token.
 The `auth-roster-reader` profile holds `$JS.API.STREAM.INFO.<KV>`,
 `$JS.API.DIRECT.GET.<KV>`, and its own inbox subscription only. Auth serves user-mode roster;
-manager serves static and token-authenticated roster. Token-mode managers read their roster from the
-existing presence watch cache. The agent profile holds the request grant, not raw presence reads.
+manager serves static roster. The agent profile holds the request grant, not raw presence reads.
 
 
 ### Agent

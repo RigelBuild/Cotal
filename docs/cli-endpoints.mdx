@@ -131,19 +131,18 @@ when the prepared folder no longer exists, it still refuses with `TARGET_UNAVAIL
 In a folder whose `.cotal/` names no space, as after `space forget`, the held default `main` is
 assumed. The report keeps `Mesh: main` and says under it that the default was assumed, and the JSON
 `target` is `{"root": <folder>, "assumed": "main"}`.
-`--creds <file>` reports what a credential file may do instead, with `kind: "credential"`: its
-space, the profile marker only when it verifies against this machine's registered issuer pins (or
-`null` when it is absent or cannot be verified), the JWT holder name separately as
-`nameUnverified`, its principal, lifecycle, expiry, channels and DM read scope. `revokedAt` is when
-this space's account on this machine revoked the key, or `null` when no revocation is recorded.
-Permission claims, principal tags and lifecycle are decoded from the file for display, not verified; only the profile marker is verified against locally registered pins. The
-JSON field `profile` is the verified signed marker, and `nameUnverified` holds the raw JWT `name`;
-the name is display-only and never treated as a profile. No broker is contacted. When the
+`--creds <file>` reports what a credential file may do instead, with `kind: "credential"`: the space
+its permissions name, the profile it was minted with, its principal, the agent lifecycle its
+delivery and history grants are keyed to (none for the `observer` and `admin` profiles), when it was
+issued and when it expires, the channels it may read and post to, and whether it may read every DM
+in the space, only its own, or none. `revokedAt` is when the space's account on this machine revoked
+the file's key with `auth revoke-credential`, and `null` when no revocation of it is recorded here. It reads the file as every `--creds` file is read and decodes
+the claims without checking the signature or contacting the broker, which enforces them. When the
 permissions name no single space, `space`, `read`, `post` and `dms` are `null`, and the run is
 `partial` (exit 4) with `CREDENTIAL_SPACE_UNKNOWN`. `--creds` takes no `--space` or `--server`.
 An unregistered `--space` is refused even with `--server`. Server addresses in the identity report
 and connection refusals omit URL user information, query strings and fragments, and escape terminal
-controls. Addresses need a host and a supported broker scheme. TCP addresses cannot have a path.
+controls. Addresses need a host and a supported broker scheme. TCP addresses cannot have a path;
 WebSocket routes and bare host addresses remain supported. Invalid addresses make `whoami` refuse
 rather than print the raw value. Recovery instructions use a `<url>` placeholder rather than a
 secret-stripped connection address.
@@ -484,15 +483,12 @@ names it, because a deadline that short can also end before a served endpoint an
 adds a rerun with a longer `--timeout`. Nothing was invoked or issued.
 
 A reference's file credential uses the [paired native caller adapter](cli-auth.mdx#endpoint-caller-credentials).
-An unmarked endpoint caller is refused with a re-mint remedy. Other signed observer credentials,
-including legacy dashboard credentials, remain valid for consumers that need no profile
-classification. The `web` service adapter still checks the native signature and current registered
-issuer pins; it does not require an observer profile marker.
-The file must match the selected registered static root, space, endpoint and signed native scope. A
+It must match the selected registered static root, space, endpoint and signed native scope. A
 conflicting explicit `--creds` refuses. Arbitrary raw files do not supply a caller triple, and a
 reference's instance pin cannot be dropped to fit a class-only file. Neither case substitutes an
-operator identity. References without a file use the normal registered-space caller and its existing
-capability checks. No local reference grants remote authority.
+operator identity. References without a file use the normal registered-space caller and its
+existing capability checks. No local reference grants remote authority.
+
 
 ## Declared capabilities that remain gated [#declared-capabilities-that-remain-gated]
 

@@ -4,7 +4,7 @@ import { hostname, userInfo } from "node:os";
 import { resolve } from "node:path";
 import { promisify } from "node:util";
 import { setTimeout as delay } from "node:timers/promises";
-import { CLI_USER_ACTOR, CommandFailure, agentGrants, codeSpan, connectOrThrow, connectSpace, credsSpace, endpointAuth, findMesh, getSpaceAuth, recordOperationSpace, jsonFlag, plainFlag, presentationOf, writeResult, spaceStreamsExpected, targetFlags, userAuthStateDir, workspaceSecretStore, type Connection, type ConnectFlags, type OutputWarning, concreteChannelProblem, offlineRecipientNotice } from "@cotal-ai/workspace";
+import { CLI_USER_ACTOR, CommandFailure, agentGrants, codeSpan, connectOrThrow, connectSpace, endpointAuth, recordOperationSpace, jsonFlag, plainFlag, presentationOf, writeResult, spaceStreamsExpected, targetFlags, userAuthStateDir, workspaceSecretStore, type Connection, type ConnectFlags, type OutputWarning, concreteChannelProblem, offlineRecipientNotice } from "@cotal-ai/workspace";
 import {
   resolvePeer,
   readsDirectMessages,
@@ -13,9 +13,6 @@ import {
   isPublishPermissionDenied,
   parsePrincipalKey,
   resolveAuthProvider,
-  accountRevocations,
-  validateSpaceAuth,
-  verifyStaticUserCredential,
   credsClaims,
   effectiveDeliveryClass,
   effectiveReplay,
@@ -107,37 +104,32 @@ export function sendArguments(args: ParsedArgs): SendInput {
   return { ...destination, source: values.file !== undefined ? (values.file === "-" ? "stdin" : "file") : values.stdin ? "stdin" : "argument", ...(args.positionals[0] === undefined ? {} : { text: args.positionals[0] }) };
 }
 
-/** Prefer a custom signed holder name only when local trust proves the credential. */
-function senderName(verifiedCreds?: { creds: string; profile: string | null }): string {
-  const base = verifiedCreds ? displayNameFromCreds(verifiedCreds.creds, verifiedCreds.profile) ?? osSenderName() : osSenderName();
+/** Prefer a non-profile name from explicit creds; invalid COTAL_NAME is omitted. */
+function senderName(credsPath?: string): string {
+  const path = credsPath ? resolve(credsPath) : undefined;
+  const base = path && existsSync(path)
+    ? displayNameFromCreds(readFileSync(path, "utf8")) ?? osSenderName()
+    : osSenderName();
   const agent = process.env.COTAL_NAME;
   if (agent === undefined || agent.length === 0) return base;
   const name = `${base} (${agent})`;
-  try { assertValidName(name); return name; }
-  catch { return base; }
-}
-
-function displayNameFromCreds(creds: string, profile: string | null): string | undefined {
-  const name = credsClaims(creds).name;
-  if (typeof name !== "string" || name === profile || PROFILES.some((known) => known === name)) return undefined;
-  try { assertValidName(name); return name; }
-  catch { return undefined; }
-}
-
-/** Resolve only the registered space root; untrusted or revoked credentials give no guidance. */
-async function trustedSendCreds(creds: string, space: string) {
   try {
-    const root = findMesh(space)?.root;
-    if (!root) return undefined;
-    const auth = await getSpaceAuth(workspaceSecretStore(root), space);
-    if (!auth) return undefined;
-    validateSpaceAuth(auth, space);
-    const verified = verifyStaticUserCredential(creds, { accountPub: auth.account.pub, signingPub: auth.account.signingPub });
-    const claims = credsClaims(creds);
-    const revokedAt = accountRevocations(auth.account.jwt)[verified.identity];
-    if (revokedAt !== undefined && (claims.iat === undefined || claims.iat <= revokedAt)) return undefined;
-    return { creds, profile: verified.profile };
-  } catch { return undefined; }
+    assertValidName(name);
+    return name;
+  } catch {
+    return base;
+  }
+}
+
+function displayNameFromCreds(creds: string): string | undefined {
+  const name = credsClaims(creds).name;
+  if (typeof name !== "string" || PROFILES.some((profile) => profile === name)) return undefined;
+  try {
+    assertValidName(name);
+    return name;
+  } catch {
+    return undefined;
+  }
 }
 
 function osSenderName(): string {
@@ -368,8 +360,8 @@ async function channelDenied(channel: string, target: { space: string }, connect
       post = status.grant === "not-granted" ? [] : status.grant?.allowPublish;
     } catch { /* the grant stays unknown */ }
   } else if (credsFile !== undefined) {
-    const trusted = await trustedSendCreds(credsFile, target.space);
-    if (trusted?.profile === "agent") post = agentGrants(credsClaims(trusted.creds).nats ?? {}, target.space).post;
+    const claims = credsClaims(credsFile);
+    if (claims.name === "agent") post = agentGrants(claims.nats ?? {}, target.space).post;
   }
   const list = (channels: readonly string[]) => channels.map((name) => `#${name}`).join(", ");
   const remedy = post === undefined
@@ -420,10 +412,7 @@ export async function send(args: ParsedArgs): Promise<void> {
   const refusal = fileRefusal(input, values);
   const body = await bodyOf(input, values, refusal);
   const warnings: OutputWarning[] = [];
-  const senderSpace = values.space ?? (values.creds && values.server === undefined ? credsSpace(process.cwd())?.space : undefined) ?? connectSpace(values);
-  let senderCreds: { creds: string; profile: string | null } | undefined;
-  try { if (values.creds && senderSpace) senderCreds = await trustedSendCreds(readFileSync(resolve(values.creds), "utf8"), senderSpace); } catch { /* fall back to the OS sender */ }
-  const senderNameValue = senderName(senderCreds);
+  const senderNameValue = senderName(typeof values.creds === "string" ? values.creds : undefined);
   const senderActor = `cli_${createHash("sha256").update(senderNameValue).digest("hex")}`;
   const opened = await openTransient(values, senderNameValue, { throwOnRefusal: true, senderActor, report: (level) => {
     warnings.push({ code: level === "error" ? "SENDER_CONNECTION_WARNING" : "SENDER_WARNING", target: { destination: input.target }, message: "The transient sender reported a connection or delivery warning; its receipt confirms only the stated storage outcome." });

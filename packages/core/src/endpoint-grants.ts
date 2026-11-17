@@ -239,6 +239,13 @@ export const RUN_READ_COMMANDS = Object.freeze(["run-status", "run-ps"] as const
  *  agent rollup: there, every spawn-capable agent could mint chat leaves. */
 export const CHAT_SESSION_COMMANDS = Object.freeze(["chat-session-open", "chat-session-retire"] as const);
 
+/** Identity commands are granted to minters, never to the seats they issue. */
+export const MINTER_IDENTITY_COMMANDS = Object.freeze(["identity-reserve", "identity-mint", "identity-renew", "identity-retire"] as const);
+const MINTER_IDENTITY_COMMANDS_SNAP = Object.freeze([...MINTER_IDENTITY_COMMANDS]);
+export function minterIdentityCapabilities(): EpCapability[] {
+  return MINTER_IDENTITY_COMMANDS_SNAP.map((command) => ({ endpoint: BASELINE_LIFECYCLE_ENDPOINT, command }));
+}
+
 // ---- operator INSTRUMENT capability sets (the 1c grant-migration table's admin row) --------------
 /** The actor capability that grants one pinned Manager's machine-vitals read. */
 export const MANAGER_VITALS_SCOPE = "machine-vitals" as const;
@@ -255,7 +262,7 @@ export const MANAGER_ADMIN_COMMANDS = Object.freeze([
   "resume-preserved", "commit-resume", "finalize-resume",
   "prepare-preservation", "commit-preservation", "abort-preservation",
   "transcript-receive",
-  "release-seat", "attest-gone", "allowlist-set",
+  "release-seat", "attest-gone", "allowlist-set", "identity-retire-admin",
 ] as const);
 
 /** The ACTION commands (§13.6): submitting one accepts a GOAL, so the caller may follow its OWN
@@ -293,7 +300,7 @@ const GOAL_BEARING_SET: ReadonlySet<string> = new Set(GOAL_BEARING_COMMANDS);
  *  it derives nothing from a descriptor, which is the part §13.7 forbids. `smoke:unfenced-responder`
  *  tripwires that pin so the version cannot move without this table being named. */
 export const REPEAT_SAFE_COMMANDS: Readonly<Record<string, readonly string[]>> = Object.freeze({
-  [BASELINE_LIFECYCLE_ENDPOINT]: Object.freeze(["status", "ps", "slots", "inspect", "list-personas", "show-persona", "run-status", "run-ps", "goal-result"]),
+  [BASELINE_LIFECYCLE_ENDPOINT]: Object.freeze(["status", "ps", "slots", "inspect", "list-personas", "show-persona", "run-status", "run-ps", "goal-result", "identity-reserve", "identity-mint", "identity-renew", "identity-retire"]),
   [BASELINE_DELIVERY_ENDPOINT]: Object.freeze(["list"]),
 });
 /** `describe` is a read on every endpoint by construction, so it is repeat-safe without one: no

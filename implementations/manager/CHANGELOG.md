@@ -1,5 +1,11 @@
 # @cotal-ai/manager
 
+## Unreleased
+
+### Patch Changes
+
+- Extract manager identity commands and retirement processing into focused modules; retry failed identity retirements with bounded exponential backoff.
+
 ## 0.151.2
 
 ### Patch Changes

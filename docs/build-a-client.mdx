@@ -58,10 +58,8 @@ Keep that path private.
 Without a lifetime flag, the credential expires after 24 hours.
 Use `--expires-in <seconds>` or `--expires-at <unix-seconds>` to set another expiry.
 A standing-renewal consumer requires an expiry.
-`--identity <creds>` reuses a nkey only when its credential verifies under the current issuer pins.
-An unmarked current-authority credential cannot provide trusted grants or lifecycle data. Choose
-those from a trusted source; use `--new-incarnation` to reuse the verified key without prior grants
-or lifecycle. A credential from an old authority needs a fresh key.
+To keep an existing nkey, use `--identity <creds>` when re-minting, while adopting the new lifecycle UID.
+
 The credential binds the client's principal and channel grants.
 See [Identity and auth](identity-and-auth.mdx), [auth mint](cli-auth.mdx#auth-mint), and [SPEC section 2](../SPEC.md#2-identity).
 

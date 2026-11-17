@@ -54,7 +54,7 @@ type Envelope = {
   completeness: string;
   command: string;
   target: { space: string; scope?: string; root?: string };
-  result: { kind: string; server?: string | null; view?: string; managers?: string; hidden?: number; items?: Row[]; identity?: { kind: string; principal: string | null; owner?: string | null; actor?: string | null; subject?: string | null; grant: string | null }; read?: unknown; post?: unknown; dms?: boolean | string | null; capabilities?: unknown; space?: string | null; profile?: string | null; nameUnverified?: string | null; principal?: string | null; lifecycleUid?: string | null; expired?: boolean } | null;
+  result: { kind: string; server?: string | null; view?: string; managers?: string; hidden?: number; items?: Row[]; identity?: { kind: string; principal: string | null; owner?: string | null; actor?: string | null; subject?: string | null; grant: string | null }; read?: unknown; post?: unknown; dms?: boolean | string | null; capabilities?: unknown; space?: string | null; profile?: string | null; principal?: string | null; lifecycleUid?: string | null; expired?: boolean } | null;
   warnings: { code: string; message: string }[];
   error?: { code: string; message: string; remedy?: string };
 };
@@ -424,11 +424,11 @@ try {
   // ── whoami --creds: what a credential file's own claims permit, with no broker contacted ─────────
   const agentId = newIdentity(), agentUid = mintLifecycleUid();
   const agentFile = join(home, "whoami-agent.creds");
-  writeFileSync(agentFile, await mintCreds(auth, agentId, "agent", { lifecycleUid: agentUid, allowSubscribe: ["general", "team.>"], allowPublish: ["general"], name: "custom-holder" }), { mode: 0o600 });
+  writeFileSync(agentFile, await mintCreds(auth, agentId, "agent", { lifecycleUid: agentUid, allowSubscribe: ["general", "team.>"], allowPublish: ["general"] }), { mode: 0o600 });
   const asAgent = await run(["whoami", "--creds", agentFile, "--json"]);
   const agentResult = asAgent.envelope?.result;
-  check("whoami --creds reports verified agent profile separately from the unverified holder name and its channel grants",
-    asAgent.status === 0 && asAgent.envelope?.completeness === "complete" && agentResult?.kind === "credential" && agentResult.space === space && agentResult.profile === "agent" && agentResult.nameUnverified === "custom-holder" &&
+  check("whoami --creds reports an agent credential's space, profile, principal, lifecycle and channel grants",
+    asAgent.status === 0 && asAgent.envelope?.completeness === "complete" && agentResult?.kind === "credential" && agentResult.space === space && agentResult.profile === "agent" &&
       agentResult.principal === `local.${agentId.id}` && agentResult.lifecycleUid === agentUid && JSON.stringify(agentResult.read) === JSON.stringify(["general", "team.>"]) &&
       JSON.stringify(agentResult.post) === JSON.stringify(["general"]) && agentResult.dms === "own" && agentResult.expired === false, shown(asAgent));
   for (const [profile, dms] of [["observer", "none"], ["admin", "all"]] as const) {
@@ -440,18 +440,9 @@ try {
       r.status === 0 && result?.profile === profile && result.read === "all" && JSON.stringify(result.post) === "[]" && result.lifecycleUid === null && result.dms === dms, shown(r));
   }
   const agentPlain = await run(["whoami", "--creds", agentFile, "--plain"]);
-  check("the plain report names the lifecycle and explains the verified profile trust boundary", agentPlain.status === 0 && agentPlain.stdout.includes(agentUid) && agentPlain.stdout.includes("profile marker is shown only when its signature verifies against this machine's registered pins"), shown(agentPlain));
+  check("the plain report names the lifecycle and says the claims are not verified", agentPlain.status === 0 && agentPlain.stdout.includes(agentUid) && agentPlain.stdout.includes("its signature is not checked and no broker is contacted"), shown(agentPlain));
   const withSpace = await run(["whoami", "--creds", agentFile, "--space", space, "--json"]);
   check("whoami --creds takes no --space: it is a usage error", withSpace.status === 1 && withSpace.envelope?.error?.code === "USAGE_INVALID", shown(withSpace));
-  const untrustedRoot = join(home, "untrusted-root");
-  mkdirSync(join(untrustedRoot, ".cotal"), { recursive: true });
-  const untrustedFile = join(home, "whoami-unregistered.creds");
-  const untrustedAuth = await createSpaceAuth("whoami-unregistered");
-  writeFileSync(untrustedFile, await mintCreds(untrustedAuth, newIdentity(), "agent", { name: "agent", lifecycleUid: mintLifecycleUid() }), { mode: 0o600 });
-  const untrusted = await run(["whoami", "--creds", untrustedFile, "--json"], {}, undefined, 120_000, untrustedRoot);
-  const untrustedResult = untrusted.envelope?.result;
-  check("whoami shows decoded permission claims when issuer pins are unregistered but never trusts the holder name as profile",
-    untrusted.status === 0 && untrustedResult?.profile === null && untrustedResult.nameUnverified === "agent" && untrustedResult.read !== null && untrustedResult.post !== null, shown(untrusted));
 
   // A prepared space has no broker yet; whoami reports the identity its folder's trust gives it.
   const prepFresh = join(home, "prep-fresh"), prepSigned = join(home, "prep-signed");

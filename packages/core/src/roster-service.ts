@@ -77,13 +77,13 @@ export async function openAuthRosterReader(opts: {
 
 /** Cache one complete scan, invalidating it when its transport changes. */
 export function createRosterSnapshotCache<T extends { isClosed(): boolean }>(current: () => T | undefined, scan: (connection: T) => Promise<Presence[]>, log: (line: string) => void, onSnapshot: () => void = () => {}): { read(): Promise<Presence[]> } {
-  let pending: { connection: T; promise: Promise<Presence[]> } | undefined;
+  let pending: Promise<Presence[]> | undefined;
   let snapshot: { rows: Presence[]; expires: number; connection: T } | undefined;
   return { read() {
     const connection = current();
     if (!connection || connection.isClosed()) return Promise.reject(new Error("roster reader connection is unavailable"));
     if (snapshot && snapshot.connection === connection && Date.now() < snapshot.expires) return Promise.resolve(snapshot.rows);
-    if (pending?.connection === connection) return pending.promise;
+    if (pending) return pending;
     const flight = (async () => {
       const rows = await scan(connection);
       if (current() !== connection || connection.isClosed()) throw new Error("roster reader connection changed during the read");
@@ -95,9 +95,8 @@ export function createRosterSnapshotCache<T extends { isClosed(): boolean }>(cur
       log(`auth roster reader scan failed: ${error instanceof Error ? error.message : String(error)}`);
       throw error;
     });
-    const flightState = { connection, promise: flight };
-    pending = flightState;
-    const settle = () => { if (pending === flightState) pending = undefined; };
+    pending = flight;
+    const settle = () => { if (pending === flight) pending = undefined; };
     flight.then(settle, settle);
     return flight;
   } };

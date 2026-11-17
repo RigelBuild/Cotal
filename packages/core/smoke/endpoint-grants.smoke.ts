@@ -14,8 +14,8 @@ import {
   epRequestGrantRows, epJournalGrantRow, epCallerReplyGrantRow, epGoalProgressGrantRow,
   epCallerGrantRows, epServeSubscribeRows, epServePublishRows, epServeGrantRows,
   epBaselineGrantRows, spawnCallerCapabilities, runCallerCapabilities, operatorInstrumentCapabilities, instancePinnedInstrumentCapabilities, baselineCallerCapabilities, permissionsFor,
-  presenceBucket, presenceKeySubject,
   SPAWN_CREATE_COMMANDS,
+  minterIdentityCapabilities, MINTER_IDENTITY_COMMANDS,
   MAX_CONTROL_LINE_BYTES, CONNECT_ENVELOPE_OVERHEAD_BYTES, MAX_MINTED_JWT_BYTES,
   subjectMatches,
   type EpCapability, type EpCaller,
@@ -343,6 +343,32 @@ const withCaps = decode(await mintCreds(auth, newIdentity(), "agent", {
 c("minted JWT carries the request row", withCaps.pub.allow.includes(`cotal.epg.ep.one.manager.spawn.owner.u_abc.u_abc.cli.${UID}.*`));
 c("minted JWT carries the journal row", withCaps.pub.allow.includes(`cotal.epg.epj.manager.spawn.owner.u_abc.u_abc.cli.${UID}`));
 c("minted JWT carries the reply-rail read", withCaps.sub.allow.includes(`cotal.epg.ep.reply.*.*.*.u_abc.cli.${UID}.*`));
+const minterCaps = minterIdentityCapabilities();
+const minterJwt = decode(await mintCreds(auth, newIdentity(), "agent", {
+  principal: { owner: "u_abc", actor: "cli" }, lifecycleUid: UID, endpointCapabilities: minterCaps,
+}));
+const expectedIdentityRows = minterCaps.flatMap((cap) => epRequestGrantRows("epg", cap, caller));
+const actualIdentityRows = minterJwt.pub.allow.filter((row: string) => MINTER_IDENTITY_COMMANDS.some((command) => row.includes(`.manager.${command}.`)));
+c("minter JWT carries exactly the four identity capability rows", JSON.stringify(actualIdentityRows) === JSON.stringify(expectedIdentityRows));
+const adminIdentity = { endpoint: "manager", command: "identity-retire-admin" } satisfies EpCapability;
+const adminIdentityJwt = decode(await mintCreds(auth, newIdentity(), "control-caller-admin", { endpointCapabilities: [adminIdentity] }));
+const expectedAdminIdentityRows = epRequestGrantRows("epg", adminIdentity, caller);
+c("admin instrument carries the exact operator identity-retirement row", expectedAdminIdentityRows.every((row) => adminIdentityJwt.pub.allow.includes(row)) && adminIdentityJwt.pub.allow.filter((row: string) => row.includes(".identity-retire-admin.")).length === expectedAdminIdentityRows.length);
+for (const name of ["identity-reserve", "identity-mint", "identity-renew", "identity-retire"]) {
+  const capability = { endpoint: "manager", command: name } satisfies EpCapability;
+  const control = decode(await mintCreds(auth, newIdentity(), "control-caller-privileged", { endpointCapabilities: [capability] }));
+  const expected = epRequestGrantRows("epg", capability, caller);
+  c(`privileged manager instrument carries exact ${name} row`, expected.every((row) => control.pub.allow.includes(row)) && control.pub.allow.filter((row: string) => row.includes(`.${name}.`)).length === expected.length);
+}
+const seatJwt = decode(await mintCreds(auth, newIdentity(), "agent", {
+  principal: { owner: "u_abc", actor: "cli" }, lifecycleUid: UID, dmOnly: true,
+}));
+c("DM-only seat has exactly one DM send and three own durable publish rows", seatJwt.pub.allow.length === 4 && seatJwt.pub.allow.some((row: string) => row.includes(".inst.*.*.u_abc.cli")) && seatJwt.pub.allow.filter((row: string) => row.startsWith("$JS.")).length === 3);
+c("DM-only seat has only its inbox subscription", seatJwt.sub.allow.length === 1 && seatJwt.sub.allow[0].startsWith("_INBOX_"));
+throws("DM-only refuses endpoint capabilities", () => permissionsFor("agent", "epg", { owner: "u_abc", actor: "cli", connId: "seat", lifecycleUid: UID }, { dmOnly: true, endpointCapabilities: minterCaps }));
+for (const forbidden of [{ capabilities: ["spawn"] }, { role: "worker" }, { allowPublish: ["team"] }, { allowSubscribe: ["team"] }]) {
+  throws("DM-only refuses additional agent permissions", () => permissionsFor("agent", "epg", { owner: "u_abc", actor: "cli", connId: "seat", lifecycleUid: UID }, { dmOnly: true, ...forbidden }));
+}
 const without = decode(await mintCreds(auth, newIdentity(), "agent", { principal: { owner: "u_abc", actor: "cli" }, lifecycleUid: UID }));
 const BASELINE_PUB = [
   `cotal.epg.ep.one.*.describe.u_abc.cli.${UID}.*`,
@@ -389,19 +415,6 @@ const agreed = permissionsFor("agent", "demo", prC7 as never, { endpointCapabili
 c("permissionsFor with an AGREEING opts.lifecycleUid mints, and every caller-rail row carries the ONE uid",
   agreed.pub.allow.concat(agreed.sub.allow).filter((r: string) => r.includes(".ep.")).every((r: string) => r.includes(`.${UID}.`) || r.includes(`.${UID}`))
   && !agreed.pub.allow.some((r: string) => r.includes(OTHER_UID)));
-const presencePermissions = permissionsFor("agent", "demo", prC7 as never, { lifecycleUid: UID }) as
-  { pub: { allow: string[] }; sub: { allow: string[] } };
-const presenceStream = `KV_${presenceBucket("demo")}`;
-c("agent permissions omit bare and keyed presence Direct Get grants",
-  !presencePermissions.pub.allow.some((r) => r === "$JS.API.DIRECT.GET" || r.startsWith(`$JS.API.DIRECT.GET.${presenceStream}`)));
-c("agent permissions omit presence consumer-create and consumer-info grants",
-  !presencePermissions.pub.allow.some((r) => r.startsWith(`$JS.API.CONSUMER.CREATE.${presenceStream}`)
-    || r.startsWith(`$JS.API.CONSUMER.INFO.${presenceStream}`)));
-c("agent permissions retain presence STREAM.INFO and only the principal's exact own-key write",
-  presencePermissions.pub.allow.includes(`$JS.API.STREAM.INFO.${presenceStream}`)
-  && presencePermissions.pub.allow.includes(presenceKeySubject("demo", prC7.owner, prC7.actor))
-  && !presencePermissions.pub.allow.some((r) => r.startsWith(`$KV.${presenceBucket("demo")}.`)
-    && r !== presenceKeySubject("demo", prC7.owner, prC7.actor)));
 let threw = false;
 try {
   await mintCreds(auth, newIdentity(), "agent", { principal: { owner: "u_abc", actor: "cli" }, endpointCapabilities: [spawnCap] });

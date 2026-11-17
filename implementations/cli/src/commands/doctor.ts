@@ -11,7 +11,6 @@ import {
   mintCreds,
   mintLifecycleUid,
   newIdentity,
-  verifyStaticUserCredential,
   probeConnect,
   type CredHealth,
   type CredentialKind,
@@ -175,9 +174,9 @@ export async function doctor(args: ParsedArgs): Promise<void> {
     if (values.fix && userMode) throw new CommandFailure("refused", "UNSUPPORTED", "this static daemon repair cannot replace a user-auth space's supported issuer authority", { target });
     repair.migrationAttempted = values.fix === true;
     const revocations = accountRevocations(auth.account.jwt);
-    reports = inventory(root, auth.space, auth.sys.pub, !values.fix, (receipt) => repair.migrations.push(receipt), revocations, auth);
+    reports = inventory(root, auth.space, auth.sys.pub, !values.fix, (receipt) => repair.migrations.push(receipt), revocations);
     if (values.fix && reports.some((row) => row.problem && isRemintable(row.kind))) await repairDoctorCredentials(root, auth, repair, new Set(reports.filter((row) => row.unparsable && isRemintable(row.kind)).map((row) => row.label)));
-    if (repair.attempted) reports = inventory(root, auth.space, auth.sys.pub, true, undefined, revocations, auth);
+    if (repair.attempted) reports = inventory(root, auth.space, auth.sys.pub, true, undefined, revocations);
   } catch (error) {
     const changed = [...repair.migrations.map((receipt) => ({ kind: "credential-material-migrated", materialKind: receipt.kind, from: receipt.from, to: receipt.to, space: receipt.space })), ...repair.results.filter((row) => row.ok).map((row) => ({ kind: "daemon-credential-resigned", file: row.file, space: auth!.space }))];
     if (isCommandFailure(error) && !repair.attempted && !repair.migrations.length) throw error;
@@ -197,7 +196,7 @@ export async function doctor(args: ParsedArgs): Promise<void> {
   try { exported = exportedCredentials(root, auth); } catch { exported = null; }
   const warnings = [
     ...items.filter((row) => row.warning !== null).map((row) => ({ code: "CREDENTIAL_UNBOUNDED_BY_REQUEST", target: { path: row.path }, message: `${row.label}: ${row.warning}` })),
-    ...(exported ?? []).filter((row) => row.state === "expired").map((row) => ({ code: "EXPORTED_CREDENTIAL_EXPIRED", target: { path: row.path }, message: `${row.label}: ${row.path} expired at ${at(row.expiresAt ?? undefined)}; ${row.repair ?? "profile and grants are unverified; select them from a trusted source before minting a new key"}` })),
+    ...(exported ?? []).filter((row) => row.state === "expired").map((row) => ({ code: "EXPORTED_CREDENTIAL_EXPIRED", target: { path: row.path }, message: `${row.label}: ${row.path} expired at ${at(row.expiresAt ?? undefined)}; ${row.repair}` })),
     ...(exported === null ? [{ code: "EXPORTED_CREDENTIALS_UNREAD", target: { space: auth.space }, message: "the records of the files auth mint --out wrote could not be read, so those files are not listed" }] : []),
   ];
   const findings = items.filter((row) => row.problem !== null).length;
@@ -304,7 +303,7 @@ function renewalObservation(root: string, space: string) {
 }
 
 /** One file `auth mint --out` wrote for this space, as it reads now. */
-interface ExportedRow { label: string; profile: string | null; path: string; state: string; issuedAt: number | null; expiresAt: number | null; revokedAt: number | null; repair: string | null }
+interface ExportedRow { label: string; profile: string; path: string; state: string; issuedAt: number | null; expiresAt: number | null; revokedAt: number | null; repair: string | null }
 
 /** The files `auth mint --out` wrote for this space from this root that are still there, with their
  *  expiry and, for one the broker refuses or soon will, the mint that replaces it. */
@@ -313,7 +312,7 @@ function exportedCredentials(root: string, auth: SpaceAuth): ExportedRow[] {
   const rows: ExportedRow[] = [];
   for (const { record: { value: entry } } of credentialExportStore(auth.space).list()) {
     if (canonicalRoot(entry.root) !== here) continue;
-    const row: ExportedRow = { label: entry.label, profile: null, path: entry.path, state: "unreadable", issuedAt: null, expiresAt: null, revokedAt: null, repair: null };
+    const row: ExportedRow = { label: entry.label, profile: entry.profile, path: entry.path, state: "unreadable", issuedAt: null, expiresAt: null, revokedAt: null, repair: null };
     let bytes: Buffer | undefined;
     try { bytes = readLocalRecordSource(entry.path, 1024 * 1024, true); }
     catch {
@@ -323,41 +322,21 @@ function exportedCredentials(root: string, auth: SpaceAuth): ExportedRow[] {
     }
     // A file removed since is not listed.
     if (!bytes) continue;
-    const text = bytes.toString("utf8");
-    let claims;
-    try { claims = credsClaims(text); } catch { row.repair = `this credential's profile and grants are unreadable; select the intended profile and grants from a trusted source, then mint a new identity without --identity: \`${cmd} auth mint ${entry.label} --profile <intended-profile> --out <new file>\`; supply trusted grants if the intended profile is agent`; rows.push(row); continue; }
-    const health = inspectCredHealth(text);
-    Object.assign(row, { state: health.state, issuedAt: claims.iat ?? null, expiresAt: claims.exp ?? null });
-    const issuerAccount = claims.nats?.issuer_account;
-    const issuerMismatch = issuerAccount !== undefined && issuerAccount !== auth.account.pub
-      || claims.iss !== undefined && claims.iss !== auth.account.signingPub;
-    if (issuerMismatch) {
-      const freshFromOldAuthority = `select the intended profile and grants from a trusted source, then mint a new identity without --identity: \`${cmd} auth mint ${entry.label} --profile <intended-profile> --out <new file>\`; supply trusted grants if the intended profile is agent`;
-      Object.assign(row, { state: "other-account", repair: `the space's identity changed after it was written, so its broker refuses it; the old credential's profile and grants are not trusted here. ${freshFromOldAuthority}` });
-      rows.push(row);
-      continue;
-    }
-    let verified;
-    try { verified = verifyStaticUserCredential(text, { accountPub: auth.account.pub, signingPub: auth.account.signingPub }, { allowOutOfWindow: true }); }
-    catch {
-      row.repair = `this credential's profile and grants are unverified; select the intended profile and grants from a trusted source, then mint a new identity without --identity: \`${cmd} auth mint ${entry.label} --profile <intended-profile> --out <new file>\`; supply trusted grants if the intended profile is agent`;
-      rows.push(row);
-      continue;
-    }
-    row.profile = verified.profile;
-    const profile = verified.profile && verified.profile !== "agent" ? ` --profile ${verified.profile}` : "";
-    const grants = verified.profile === "agent" ? agentGrants(claims.nats ?? {}, auth.space) : undefined;
-    const fresh = verified.profile === null
-      ? `this credential has no verified profile marker; select the intended profile and grants from a trusted source, then mint a new identity without --identity: \`${cmd} auth mint ${entry.label} --profile <intended-profile> --out <new file>\`; supply trusted grants if the intended profile is agent`
-      : `mint a new key${grants ? " with the grants this file holds" : ""}: \`${cmd} auth mint ${entry.label}${profile}${grants ? grantMintFlags(grants) : ""} --out <new file>\``;
-    if (verified.profile === null) {
-      if (entry.label !== WEB_CREDS_KIND) row.repair = fresh;
-    } else if (health.state === "expired" || health.state === "near-expiry") {
-      row.repair = `\`${cmd} auth mint ${entry.label}${profile} --identity ${entry.path} --out ${entry.path}\` signs the same key again${verified.profile === "agent" ? " with the same grants" : ""}`;
-    }
+    let claims: ReturnType<typeof credsClaims>;
+    try { claims = credsClaims(bytes.toString("utf8")); } catch { rows.push(row); continue; }
+    const health = inspectCredHealth(bytes.toString("utf8"));
+    const profile = entry.profile === "agent" ? "" : ` --profile ${entry.profile}`;
+    // A new key holds only the grants its mint names, so the mint names the ones this file holds.
+    const grants = entry.profile === "agent" && claims.name === "agent" ? agentGrants(claims.nats ?? {}, auth.space) : undefined;
+    const fresh = `mint a new key${grants ? " with the grants this file holds" : ""}: \`${cmd} auth mint ${entry.label}${profile}${grants ? grantMintFlags(grants) : ""} --out <new file>\``;
     const revokedAt = claims.sub === undefined ? undefined : revocations[claims.sub];
-    if (revokedAt !== undefined && (claims.iat === undefined || claims.iat <= revokedAt))
+    Object.assign(row, { state: health.state, issuedAt: claims.iat ?? null, expiresAt: claims.exp ?? null });
+    if ((claims.nats?.issuer_account ?? claims.iss) !== auth.account.pub)
+      Object.assign(row, { state: "other-account", repair: `the space's identity changed after it was written, so its broker refuses it; ${fresh}` });
+    else if (revokedAt !== undefined && (claims.iat === undefined || claims.iat <= revokedAt))
       Object.assign(row, { state: "revoked", revokedAt, repair: `its key was revoked at ${at(revokedAt)}, and auth mint --identity refuses that key; ${fresh}` });
+    else if (health.state === "expired" || health.state === "near-expiry")
+      row.repair = `\`${cmd} auth mint ${entry.label}${profile} --identity ${entry.path} --out ${entry.path}\` signs the same key again${entry.profile === "agent" ? " with the same grants" : ""}`;
     rows.push(row);
   }
   return rows.sort((x, y) => x.label.localeCompare(y.label) || x.path.localeCompare(y.path));
@@ -416,9 +395,6 @@ function missingReport(label: string, kind: CredentialKind, path: string, sysPub
 }
 
 /** Local filename/issued-at ordering only. No role here proves a connected or running successor. */
-function unmarkedAgentProfileRepair(): string {
-  return "this credential has no verified profile marker; choose --profile <intended-profile> from a trusted source before replacing it, and do not infer a profile from its holder name";
-}
 type AgentFileRole = "current" | "superseded" | "sole";
 interface LocalCredentialFamily { role: AgentFileRole }
 
@@ -533,7 +509,7 @@ function aliasOf(label: string): string {
 /** Inspect every managed credential file for this folder. Missing files are noted (with how they
  *  get provisioned) but only EXISTING-but-bad material is a problem — process presence is `cotal
  *  status`'s job; this surface owns credential health. */
-function inventory(root: string, space: string, sysPub?: string, readOnly = false, onMigrated?: (receipt: MaterialMigrationReceipt) => void, revocations: Readonly<Record<string, number>> = {}, auth?: SpaceAuth): CredReport[] {
+function inventory(root: string, space: string, sysPub?: string, readOnly = false, onMigrated?: (receipt: MaterialMigrationReceipt) => void, revocations: Readonly<Record<string, number>> = {}): CredReport[] {
   // Through the choke point, not a hand-composed `.cotal/<file>` (P7 §2 rule 1). The four kinds are
   // per-space now, and a diagnosis that read the canonical location past an unmigrated copy would
   // report every one of them "missing" on a root `up` has not re-provisioned — the worst possible
@@ -550,7 +526,7 @@ function inventory(root: string, space: string, sysPub?: string, readOnly = fals
   // Ask the staleness question ONCE, through the same helper the boot path uses, so `doctor auth`
   // and `cotal up` can never disagree about which $SYS creds the trust record authorizes.
   const stale = new Map(sysPub ? staleSystemCreds(root, sysPub, space, { readOnly, onMigrated }).map((x) => [x.file, x] as const) : []);
-  const reports = fixed.map((f) => report(f.label, f.kind, f.path, sysPub, stale.get(f.label), undefined, undefined, {}, auth));
+  const reports = fixed.map((f) => report(f.label, f.kind, f.path, sysPub, stale.get(f.label)));
   // Same posture for the per-agent secrets (P1), and for the same reason: this space's segment
   // through the choke point, never `join(authDir(root), "creds")`, so an operator running `doctor`
   // on a root that has not migrated yet sees their agents' creds rather than an empty inventory. It
@@ -559,7 +535,7 @@ function inventory(root: string, space: string, sysPub?: string, readOnly = fals
   const agentDir = agentCredsDir(root, space, { readOnly, onMigrated });
   if (existsSync(agentDir)) {
     for (const f of readdirSync(agentDir).filter((f) => f.endsWith(".creds") && !f.endsWith(".sentinel.creds")).sort()) {
-      reports.push(report(basename(f), "agent", join(agentDir, f), undefined, undefined, undefined, space, revocations, auth));
+      reports.push(report(basename(f), "agent", join(agentDir, f), undefined, undefined, undefined, space, revocations));
     }
   }
   // SECOND PASS over the agent files (#1576). Supersession is a property of an alias's FAMILY, not of
@@ -568,11 +544,11 @@ function inventory(root: string, space: string, sysPub?: string, readOnly = fals
   // classified once every member is known, and the affected rows are re-derived with that role.
   const roles = classifyAgentFamilies(reports);
   return reports.map((r) =>
-    r.kind === "agent" && r.health ? report(r.label, r.kind, r.path, undefined, undefined, { role: roles.get(r.label) ?? "sole" }, space, revocations, auth) : r,
+    r.kind === "agent" && r.health ? report(r.label, r.kind, r.path, undefined, undefined, { role: roles.get(r.label) ?? "sole" }, space, revocations) : r,
   );
 }
 
-function report(label: string, kind: CredentialKind, path: string, sysPub?: string, stale?: StaleSystemCred, live?: LocalCredentialFamily, space?: string, revocations: Readonly<Record<string, number>> = {}, auth?: SpaceAuth): CredReport {
+function report(label: string, kind: CredentialKind, path: string, sysPub?: string, stale?: StaleSystemCred, live?: LocalCredentialFamily, space?: string, revocations: Readonly<Record<string, number>> = {}): CredReport {
   let health: CredHealth;
   // A cause the operator can act on, reported in place of the generic parse finding. Its text is
   // fixed and never quotes the file.
@@ -602,29 +578,15 @@ function report(label: string, kind: CredentialKind, path: string, sysPub?: stri
   const r: CredReport = { label, kind, path, health, unparsable };
   // An agent file's own claims: its grants, which a replacement under a new key holds only if its
   // mint names them, and its key, which a revocation names.
-  let claims;
-  let profile: string | null = null;
-  let verifiedCredential = false;
-  if (kind === "agent" && health.state !== "unreadable" && bytes && auth) {
-    try {
-      const text = bytes.toString("utf8");
-      claims = credsClaims(text);
-      profile = verifyStaticUserCredential(text, { accountPub: auth.account.pub, signingPub: auth.account.signingPub }, { allowOutOfWindow: true }).profile;
-      verifiedCredential = true;
-    } catch { /* no profile or grants without a verified credential */ }
-  }
-  const grants = profile === "agent" && claims && space !== undefined ? agentGrants(claims.nats ?? {}, space) : undefined;
+  const claims = kind === "agent" && health.state !== "unreadable" && bytes ? credsClaims(bytes.toString("utf8")) : undefined;
+  const grants = claims?.name === "agent" && space !== undefined ? agentGrants(claims.nats ?? {}, space) : undefined;
   const policy = credentialLifetime(kind);
   const standing = policy.class === "standing-renewable" || policy.class === "rotation-renewed";
   const repair = isRemintable(kind)
     ? `${displayCmd()} doctor auth --fix   (or start the mesh's manager - it is the renewal owner and re-signs + reloads these every half-TTL)`
-    : kind === "agent" && claims !== undefined && !verifiedCredential
-      ? "the credential could not be verified under this space's current issuer pins; select the intended profile and grants from a trusted source before replacing it"
-      : kind === "agent" && verifiedCredential && profile === null
-        ? unmarkedAgentProfileRepair()
-        : kind === "agent"
-          ? agentRepair(path, live, space, grants, profile ?? undefined)
-          : systemRotationRepair();
+    : kind === "agent"
+      ? agentRepair(path, live, space, grants, claims?.name)
+      : systemRotationRepair();
   // A $SYS cred is only usable if the system account that SIGNED it is the one the broker loads,
   // i.e. the one in this root's trust record. Expiry alone cannot see a RETIRED issuer: a rotation
   // that committed the record and then died leaves a file that is structurally valid and years from
@@ -639,12 +601,12 @@ function report(label: string, kind: CredentialKind, path: string, sysPub?: stri
   }
   // The broker refuses a key the space's account revoked, so a file signed for it before then is dead
   // however far off its expiry is, and nothing signs that key again.
-  if (verifiedCredential && claims && live?.role !== "superseded") {
+  if (claims && live?.role !== "superseded") {
     const revokedAt = claims.sub === undefined ? undefined : revocations[claims.sub];
     if (revokedAt !== undefined && (claims.iat === undefined || claims.iat <= revokedAt)) {
       r.revokedAt = revokedAt;
       r.problem = `REVOKED - its key ${claims.sub} was revoked at ${at(revokedAt)} with auth revoke-credential, so the broker refuses this credential`;
-      r.repair = kind === "agent" && profile === null ? unmarkedAgentProfileRepair() : revokedAgentRepair(path, space, grants, profile ?? undefined);
+      r.repair = revokedAgentRepair(path, space, grants, claims.name);
       return r;
     }
   }
@@ -682,7 +644,7 @@ function report(label: string, kind: CredentialKind, path: string, sysPub?: stri
       const requestedAt = kind === "agent" && live?.role !== "superseded" && space !== undefined && bytes ? noExpiryRequestedAt(path, bytes) : undefined;
       if (requestedAt !== undefined) {
         r.warning = `unbounded by request (auth mint --no-expiry, recorded ${requestedAt}) - a copy stays valid until it is revoked or the space identity rotates`;
-        r.repair = profile === null ? verifiedCredential ? unmarkedAgentProfileRepair() : repair : agentUnboundedRepair(path, space!, noExpiryRecordPath(path), grants, profile);
+        r.repair = agentUnboundedRepair(path, space!, noExpiryRecordPath(path), grants, claims?.name);
         break;
       }
       // The dashboard cred is minted without an expiry by design (the dashboard reads it once at
@@ -693,7 +655,7 @@ function report(label: string, kind: CredentialKind, path: string, sysPub?: stri
       r.problem = standing
         ? "unbounded standing credential (minted before the renewal slice) - a copied cred never dies"
         : "unbounded credential (no expiry claim) - a copy stays valid until it is revoked or the space identity rotates";
-      r.repair = kind === "agent" && live?.role !== "superseded" && space !== undefined ? profile === null ? verifiedCredential ? unmarkedAgentProfileRepair() : repair : agentUnboundedRepair(path, space, undefined, grants, profile) : repair;
+      r.repair = kind === "agent" && live?.role !== "superseded" && space !== undefined ? agentUnboundedRepair(path, space, undefined, grants, claims?.name) : repair;
       break;
     }
   }

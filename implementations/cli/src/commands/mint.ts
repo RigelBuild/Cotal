@@ -1,7 +1,7 @@
 import { existsSync, lstatSync, readlinkSync, realpathSync, unlinkSync, type Stats } from "node:fs";
 import { dirname, join, parse, relative, resolve, sep } from "node:path";
 import {
-  DEV_OWNER, accountRevocations, acquireLock, agentFilePath, assertKnownAgentCapabilities, assertValidRole, assertLifecycleToken, credsClaims, ensureDirNoSymlink, identityFromCreds, verifyStaticUserCredential,
+  DEV_OWNER, accountRevocations, acquireLock, agentFilePath, assertKnownAgentCapabilities, assertValidRole, assertLifecycleToken, credsClaims, ensureDirNoSymlink, identityFromCreds,
   loadAgentFile, mintCreds, mintLifecycleUid, newIdentity, principalKey, provisionAgentDurables, resolveReadAcl, writeSecretFileAtomic, writeSecretFileCreateOnly,
   type FlagValues, type HeldLock, type Identity, type ParsedArgs, type Profile, type SpaceAuth,
 } from "@cotal-ai/core";
@@ -35,31 +35,12 @@ const expiry = (seconds: number | undefined): string => {
  *  other standing credential stays, because something may still use it. */
 interface Replaced { state: "expired" | "unbounded" | "revoked"; expiresAt: number | null; publicKey: string; revokedAt: number | null; profile: string | null }
 
-function replaceable(standing: string, name: string, target: object, revocations: Readonly<Record<string, number>>, auth: SpaceAuth): Replaced {
-  let claims: ReturnType<typeof credsClaims>;
-  try { claims = credsClaims(standing); }
-  catch {
-    throw new CommandFailure("refused", "CONFLICT", `the standing credential "${name}" is not a native credential this command can read; it was not replaced`, { target });
-  }
-  let publicKey: string, profile: string | null;
-  try {
-    const verified = verifyStaticUserCredential(standing, { accountPub: auth.account.pub, signingPub: auth.account.signingPub }, { allowOutOfWindow: true });
-    publicKey = verified.identity;
-    profile = verified.profile;
-  } catch {
-    // The credential's self-described issuer and account prove signature consistency only; the
-    // profile remains untrusted after an authority rotation.
-    const signingPub = claims.iss;
-    const accountPub = claims.nats?.issuer_account ?? signingPub;
-    try {
-      if (signingPub === undefined || accountPub === undefined) throw new Error();
-      publicKey = verifyStaticUserCredential(standing, { accountPub, signingPub }, { allowOutOfWindow: true }).identity;
-      profile = null;
-    } catch {
-      throw new CommandFailure("refused", "CONFLICT", `the standing credential "${name}" is not a native credential this command can read; it was not replaced`, { target });
-    }
-  }
-  const exp = claims.exp;
+function replaceable(standing: string, name: string, target: object, revocations: Readonly<Record<string, number>>): Replaced {
+  let claims: ReturnType<typeof credsClaims> | undefined;
+  try { claims = credsClaims(standing); } catch { claims = undefined; }
+  if (!claims?.sub) throw new CommandFailure("refused", "CONFLICT", `the standing credential "${name}" is not a native credential this command can read; it was not replaced`, { target });
+  const exp = claims.exp, publicKey = claims.sub, profile = claims.name ?? null;
+  // The broker refuses a revoked key whatever the expiry, and the replacement takes a new key.
   const revokedAt = revocations[publicKey];
   if (revokedAt !== undefined && (claims.iat === undefined || claims.iat <= revokedAt)) return { state: "revoked", expiresAt: exp ?? null, publicKey, revokedAt, profile };
   if (exp === undefined) return { state: "unbounded", expiresAt: null, publicKey, revokedAt: null, profile };
@@ -79,11 +60,9 @@ function replaceNotes(replaced: Replaced | undefined, standing: boolean, profile
 
 /** Declared grants of a replaced agent credential whose issuer matches this space's account.
  *  This metadata is used only for a warning, never for authority or grant inheritance. */
-function heldGrants(standing: string, space: string, auth: SpaceAuth): AgentGrants | undefined {
-  try {
-    const verified = verifyStaticUserCredential(standing, { accountPub: auth.account.pub, signingPub: auth.account.signingPub }, { allowOutOfWindow: true });
-    return verified.profile === "agent" ? agentGrants(credsClaims(standing).nats ?? {}, space) : undefined;
-  } catch { return undefined; }
+function heldGrants(standing: string, space: string, account: string): AgentGrants | undefined {
+  const claims = credsClaims(standing);
+  return claims.name === "agent" && (claims.nats?.issuer_account ?? claims.iss) === account ? agentGrants(claims.nats ?? {}, space) : undefined;
 }
 
 const grantText = (grants: AgentGrants) => `read ${channelList(grants.read)}, post ${channelList(grants.post)} and ${grants.role ? `role ${grants.role}` : "no role"}`;
@@ -160,12 +139,7 @@ export async function mint(args: ParsedArgs): Promise<void> {
       try { text = new TextDecoder("utf-8", { fatal: true }).decode(bytes); identity = identityFromCreds(text); }
       catch { throw new CommandFailure("refused", "SCHEMA_INVALID", "the identity source has no matching native JWT subject and user nkey seed; contents were not printed"); }
       const claims = credsClaims(text);
-      let verifiedSource: ReturnType<typeof verifyStaticUserCredential>;
-      try { verifiedSource = verifyStaticUserCredential(text, { accountPub: auth.account.pub, signingPub: auth.account.signingPub }, { allowOutOfWindow: true }); }
-      catch { throw new CommandFailure("refused", "SCHEMA_INVALID", "--identity does not verify under this space's current issuer pins; it cannot supply a trusted profile or grants", { target: { ...target, identity: identity.id }, remedy: "mint a fresh key: run auth mint without --identity" }); }
-      if (profile === "agent" && verifiedSource.profile === "agent") carried = agentGrants(claims.nats ?? {}, space);
-      if (profile === "agent" && verifiedSource.profile !== "agent")
-        throw new CommandFailure("refused", "SCHEMA_INVALID", "--identity does not have a verified signed agent profile; choose an agent credential with a verified marker or mint a fresh identity", { target: { ...target, identity: identity.id } });
+      if (profile === "agent" && claims.name === "agent" && (claims.nats?.issuer_account ?? claims.iss) === auth.account.pub) carried = agentGrants(claims.nats ?? {}, space);
       if (profile === "agent" && !values["new-incarnation"]) {
         const candidate = new Set<string>();
         for (const subject of claims.nats?.pub?.allow ?? []) {
@@ -205,8 +179,8 @@ export async function mint(args: ParsedArgs): Promise<void> {
       standing = await store.get(key);
       if (standing !== undefined && !values.replace) throw new CommandFailure("refused", "CONFLICT", "the named standing credential already exists; it was not replaced", { target, remedy: "choose a new label or an explicit separate private --out path, or replace it with --replace once it has expired, if it has no expiry or if its key was revoked" });
       if (standing !== undefined) {
-        replaced = replaceable(standing, name, target, accountRevocations(auth.account.jwt), auth);
-        replacedGrants = heldGrants(standing, space, auth);
+        replaced = replaceable(standing, name, target, accountRevocations(auth.account.jwt));
+        replacedGrants = heldGrants(standing, space, auth.account.pub);
       }
     }
     let allowSubscribe: string[] | undefined, allowPublish: string[] | undefined, role: string | undefined, capabilities: string[] | undefined;

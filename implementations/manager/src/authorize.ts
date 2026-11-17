@@ -60,6 +60,7 @@ export async function authorizeNamedControl(opts: {
   return `not authorized: ${target.name} was not spawned by ${caller} (admin tier required)`;
 }
 
+
 /**
  * The manifest-launch authorization decision — pure, same contract style as
  * {@link authorizeNamedControl}. The dispatch already rejects a static-mesh privileged-tier

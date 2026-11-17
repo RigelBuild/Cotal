@@ -42,19 +42,16 @@ import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  isReachable, registry, seatCapFrom, serverConfig, setupSpaceStreams, mintCreds, newIdentity, createSpaceAuth, DEV_OWNER,
-  type Connector, type ControlReply, type LaunchOpts, type LaunchSpec,
+  isReachable, registry, parseCommandArgs, parsePositiveIntegerFlag, seatCapFrom, serverConfig, setupSpaceStreams, mintCreds, newIdentity, createSpaceAuth, DEV_OWNER,
+  type Command, type Connector, type ControlReply, type LaunchOpts, type LaunchSpec,
 } from "@cotal-ai/core";
 import {
   authDir, parseSeatCapFlag, readManagerSeatCap, recordManagerSeatCap, recordMesh, saveSpaceAuth,
-  SEAT_CAP_UNLIMITED, isCommandFailure,
+  SEAT_CAP_UNLIMITED, isCommandFailure, DEFAULT_SEAT_MINT_CAP, readManagerSeatMintCap, recordManagerSeatMintCap,
 } from "@cotal-ai/workspace";
 import { launchEnv } from "@cotal-ai/connector-core";
 // Dev-only smoke import of the sibling package's source, as the auth suites do: the tool spec
 // is not on connector-core's published surface, and the point of the cell is the shipped renderer.
-import { cotalToolSpecs } from "../../../extensions/connector-core/src/tool-specs.js";
-import type { AgentConfig } from "../../../extensions/connector-core/src/config.js";
-import { Manager } from "../src/manager.js";
 import { SMOKE_BROKER_TOKEN, emitSentinel, freePort, makeSeatRoot, teardownOnSignal } from "@cotal-ai/smoke-kit";
 
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -331,6 +328,27 @@ try {
   check("a number round trips", readManagerSeatCap(ctx) === 7, readManagerSeatCap(ctx));
   recordManagerSeatCap(ctx, SEAT_CAP_UNLIMITED);
   check("and so does unlimited", readManagerSeatCap(ctx) === SEAT_CAP_UNLIMITED, readManagerSeatCap(ctx));
+  check("nothing recorded yet resolves to the default seat-mint cap of 32", (parsePositiveIntegerFlag("--seat-mint-cap", undefined) ?? readManagerSeatMintCap(ctx) ?? DEFAULT_SEAT_MINT_CAP) === 32 && DEFAULT_SEAT_MINT_CAP === 32);
+  recordManagerSeatMintCap(ctx, 9);
+  check("a seat-mint cap round trips through the protected manager record", readManagerSeatMintCap(ctx) === 9);
+  check("an explicit seat-mint cap overrides the saved value", parsePositiveIntegerFlag("--seat-mint-cap", "12") === 12);
+  check("an absent seat-mint flag keeps the saved value", (parsePositiveIntegerFlag("--seat-mint-cap", undefined) ?? readManagerSeatMintCap(ctx)) === 9);
+  for (const bad of ["0", "-1", "abc", "2.5", ""]) {
+    let refusal: unknown;
+    try { parsePositiveIntegerFlag("--seat-mint-cap", bad); } catch (e) { refusal = e; }
+    check(`--seat-mint-cap ${JSON.stringify(bad)} is a usage refusal`, isCommandFailure(refusal) && refusal.code === "USAGE_INVALID", refusal);
+  }
+  const supervise = registry.resolve<Command>("command", "supervise");
+  if (supervise === undefined || supervise.validate === undefined) throw new Error("the manager supervise command is not registered with validation");
+  check("supervise exposes --seat-mint-cap and its persisted default", supervise.flags?.some((flag) => flag.name === "seat-mint-cap" && flag.description?.includes("default 32")) === true);
+  const positiveMintArgs = parseCommandArgs(supervise, ["--seat-mint-cap", "6"]);
+  supervise.validate(positiveMintArgs);
+  check("supervise accepts a positive seat-mint cap", positiveMintArgs.values["seat-mint-cap"] === "6");
+  for (const bad of ["0", "-1", "abc", "2.5", ""]) {
+    let refusal: unknown;
+    try { supervise.validate(parseCommandArgs(supervise, ["--seat-mint-cap", bad])); } catch (e) { refusal = e; }
+    check(`supervise rejects --seat-mint-cap ${JSON.stringify(bad)} as usage`, isCommandFailure(refusal) && refusal.code === "USAGE_INVALID", refusal);
+  }
   check("the flag parses a positive integer", parseSeatCapFlag("--seat-cap", "4") === 4);
   check("the flag parses unlimited", parseSeatCapFlag("--seat-cap", "unlimited") === SEAT_CAP_UNLIMITED);
   check("an absent flag stays undefined so the recorded value applies", parseSeatCapFlag("--seat-cap", undefined) === undefined);

@@ -28,9 +28,10 @@ import { join } from "node:path";
 const home = mkdtempSync(join(tmpdir(), "cotal-max-sessions-"));
 process.env.COTAL_HOME = home; // sandbox the registry BEFORE the modules that read it load
 
+// Dynamic imports are required here: COTAL_HOME must be set before workspace modules capture the registry path.
 const { recordMesh, findMesh, parsePositiveIntegerFlag } = await import("@cotal-ai/workspace");
-const { maxSessionsFor } = await import("../src/commands/up.js");
-const { liveManagerWouldApplyMaxSessions, maxSessionsFromSuperviseArgv } = await import("../src/lib/manager-proc.js");
+const { maxSessionsFor, seatMintCapFor } = await import("../src/commands/up.js");
+const { liveManagerWouldApplyMaxSessions, maxSessionsFromSuperviseArgv, liveManagerWouldApplySeatMintCap, seatMintCapFromSuperviseArgv } = await import("../src/lib/manager-proc.js");
 
 let failures = 0;
 function check(label: string, cond: boolean, extra?: unknown): void {
@@ -55,6 +56,10 @@ try {
   check("a later launch with no --max-sessions reads the recorded decision", maxSessionsFor("sized") === 256, maxSessionsFor("sized"));
   check("an explicit ceiling on THIS invocation wins", maxSessionsFor("sized", 128) === 128, maxSessionsFor("sized", 128));
 
+
+  // The direct launch serializes the accepted cap as two argv tokens; the parser assertions above
+  // prove the same value survives the child process boundary without changing the setting.
+
   recordMesh({ ...base, space: "defaulted", server: "nats://127.0.0.1:4226" });
   check("a mesh that never asked records NO ceiling", findMesh("defaulted")?.maxSessions === undefined, findMesh("defaulted")?.maxSessions);
   check("...and resolves to undefined, so the plane keeps 64", maxSessionsFor("defaulted") === undefined, maxSessionsFor("defaulted"));
@@ -73,12 +78,24 @@ try {
   // recording one anyway is a durable lie: MeshEntry said 1 while the live argv had none.
   const liveBare = "/usr/bin/node /opt/cotal/bin/dist/cotal.js supervise --space sized --server nats://127.0.0.1:35715";
   const liveSized = `${liveBare} --max-sessions 3`;
+  recordMesh({ ...base, space: "minted", seatMintCap: 11 });
+  check("a saved manager mint cap round-trips", findMesh("minted")?.seatMintCap === 11);
+  check("a later launch without the flag keeps the saved mint cap", seatMintCapFor("minted") === 11);
+  check("an explicit mint cap wins for this launch", seatMintCapFor("minted", 7) === 7);
+  check("an unknown mesh keeps the manager's default cap decision unset", seatMintCapFor("missing") === undefined);
+
+  const liveMinted = `${liveBare} --seat-mint-cap 11`;
+  check("supervise argv reports the applied mint cap", seatMintCapFromSuperviseArgv(liveMinted) === 11);
+  check("equals-form supervise argv reports the applied mint cap", seatMintCapFromSuperviseArgv(`${liveBare} --seat-mint-cap=11`) === 11);
+  check("a matching live manager accepts the same mint cap", liveManagerWouldApplySeatMintCap(liveMinted, 11));
+  check("a live manager without the requested cap cannot apply it", !liveManagerWouldApplySeatMintCap(liveBare, 11));
   check("absent --max-sessions on a live supervisor is the plane default, not a recorded 64", maxSessionsFromSuperviseArgv(liveBare) === undefined);
   check("a live supervisor argv reports the applied ceiling", maxSessionsFromSuperviseArgv(liveSized) === 3);
   check("equals-form argv reports the applied ceiling", maxSessionsFromSuperviseArgv(`${liveBare} --max-sessions=3`) === 3);
   check("a matching refresh may proceed", liveManagerWouldApplyMaxSessions(liveSized, 3) === true);
   check("a different requested ceiling on a live manager is unapplied", liveManagerWouldApplyMaxSessions(liveBare, 1) === false);
   check("an unreadable command line cannot prove a match, so persist would guess", liveManagerWouldApplyMaxSessions(undefined, 1) === false);
+  check("the cap argument appears as a separate child argv value", liveMinted.split(/\s+/).slice(-2).join(" ") === "--seat-mint-cap 11");
 } finally {
   rmSync(home, { recursive: true, force: true });
 }

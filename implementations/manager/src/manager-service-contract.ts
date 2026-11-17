@@ -602,6 +602,43 @@ const ATTEST_GONE_OUTPUT_SCHEMA = {
   type: "object", additionalProperties: false, required: ["name", "lifecycleUid", "phase", "attestedGone"],
   properties: { name: { type: "string" }, lifecycleUid: { type: "string" }, phase: { type: "string" }, attestedGone: { type: "string" } },
 } as const;
+const IDENTITY_NAME = { type: "string", minLength: 1 } as const;
+const IDENTITY_PUBLIC_KEY = { type: "string", pattern: "^U[A-Z2-7]{55}$" } as const;
+const IDENTITY_LIFECYCLE_UID = { type: "string", pattern: "^[a-z0-9]{26,32}$" } as const;
+const IDENTITY_RESERVE_INPUT_SCHEMA = {
+  type: "object", additionalProperties: false, required: ["name"],
+  properties: { name: IDENTITY_NAME },
+} as const;
+const IDENTITY_RESERVE_OUTPUT_SCHEMA = {
+  type: "object", additionalProperties: false, required: ["name", "lifecycleUid"],
+  properties: { name: IDENTITY_NAME, lifecycleUid: IDENTITY_LIFECYCLE_UID },
+} as const;
+const IDENTITY_MINT_INPUT_SCHEMA = {
+  type: "object", additionalProperties: false, required: ["name", "lifecycleUid", "publicKey"],
+  properties: { name: IDENTITY_NAME, lifecycleUid: IDENTITY_LIFECYCLE_UID, publicKey: IDENTITY_PUBLIC_KEY },
+} as const;
+const IDENTITY_MINT_OUTPUT_SCHEMA = {
+  type: "object", additionalProperties: false, required: ["name", "jwt", "lifecycleUid", "exp", "acceptedToken"],
+  properties: {
+    name: IDENTITY_NAME,
+    jwt: { type: "string", minLength: 1 },
+    lifecycleUid: IDENTITY_LIFECYCLE_UID,
+    exp: { type: "integer", minimum: 0 },
+    acceptedToken: { type: "string", pattern: "^[0-9a-f]{32}$" },
+  },
+} as const;
+const IDENTITY_RENEW_INPUT_SCHEMA = {
+  type: "object", additionalProperties: false, required: ["name", "publicKey"],
+  properties: { name: IDENTITY_NAME, publicKey: IDENTITY_PUBLIC_KEY },
+} as const;
+const IDENTITY_RENEW_OUTPUT_SCHEMA = IDENTITY_MINT_OUTPUT_SCHEMA;
+const IDENTITY_RETIRE_INPUT_SCHEMA = {
+  type: "object", additionalProperties: false, required: ["name"],
+  properties: { name: IDENTITY_NAME },
+} as const;
+const IDENTITY_RETIRE_OUTPUT_SCHEMA = { type: "object", additionalProperties: false, properties: {} } as const;
+
+// ---- output/input schemas (closed unless the payload is genuinely open) ------------------------
 
 const CHANNEL_LIST = { type: "array", items: { type: "string" } } as const;
 const PERSONA_INPUT_SCHEMA = {
@@ -1132,10 +1169,15 @@ const ROWS: CommandRow[] = [
   { name: "release-seat", capability: "manager.admin", input: RELEASE_SEAT_INPUT_SCHEMA, output: RELEASE_SEAT_OUTPUT_SCHEMA, targeted: false, handler: "releaseSeat" },
   { name: "attest-gone", capability: "manager.admin", input: ATTEST_GONE_INPUT_SCHEMA, output: ATTEST_GONE_OUTPUT_SCHEMA, targeted: false, handler: "attestGone" },
   { name: "allowlist-set", capability: "manager.admin", input: ALLOWLIST_SET_INPUT_SCHEMA, output: ALLOWLIST_SET_OUTPUT_SCHEMA, targeted: false, handler: "allowlistSet" },
+  { name: "identity-reserve", capability: "manager.seat", input: IDENTITY_RESERVE_INPUT_SCHEMA, output: IDENTITY_RESERVE_OUTPUT_SCHEMA, targeted: false, handler: "identityReserve" },
+  { name: "identity-mint", capability: "manager.seat", input: IDENTITY_MINT_INPUT_SCHEMA, output: IDENTITY_MINT_OUTPUT_SCHEMA, targeted: false, handler: "identityMint" },
+  { name: "identity-renew", capability: "manager.seat", input: IDENTITY_RENEW_INPUT_SCHEMA, output: IDENTITY_RENEW_OUTPUT_SCHEMA, targeted: false, handler: "identityRenew" },
+  { name: "identity-retire", capability: "manager.seat", input: IDENTITY_RETIRE_INPUT_SCHEMA, output: IDENTITY_RETIRE_OUTPUT_SCHEMA, targeted: false, handler: "identityRetire" },
+  { name: "identity-retire-admin", capability: "manager.admin", input: IDENTITY_RETIRE_INPUT_SCHEMA, output: IDENTITY_RETIRE_OUTPUT_SCHEMA, targeted: false, handler: "identityRetireAdmin" },
 ];
 
 // WHEN THE COMPILE HAPPENS (#1323): every CLI invocation loads this module before its verb is
-// read (`bin/run.ts` self-registers the manager), and compiling the 41 distinct schema roots cost
+// read (`bin/run.ts` self-registers the manager), and compiling the 48 distinct schema roots cost
 // ~1.8 CPU-seconds of Ajv work paid by `cotal --version`. The compile therefore runs ON FIRST
 // ACCESS, not at import: importing this module builds only the source table and its digests (pure
 // canonical JSON, no Ajv), and the first read of a contract pair — `managerCommandDefs` at serve
@@ -1263,10 +1305,10 @@ export const MANAGER_STATUS_CONTRACT: { input: CompiledContract; output: Compile
  *
  *  48 adds retained-custody and deferred-seat reconciliation status; 49 adds `release-seat`;
  *  50 adds `attest-gone`; 51 adds `allowlist-set` and the fork's blank continuation refusal;
- *  52 adds `roster` for static agent presence reads.
+ *  52 adds `roster`; 53 adds the seat identity operations.
  */
 export function managerClusterDocument(): ClusterDocument {
-  return buildClusterDocument(MANAGER_CLUSTER_URN, 52, ROWS);
+  return buildClusterDocument(MANAGER_CLUSTER_URN, 53, ROWS);
 }
 
 /** Revision, count, and names from the shipped cluster document. Reached smokes derive surface pins from this. */
@@ -1365,6 +1407,11 @@ export interface ManagerServiceHandlers {
   releaseSeat(ctx: EpServeContext): unknown | Promise<unknown>;
   attestGone(ctx: EpServeContext): unknown | Promise<unknown>;
   allowlistSet(ctx: EpServeContext): unknown | Promise<unknown>;
+  identityReserve(ctx: EpServeContext): unknown | Promise<unknown>;
+  identityMint(ctx: EpServeContext): unknown | Promise<unknown>;
+  identityRenew(ctx: EpServeContext): unknown | Promise<unknown>;
+  identityRetire(ctx: EpServeContext): unknown | Promise<unknown>;
+  identityRetireAdmin(ctx: EpServeContext): unknown | Promise<unknown>;
 }
 
 /** Build the `EpCommandDef[]` `serveEndpoint` consumes: each command's provenance-branded compiled

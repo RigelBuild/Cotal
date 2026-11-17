@@ -14,14 +14,14 @@
  * Every credential kind is classified in {@link CREDENTIAL_LIFETIMES}: its lifetime class, default
  * expiry and renewal owner.
  */
-import { PROFILES } from "./credential-profiles.js";
 import { TTL_RECONCILE_CANARY_KEY, ttlBuckets } from "./streams.js";
 import { decodeNatsJwt, nativeNkeySigner } from "./nkey-signer.js";
 import { spaceDeletionStreams } from "./space-deletion-targets.js";
 import { assertValidName } from "./resolve.js";
 import { BROKER_USER_INFO_SUBJECT } from "./broker-identity.js";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { join } from "node:path";
+import { canonicalJson } from "./canonical.js";
 import {
   decode,
   encodeOperator,
@@ -31,6 +31,7 @@ import {
   type Account,
 } from "@nats-io/jwt";
 import { createOperator, createAccount, fromPublic, fromSeed } from "@nats-io/nkeys";
+import type { KeyPair } from "@nats-io/nkeys";
 import type { BrokerTransport } from "./broker-tls.js";
 import {
   token,
@@ -101,7 +102,8 @@ import { SERVICE_ACCESS_TTL_SECONDS } from "./service-authority-limits.js";
 import { effectsBindGrants, poolOwnerBindGrants, goalWriterGrants, environmentManagerGoalWriterGrants, sessionLedgerGrants, epAuthBucket, sessionsBucket, epcStreamName, endpointPlaneStreamNames, eptReqStreamName, eptStreamName, hardenedAuthorityStreamNames, timerWriterDurable, timerWriterGrants } from "./endpoint-binding.js";
 import { epsSubject, epCallerReplyFilter, assertGeneration, isIssuedCaller, AUTH_ENDPOINT, EP_CMD_RETIRE_LIFECYCLE, EP_CMD_VERIFY_PLACEMENT_ENROLLMENT, EP_CMD_ENROLLMENT_EFFECT_STATUS, EP_CMD_CLOSE_ENROLLMENT_EFFECT, EP_CMD_RETIRE_PLACEMENT_ENROLLMENT, type EpCaller, type IssuedCaller } from "./endpoint-subjects.js";
 import { managerRegistrationFamilySubject } from "./endpoint-subjects.js";
-import { acceptedReadGrant, acceptedBucket, importNativeSubjectPermissions, issuedBucket, issuedHorizon, issuedPermitsPattern, issuedStoreStreamNames, prepareListing, writeAcceptedRow, type IssuanceSeam, type IssuedAuthorityRef, type ListingBinding, type ListingSeam, type PreparedListing } from "./issued-authority.js";
+import { acceptedKey, acceptedReadGrant, acceptedBucket, importNativeSubjectPermissions, issuedBucket, issuedHorizon, issuedPermitsPattern, issuedStoreStreamNames, prepareListing, writeAcceptedRow, type IssuanceSeam, type IssuedAuthorityRef, type IssuedSubjectPermissions, type IssuedSourceRef, type ListingBinding, type ListingSeam, type PreparedListing } from "./issued-authority.js";
+import { signIssuedUserJwt } from "./issued-user-jwt.js";
 import { REGISTRY_ENDPOINTS_GRANT } from "./registry-contract.js";
 import { admissionBucket, admissionKey, revocationKey } from "./run-admission.js";
 import { runSubmissionKey } from "./run-submission.js";
@@ -224,8 +226,20 @@ export type Profile =
   | "environment-manager-supervisor"
   | "environment-manager-executor"
   | "environment-manager-goal-writer";
-
-export { PROFILES };
+/** Runtime list of credential profile labels for claim classification. */
+export const PROFILES = Object.freeze([
+  "agent", "manager-caller", "observer", "admin", "supervisor", "provisioner", "deprovisioner",
+  "reconciler", "retirement-requester", "lifecycle-executor", "endpoint-serve-executor", "operator", "purger",
+  "backup", "restore", "delivery", "membership-rw", "probe", "channel-writer", "channel-purger",
+  "teardown", "control-caller-privileged", "control-caller-admin", "deployer", "endpoint-serve",
+  "goal-writer", "session-caller", "session-serving", "session-ledger", "run-driver", "run-mediator",
+  "run-operator", "endpoint-evictor", "issuer", "run-admitter", "transfer-writer", "transfer-reader",
+  "remote-manager", "environment-bootstrap", "environment-manager-supervisor",
+  "environment-manager-executor", "environment-manager-goal-writer", "dm-reader", "issued-store-recreate",
+  "registry-reader",
+  "webhook-publisher",
+  "auth-roster-reader",
+] as const satisfies readonly Profile[]);
 
 type _AllProfiles = Exclude<Profile, (typeof PROFILES)[number]> extends never ? true : never;
 const _allProfiles: _AllProfiles = true;
@@ -643,6 +657,8 @@ export interface IssuedBinding {
 export interface MintOpts {
   /** Display name placed in the JWT `name` claim. Defaults to the profile label. */
   name?: string;
+  /** Restrict an agent to sending DMs and binding its own DM durable. */
+  dmOnly?: boolean;
   /** The owner+actor principal to mint for. Omitted ⇒ the no-login dev default (owner `"local"`, actor
    *  = the connection id) via {@link principalOf}. User mode supplies the derived owner + ledger actor. */
   principal?: { owner: string; actor: string };
@@ -834,7 +850,7 @@ export interface MintOpts {
  *  JWT digest: a restart's re-mint would re-sign the credential its barrier just revoked under the
  *  revoked row's id (SPEC 13.1). */
 function userTags(profile: Profile, pr: MintPrincipal): string[] {
-  const tags = [...principalTags(pr.owner, pr.actor), `profile:${profile}`];
+  const tags = principalTags(pr.owner, pr.actor);
   return profile === "goal-writer" || profile === "session-ledger" ? [...tags, `issuance:${randomBytes(16).toString("hex")}`] : tags;
 }
 
@@ -1184,6 +1200,137 @@ async function releaseIssuance(
   });
   await seam.store.release(prepared, async () => { await seam.finalize?.(credentialId); });
   await writeAcceptedRow(seam.accepted, opts.issued.acceptedToken, ref);
+}
+
+type PublicSeatMintOptions = {
+  name: string;
+  principal: { owner: string; actor: string };
+  lifecycleUid: string;
+  issuedAt: number;
+  expiresAt: number;
+  issued: IssuedBinding;
+  issuance: IssuanceSeam;
+};
+
+type PublicSeatMintContext = {
+  auth: { space: string; account: Pick<SpaceAccountAuth["account"], "pub" | "signingSeed"> };
+  publicId: string;
+  opts: PublicSeatMintOptions;
+  signer: KeyPair;
+  perms: Record<string, unknown>;
+  tags: string[];
+  claimsDigest: string;
+  ref: IssuedAuthorityRef;
+  source: IssuedSourceRef;
+  permissions: IssuedSubjectPermissions;
+};
+
+async function assertPublicSeatAcceptedRow(context: PublicSeatMintContext): Promise<void> {
+  const accepted = await context.opts.issuance.accepted.get(acceptedKey(context.opts.issued.acceptedToken));
+  if (!accepted || accepted.operation !== "PUT"
+    || canonicalJson(accepted.json<unknown>()) !== canonicalJson({ version: 1, ref: context.ref }))
+    throw new Error("mintPublicSeatUserJwt: issuance has no identical accepted row");
+}
+
+function signPublicSeatUserJwt(context: PublicSeatMintContext, issuedAt: number, expiresAt: number): string {
+  const jwt = signIssuedUserJwt({
+    accountSigner: context.signer,
+    accountIssuer: context.auth.account.pub,
+    userPublicKey: context.publicId,
+    name: context.opts.name,
+    permissions: context.perms,
+    tags: context.tags,
+    exp: expiresAt,
+    iat: issuedAt,
+  });
+  if (Buffer.byteLength(jwt, "utf8") > MAX_MINTED_JWT_BYTES)
+    throw new Error("mintPublicSeatUserJwt: minted JWT exceeds the CONNECT line budget");
+  return jwt;
+}
+
+async function issuePublicSeatUserJwt(context: PublicSeatMintContext): Promise<{ jwt: string; exp: number; acceptedToken: string }> {
+  const { opts, ref, source, permissions } = context;
+  const prepared = await opts.issuance.store.stage({
+    version: 1,
+    ref,
+    sources: [source],
+    permissions,
+    issuedAt: opts.issuedAt,
+    jwtExpiresAt: opts.expiresAt,
+    jwtClaimsDigest: context.claimsDigest,
+  });
+  if (prepared.issuedAt !== opts.issuedAt || prepared.jwtExpiresAt !== opts.expiresAt || prepared.jwtClaimsDigest !== context.claimsDigest)
+    throw new Error("mintPublicSeatUserJwt: prepared issuance is missing or mismatches persisted JWT claims");
+  const jwt = signPublicSeatUserJwt(context, prepared.issuedAt, prepared.jwtExpiresAt);
+  if (prepared.state === "prepared") {
+    await opts.issuance.store.release(prepared, async () => { await opts.issuance.finalize?.(credentialIdOf(jwt)); });
+    await writeAcceptedRow(opts.issuance.accepted, opts.issued.acceptedToken, ref);
+  } else {
+    if (prepared.state !== "active") throw new Error("mintPublicSeatUserJwt: issuance is not active");
+    await opts.issuance.store.release(prepared, async () => {});
+    await writeAcceptedRow(opts.issuance.accepted, opts.issued.acceptedToken, ref);
+  }
+  return { jwt, exp: prepared.jwtExpiresAt, acceptedToken: opts.issued.acceptedToken };
+}
+
+async function renewPublicSeatUserJwt(context: PublicSeatMintContext): Promise<{ jwt: string; exp: number; acceptedToken: string }> {
+  const { opts, ref, source, permissions } = context;
+  const previous = await opts.issuance.store.observe(ref);
+  if (previous.evidence.sources.length !== 1 || canonicalJson(previous.evidence.sources[0]) !== canonicalJson(source))
+    throw new Error("mintPublicSeatUserJwt: renewal source does not match the active issuance's static credential-family source");
+  if (previous.evidence.jwtClaimsDigest !== context.claimsDigest
+    || previous.evidence.issuedAt === undefined || previous.evidence.jwtExpiresAt === undefined)
+    throw new Error("mintPublicSeatUserJwt: renewal claims do not match immutable active issuance evidence");
+  if (opts.issuedAt <= previous.evidence.issuedAt || opts.expiresAt <= previous.evidence.jwtExpiresAt)
+    throw new Error("mintPublicSeatUserJwt: renewal must advance the persisted issuedAt and expiresAt");
+  await opts.issuance.store.confirm(ref, permissions);
+  const jwt = signPublicSeatUserJwt(context, opts.issuedAt, opts.expiresAt);
+  await assertPublicSeatAcceptedRow(context);
+  await opts.issuance.finalize?.(credentialIdOf(jwt));
+  return { jwt, exp: opts.expiresAt, acceptedToken: opts.issued.acceptedToken };
+}
+
+/** Issue or renew a DM-only seat credential without accepting the holder's private key. */
+export async function mintPublicSeatUserJwt(
+  auth: { space: string; account: Pick<SpaceAccountAuth["account"], "pub" | "signingSeed"> },
+  publicId: string,
+  opts: PublicSeatMintOptions,
+): Promise<{ jwt: string; exp: number; acceptedToken: string }> {
+  if (!isUserNkey(publicId)) throw new Error("mintPublicSeatUserJwt: publicId must be a user nkey");
+  assertValidName(opts.name);
+  const now = Math.floor(Date.now() / 1000);
+  if (!Number.isSafeInteger(opts.issuedAt) || opts.issuedAt <= 0 || opts.issuedAt > now
+    || !Number.isSafeInteger(opts.expiresAt) || opts.expiresAt <= now || opts.expiresAt <= opts.issuedAt
+    || opts.expiresAt > opts.issuedAt + STANDING_RENEWABLE_TTL_SEC)
+    throw new Error("mintPublicSeatUserJwt: persisted issuedAt and expiresAt must describe a live JWT no longer than 24 hours");
+
+  const pr: MintPrincipal = { ...opts.principal, connId: publicId, lifecycleUid: opts.lifecycleUid };
+  const perms = permissionsFor("agent", auth.space, pr, { ...opts, dmOnly: true });
+  const tags = userTags("agent", pr);
+  const encodedSeed = new TextEncoder().encode(auth.account.signingSeed);
+  const signer = nativeNkeySigner(encodedSeed);
+  encodedSeed.fill(0);
+  try {
+    const claimsDigest = createHash("sha256").update(canonicalJson({
+      accountIssuer: auth.account.pub, signerPublicKey: signer.getPublicKey(), userPublicKey: publicId,
+      name: opts.name, permissions: perms, tags,
+    })).digest("hex");
+    const ref: IssuedAuthorityRef = { space: auth.space, owner: pr.owner, actor: pr.actor, uid: opts.lifecycleUid, generation: opts.issued.generation };
+    const source = { space: auth.space, bucket: epAuthBucket(auth.space), key: `cred.${opts.lifecycleUid}` };
+    if (opts.expiresAt > issuedHorizon(ref.generation))
+      throw new Error(`mintPublicSeatUserJwt: expiresAt must not pass generation horizon ${issuedHorizon(ref.generation)}`);
+    if (opts.issuance.sources.length !== 1 || canonicalJson(opts.issuance.sources[0]) !== canonicalJson(source))
+      throw new Error("mintPublicSeatUserJwt: issuance must name this lifecycle's static credential-family source");
+    const context: PublicSeatMintContext = {
+      auth, publicId, opts, signer, perms, tags, claimsDigest, ref, source,
+      permissions: importNativeSubjectPermissions(perms),
+    };
+    return opts.issuance.mode === "issue"
+      ? await issuePublicSeatUserJwt(context)
+      : await renewPublicSeatUserJwt(context);
+  } finally {
+    signer.clear();
+  }
 }
 
 /** Issue a host-signed NATS user JWT for a caller-generated nkey. The private seed stays with
@@ -1609,6 +1756,19 @@ export function permissionsFor(
   // than mint it agent perms by accident (the no-fallbacks rule; matches the deleted `manager`'s intent).
   if (profile !== "agent")
     throw new Error(`permissionsFor: unhandled profile "${profile}" - add an explicit arm, do not fall through to agent`);
+  if (opts.dmOnly) {
+    if (opts.endpointCapabilities !== undefined || opts.capabilities !== undefined || opts.role !== undefined ||
+        opts.allowPublish !== undefined || opts.allowSubscribe !== undefined || opts.listing !== undefined || opts.listingSeam !== undefined)
+      throw new Error("permissionsFor(agent): dmOnly cannot carry other permission options");
+    if (!pr.lifecycleUid)
+      throw new Error("permissionsFor(agent): dmOnly requires lifecycleUid");
+    const dm = dmStream(space);
+    const durable = dmDurable(pr.owner, pr.actor, assertLifecycleToken(pr.lifecycleUid));
+    return {
+      pub: { allow: [unicastSubject(space, "*", "*", pr.owner, pr.actor), `$JS.API.CONSUMER.INFO.${dm}.${durable}`, `$JS.API.CONSUMER.MSG.NEXT.${dm}.${durable}`, `$JS.ACK.${dm}.${durable}.>`] },
+      sub: { allow: [inbox] },
+    };
+  }
   const allowPublish = opts.allowPublish ?? []; // post ACL — DEFAULT-DENY (publish must be declared)
   // Read ACL — DEFAULT-DENY for channels, exactly like allowPublish above. Omitted or empty mints
   // NO channel row: no per-channel history-consumer create grant and no `chat.*.<ch>` sub.allow.

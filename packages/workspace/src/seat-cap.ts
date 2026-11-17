@@ -37,6 +37,7 @@ export function parseSeatCapFlag(flag: string, raw: string | undefined): SeatCap
   return n;
 }
 
+
 /** How a cap reads in a sentence an operator or an agent sees. */
 export function seatCapText(cap: SeatCap): string {
   return cap === SEAT_CAP_UNLIMITED ? SEAT_CAP_UNLIMITED : String(cap);
@@ -66,4 +67,35 @@ export function readManagerSeatCap(context: LocalProcessContext): SeatCap | unde
 /** Record `cap` as this root's manager seat cap for the space. */
 export function recordManagerSeatCap(context: LocalProcessContext, cap: SeatCap): void {
   writeSecretFileAtomic(canonicalLocalProcessPath(MANAGER_SEAT_CAP_RECORD, context), JSON.stringify({ version: 1, seatCap: cap }));
+}
+
+
+/** What a manager started without a saved seat-mint ceiling enforces. */
+export const DEFAULT_SEAT_MINT_CAP = 32;
+
+/** Where this root records its manager's seat-mint ceiling for one space. */
+export const MANAGER_SEAT_MINT_CAP_RECORD = "manager.{space}.seat-mint-cap.json";
+
+/** Read the seat-mint cap saved for this root and space. */
+export function readManagerSeatMintCap(context: LocalProcessContext): number | undefined {
+  const path = canonicalLocalProcessPath(MANAGER_SEAT_MINT_CAP_RECORD, context);
+  const bytes = readLocalRecordSource(path, 4096, true);
+  if (bytes === undefined) return undefined;
+  const corrupt = (what: string) => new CommandFailure("refused", "SCHEMA_INVALID", `the manager seat-mint-cap record ${path} ${what}`, { target: { path }, remedy: "remove or repair that record, then start the manager again" });
+  let value: unknown;
+  try { value = JSON.parse(bytes.toString("utf8")); }
+  catch { throw corrupt("is not valid JSON"); }
+  let record: Record<string, unknown>;
+  try { record = localRecordObject(value, ["version", "seatMintCap"]); }
+  catch { throw corrupt("is not an object of version and seatMintCap"); }
+  if (record.version !== 1) throw corrupt("has an unsupported version");
+  const cap = record.seatMintCap;
+  if (typeof cap !== "number" || !Number.isSafeInteger(cap) || cap < 1) throw corrupt("does not hold a positive integer");
+  return cap;
+}
+
+/** Record the positive seat-mint cap for the next start in this root and space. */
+export function recordManagerSeatMintCap(context: LocalProcessContext, cap: number): void {
+  if (!Number.isSafeInteger(cap) || cap < 1) throw new CommandFailure("refused", "USAGE_INVALID", "the manager seat-mint cap must be a positive integer");
+  writeSecretFileAtomic(canonicalLocalProcessPath(MANAGER_SEAT_MINT_CAP_RECORD, context), JSON.stringify({ version: 1, seatMintCap: cap }));
 }
