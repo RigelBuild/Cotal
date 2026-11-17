@@ -20,7 +20,7 @@ import {
   type SpaceAuth,
 } from "@cotal-ai/core";
 import { isConnectRefusal, mintControlInstrument, preflightOrThrow } from "../connect.js";
-import { askManager, managerFailure, refuseWithoutLiveManager, type ControlClient, type ManagerReply } from "../control/manager.js";
+import { askManager, managerFailure, refuseWithoutLiveManager, type ControlClient, type ManagerOp, type ManagerReply } from "../control/manager.js";
 import type { MeshTarget } from "../mesh-target.js";
 import { CommandFailure } from "../output.js";
 import { NativeChatSession } from "./native-session.js";
@@ -118,7 +118,7 @@ export function retireReport(reply: ManagerReply, managerInstanceId: string, val
  *  With `purpose`, an unpinned call on a space whose registry lists no live manager is refused
  *  before `op` is sent, as the run verbs refuse it, rather than after it has waited out its deadline.
  *  `timeoutMs` is the reply window for `op` itself; absent, it is `askManager`'s default. */
-async function askPinned(control: ControlClient, mesh: PinnedMesh, op: string, args: Record<string, unknown>, instanceId: string | undefined, purpose?: string, timeoutMs?: number): Promise<ManagerReply> {
+async function askPinned(control: ControlClient, mesh: PinnedMesh, op: ManagerOp, args: Record<string, unknown>, instanceId: string | undefined, purpose?: string, timeoutMs?: number): Promise<ManagerReply> {
   try {
     const auth = { ...await mintControlInstrument(mesh, "privileged", instanceId), tls: mesh.tlsRequired };
     if (purpose !== undefined && instanceId === undefined) await refuseWithoutLiveManager(mesh.space, mesh.server, auth, { space: mesh.space }, purpose);

@@ -77,7 +77,12 @@ export const START_TIMEOUT_MS = 40_000;
  *  `{name}` argument becomes a §13.2 target block (resolved to the agent's principal triple via
  *  the name-keyed `inspect` read — it rides the spawn capability arm, so resolution reach equals
  *  despawn/attach reach; the wire target is (owner, actor, lifecycleUid), never an alias). */
-export const EP_COMMANDS: Readonly<Record<string, Readonly<{ command: string; targeted?: boolean; self?: boolean }>>> = Object.freeze({
+type EpCommand = Readonly<{ command: string; targeted?: boolean; self?: boolean }>;
+
+/** Keeps each op name as a literal key, so {@link ManagerOp} is exact, while every value is an EpCommand. */
+const epCommands = <const T extends Record<string, EpCommand>>(rows: T): { readonly [K in keyof T]: EpCommand } => Object.freeze(rows);
+
+export const EP_COMMANDS = epCommands({
   managerStatus: Object.freeze({ command: "status" }),
   start: Object.freeze({ command: "spawn" }),
   resolveAgent: Object.freeze({ command: "resolve-agent" }),
@@ -108,6 +113,9 @@ export const EP_COMMANDS: Readonly<Record<string, Readonly<{ command: string; ta
   runStatus: Object.freeze({ command: "run-status" }),
 });
 
+/** An op the CLI can send to the manager: a key of {@link EP_COMMANDS}, so an unmapped name fails typecheck. */
+export type ManagerOp = keyof typeof EP_COMMANDS;
+
 /** Operator reach for one targeted control call: `owner` rides the caller's own-domain verb rows
  *  (the spawn capability's standing mint), `any` the admin instrument's cross-agent rows (§13.2
  *  any-mode). Replaces the deleted manager ctl tiers as the CLI's mode selector (1d). */
@@ -129,7 +137,7 @@ async function askManagerEp(
   client: ControlClient,
   space: string,
   server: string,
-  op: string,
+  op: ManagerOp,
   args: Record<string, unknown> | undefined,
   auth: ControlAuth,
   reach: ControlReach,
@@ -422,7 +430,7 @@ export async function askManager(
   client: ControlClient,
   space: string,
   server: string,
-  op: string,
+  op: ManagerOp,
   args?: Record<string, unknown>,
   auth: ControlAuth = {},
   reach: ControlReach = "owner",
@@ -738,7 +746,7 @@ async function askManagerScatterEp(
   client: ControlClient,
   space: string,
   server: string,
-  op: string,
+  op: ManagerOp,
   auth: ControlAuth,
   spaceAuth: SpaceAuth | undefined,
   timeoutMs?: number,
@@ -830,7 +838,7 @@ export async function scatterManager(
   client: ControlClient,
   space: string,
   server: string,
-  op: string,
+  op: ManagerOp,
   auth: ControlAuth = {},
   spaceAuth?: SpaceAuth,
   timeoutMs?: number,
