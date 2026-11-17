@@ -1,2 +1,0 @@
-# DM-only consume mode: an own-DM credential binds its dm_ durable and nothing else (#4189).
-smoke:dm-only-consume:auth

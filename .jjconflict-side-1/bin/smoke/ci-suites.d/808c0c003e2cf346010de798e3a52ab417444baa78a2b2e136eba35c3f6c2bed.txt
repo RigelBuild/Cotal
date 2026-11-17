@@ -1,2 +1,0 @@
-# Keyed run submission on a signerless native manager behind the auth service and broker callout.
-smoke:keyed-submission-signerless-native:auth

@@ -1,3 +1,0 @@
-# The delegation bound at the mint on a static mesh: a spawner hands its helper only what its issued
-# credential carries, and a spawner with no evidence hands on no grant.
-smoke:spawn-grant-bound

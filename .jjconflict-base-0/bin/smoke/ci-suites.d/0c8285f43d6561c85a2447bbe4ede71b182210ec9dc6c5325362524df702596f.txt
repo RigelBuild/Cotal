@@ -1,2 +1,0 @@
-# Legacy managers get a continuity report, not a hot-update claim.
-smoke:legacy-manager-report

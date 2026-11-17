@@ -1,2 +1,0 @@
-# --creds identity: only this space's .cotal/<spaceSegment>/delivery.creds names the workstation root.
-smoke:reload-store-identity

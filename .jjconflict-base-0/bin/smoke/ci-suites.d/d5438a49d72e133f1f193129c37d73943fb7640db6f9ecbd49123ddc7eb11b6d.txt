@@ -1,3 +1,0 @@
-# The service caller payload bootstrap and its withdraw, policy, close and reopen runs.
-# Its smoke file had no script and no fragment, so nothing ran it.
-smoke:service-caller-payload

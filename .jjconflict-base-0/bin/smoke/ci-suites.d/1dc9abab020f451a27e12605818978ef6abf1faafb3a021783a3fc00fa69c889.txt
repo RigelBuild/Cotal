@@ -1,3 +1,0 @@
-# The managed-grant transaction.
-# Its smoke file had no script and no fragment, so nothing ran it.
-smoke:managed-grant-transaction

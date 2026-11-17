@@ -1,2 +1,0 @@
-# Browser presence facts use the canonical ages on both dashboard views (#3684).
-smoke:web-presence-ages

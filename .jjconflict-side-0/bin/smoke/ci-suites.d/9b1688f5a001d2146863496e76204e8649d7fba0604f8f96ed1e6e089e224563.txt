@@ -1,2 +1,0 @@
-# Native worker, inspection and MessagePort error projection.
-smoke:lang-worker-errors

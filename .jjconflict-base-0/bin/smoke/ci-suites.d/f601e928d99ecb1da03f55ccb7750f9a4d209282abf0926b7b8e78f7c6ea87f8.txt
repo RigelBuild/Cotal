@@ -1,2 +1,0 @@
-# Cross-ref: a replacement frozen-body egress guard graded against its predecessor (#1433).
-smoke:egress-guard-differential

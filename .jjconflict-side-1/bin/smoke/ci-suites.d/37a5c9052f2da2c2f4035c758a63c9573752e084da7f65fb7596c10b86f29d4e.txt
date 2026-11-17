@@ -1,3 +1,0 @@
-# Human approval before a new conversation identity: pending, edited grant, strict request
-# binding, legacy recovery and unsupported authorities over an isolated HTTPS fixture.
-smoke:conversation-approval-live

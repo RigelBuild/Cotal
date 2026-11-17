@@ -1,2 +1,0 @@
-# A failed team launch's journal yields a removable stopped receipt only when it records every effect.
-smoke:team-stopped-attempt

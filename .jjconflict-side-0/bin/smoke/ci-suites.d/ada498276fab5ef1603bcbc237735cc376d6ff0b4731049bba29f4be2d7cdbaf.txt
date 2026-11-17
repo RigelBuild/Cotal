@@ -1,2 +1,0 @@
-# The chat command's declaration, help, grammar, mode dispatch and close exit codes. No broker.
-smoke:chat-command

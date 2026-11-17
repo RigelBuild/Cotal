@@ -1,3 +1,0 @@
-# cotal runtimes, ps and models on the structured output contract: reports, plain text, envelopes,
-# partial reads and refusals before any request.
-smoke:read-envelopes

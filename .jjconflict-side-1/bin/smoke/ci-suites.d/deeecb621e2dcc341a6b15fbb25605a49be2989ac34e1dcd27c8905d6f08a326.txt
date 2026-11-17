@@ -1,3 +1,0 @@
-# Stored copies for an agent that follows a channel family (review.>): fan-out, the reader's re-check
-# and one copy per agent, against a real auth broker.
-smoke:channel-family:auth

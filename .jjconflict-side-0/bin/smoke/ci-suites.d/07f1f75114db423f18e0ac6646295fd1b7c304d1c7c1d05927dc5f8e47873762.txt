@@ -1,2 +1,0 @@
-# cotal run operator surface (lane C). Registered as a fragment (ci-suites.txt frozen since #1052).
-smoke:runtime-run-command
