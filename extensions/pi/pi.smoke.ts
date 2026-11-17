@@ -1360,13 +1360,115 @@ for (const assistant of [
   // the 5ms timer on Windows' coarse (~15ms) granularity, where both round to the same tick.
   await new Promise((resolve) => setTimeout(resolve, 120));
   ok(driver.state === "held" && mesh.drained.length === 0, "watchdog expiry holds without acknowledgement");
+  await driver.flushPresence();
+  ok(
+    mesh.statuses.at(-1)?.status === "working" && mesh.statuses.at(-1)?.activity === `steer queued (batch ${details.batchId})`,
+    "a watchdog expiry shows the queued steer as working, not waiting",
+  );
   mesh.items.push(item("new"));
   driver.onIncoming(mesh.items.at(-1)!);
   ok(host.sent.length === 1, "watchdog hold blocks a competing dispatch");
   driver.onMessageStart({ role: "custom", customType: "cotal-inbox", details });
+  await driver.flushPresence();
+  ok(
+    driver.state !== "held" && mesh.statuses.at(-1)?.status === "working" && mesh.statuses.at(-1)?.activity === "thinking",
+    "a late message_start returns the seat to its normal presence",
+  );
   confirm(driver, details);
   driver.onAgentEnd([{ role: "assistant", stopReason: "stop" }], ctx);
   ok(mesh.drained.join() === "slow", "late lifecycle confirmation remains associated with the original batch");
+}
+
+// A dispatch Pi rejects outright is a real error, not a slow start: it stays a visible waiting hold.
+{
+  const mesh = new FakeMesh();
+  mesh.items = [item("refused-dispatch")];
+  const rejecting: PiHost = {
+    sendMessage(): void {
+      throw new Error("pi refused the message");
+    },
+  };
+  const driver = new PiDriver(mesh as unknown as MeshAgent);
+  driver.bind(rejecting);
+  driver.onSessionStart(context());
+  await driver.flushPresence();
+  ok(driver.state === "held", "a rejected dispatch holds the seat");
+  ok(
+    mesh.statuses.at(-1)?.status === "waiting" &&
+      /Pi rejected Cotal dispatch: pi refused the message/.test(mesh.statuses.at(-1)?.activity ?? ""),
+    "a real dispatch error still shows the seat as waiting",
+  );
+}
+
+// A steer dispatched while Pi is idle that Pi never starts: the watchdog holds the seat as working,
+// and the lost-steer path re-dispatches it from the inbox once Pi settles, so no seat stays working forever.
+{
+  const mesh = new FakeMesh();
+  mesh.items = [item("idle-never-starts")];
+  const host = new FakeHost();
+  const ctx = context();
+  ctx.idle = true;
+  ctx.pending = false;
+  const driver = new PiDriver(mesh as unknown as MeshAgent, 20, 50);
+  driver.bind(host);
+  driver.onSessionStart(ctx);
+  const first = host.sent[0]!.details;
+  await delay(60);
+  await driver.flushPresence();
+  ok(
+    mesh.statuses.at(-1)?.status === "working" && mesh.statuses.at(-1)?.activity === `steer queued (batch ${first.batchId})`,
+    "an idle dispatch Pi never starts shows the queued steer as working while the watchdog holds",
+  );
+  for (let waited = 0; host.sent.length < 2 && waited < 2_000; waited += 20) await delay(20);
+  ok(
+    host.sent.length === 2 && host.sent[1]?.details.ids.join() === "idle-never-starts" && host.sent[1]?.details.batchId !== first.batchId,
+    "a steer Pi never starts is re-dispatched from the inbox instead of staying working forever",
+  );
+}
+
+// The lost-steer watch re-dispatches only the hold it was armed for. A terminal hold that lands later
+// in the same run (a user abort, or a history refusal) must stand: once the settle window passes,
+// nothing is re-dispatched and the terminal hold keeps the seat.
+for (const ending of [
+  {
+    label: "a user abort",
+    assistant: { role: "assistant", stopReason: "aborted" },
+    abort: true,
+    reason: /Pi turn was aborted/,
+  },
+  {
+    label: "a history refusal",
+    assistant: { role: "assistant", stopReason: "error", errorMessage: "Refusal (reasoning_extraction)" },
+    abort: false,
+    reason: /provider refused this session's history/,
+  },
+]) {
+  const mesh = new FakeMesh();
+  const host = new FakeHost();
+  const controller = new AbortController();
+  const ctx = context(controller.signal);
+  const driver = new PiDriver(mesh as unknown as MeshAgent, 20, 50);
+  driver.bind(host);
+  driver.onSessionStart(ctx);
+  driver.onAgentStart(ctx);
+  driver.onToolStart("bash");
+  mesh.items.push(item("m1"));
+  driver.onIncoming(mesh.items.at(-1)!);
+  await delay(60);
+  ok(driver.state === "held" && host.sent.length === 1, `${ending.label}: the watchdog holds the mid-run steer`);
+  if (ending.abort) controller.abort();
+  ctx.idle = true;
+  ctx.pending = false;
+  driver.onAgentEnd([ending.assistant], ctx);
+  await delay(400);
+  ok(host.sent.length === 1 && mesh.drained.length === 0,
+    `${ending.label} is not re-dispatched after the lost-steer settle window`);
+  ok(driver.state === "held" && ending.reason.test(driver.reason ?? ""), `${ending.label} keeps its own terminal hold`);
+  await driver.flushPresence();
+  ok(
+    mesh.statuses.at(-1)?.status === "waiting" && ending.reason.test(mesh.statuses.at(-1)?.activity ?? ""),
+    `${ending.label} shows its own terminal hold as waiting`,
+  );
 }
 
 // Presence writes complete in callback invocation order despite asynchronous operations.
