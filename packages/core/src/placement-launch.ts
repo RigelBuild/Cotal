@@ -367,7 +367,7 @@ function parseRuntimeAssets(raw: unknown, what: string): RuntimeAssets {
   if (!isContractDigest(value.digest) || !isContractDigest(value.baselineConfigDigest) || !isContractDigest(value.modelCatalogDigest) ||
       !isContractDigest(value.personaCatalogDigest) || !isContractDigest(value.extensionsDigest) || !isContractDigest(value.rulesSkillsDigest) ||
       !isContractDigest(value.cliClosureDigest)) fail(what, "digest fields are malformed");
-  const toolBindings = value.toolBindings.map((entry, index) => {
+  const toolBindings = value.toolBindings.map((entry: unknown, index: number) => {
     const binding = objectOf(entry, `${what} toolBindings[${index}]`);
     exactKeys(binding, ["id", "endpoint", "entitlementRef"], `${what} toolBindings[${index}]`);
     if (!isString(binding.id) || !isString(binding.endpoint) || !isString(binding.entitlementRef)) fail(what, "toolBindings entries are malformed");
