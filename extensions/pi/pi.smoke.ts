@@ -1400,6 +1400,32 @@ for (const assistant of [
   );
 }
 
+// A steer dispatched while Pi is idle that Pi never starts: the watchdog holds the seat as working,
+// and the lost-steer path re-dispatches it from the inbox once Pi settles, so no seat stays working forever.
+{
+  const mesh = new FakeMesh();
+  mesh.items = [item("idle-never-starts")];
+  const host = new FakeHost();
+  const ctx = context();
+  ctx.idle = true;
+  ctx.pending = false;
+  const driver = new PiDriver(mesh as unknown as MeshAgent, 20, 50);
+  driver.bind(host);
+  driver.onSessionStart(ctx);
+  const first = host.sent[0]!.details;
+  await delay(60);
+  await driver.flushPresence();
+  ok(
+    mesh.statuses.at(-1)?.status === "working" && mesh.statuses.at(-1)?.activity === `steer queued (batch ${first.batchId})`,
+    "an idle dispatch Pi never starts shows the queued steer as working while the watchdog holds",
+  );
+  for (let waited = 0; host.sent.length < 2 && waited < 2_000; waited += 20) await delay(20);
+  ok(
+    host.sent.length === 2 && host.sent[1]?.details.ids.join() === "idle-never-starts" && host.sent[1]?.details.batchId !== first.batchId,
+    "a steer Pi never starts is re-dispatched from the inbox instead of staying working forever",
+  );
+}
+
 // Presence writes complete in callback invocation order despite asynchronous operations.
 {
   const mesh = new FakeMesh();
