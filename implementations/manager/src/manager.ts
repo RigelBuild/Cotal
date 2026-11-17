@@ -4750,6 +4750,7 @@ export class Manager {
       if (!a) throw new EpEnvelopeError("expired", `target ${t.owner}.${t.actor} (lifecycle ${t.lifecycleUid}) is not a live managed agent of this manager`, undefined, "not-executed");
       return a;
     };
+    const placementLaunch = createPlacementLaunchHandlers({ configured: false, port: () => undefined });
     return managerCommandDefs({
       roster: (ctx) => this.serveObservation(ctx, async () => {
         if (this.userMode) throw new EpEnvelopeError("unavailable", "user-mode roster is served by auth");
@@ -5026,7 +5027,8 @@ export class Manager {
           throw new EpEnvelopeError("failed-precondition", "transcript-receive: this manager does not receive carried transcripts (its remote authority issues no transfer reader)");
         return this.transcripts.receive(args(ctx) as unknown as TranscriptReceiveInput);
       })),
-      ...createPlacementLaunchHandlers({ configured: false, port: () => undefined }),
+      prepareLaunch: (ctx) => this.serveGated(ctx, () => placementLaunch.prepareLaunch(ctx)),
+      place: (ctx) => this.serveGated(ctx, () => placementLaunch.place(ctx)),
     });
   }
 

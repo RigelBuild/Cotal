@@ -26,11 +26,11 @@
       "cell": "the resolved surface matches the shipped cluster document"
     },
     {
-      "name": "M2 keep revision 51 after adding roster",
+      "name": "M2 keep revision 52 after adding prepare-launch and place",
       "file": "implementations/manager/src/manager-service-contract.ts",
       "find": "  return buildClusterDocument(MANAGER_CLUSTER_URN, 53, ROWS);",
-      "replace": "  return buildClusterDocument(MANAGER_CLUSTER_URN, 51, ROWS);",
-      "cell": "roster advances the manager cluster revision and retains existing commands"
+      "replace": "  return buildClusterDocument(MANAGER_CLUSTER_URN, 52, ROWS);",
+      "cell": "the revision 53 surface retains roster and existing commands"
     },
     {
       "name": "M3 compile every contract pair at module scope again",
