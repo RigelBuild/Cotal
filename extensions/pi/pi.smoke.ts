@@ -1360,13 +1360,44 @@ for (const assistant of [
   // the 5ms timer on Windows' coarse (~15ms) granularity, where both round to the same tick.
   await new Promise((resolve) => setTimeout(resolve, 120));
   ok(driver.state === "held" && mesh.drained.length === 0, "watchdog expiry holds without acknowledgement");
+  await driver.flushPresence();
+  ok(
+    mesh.statuses.at(-1)?.status === "working" && mesh.statuses.at(-1)?.activity === `steer queued (batch ${details.batchId})`,
+    "a watchdog expiry shows the queued steer as working, not waiting",
+  );
   mesh.items.push(item("new"));
   driver.onIncoming(mesh.items.at(-1)!);
   ok(host.sent.length === 1, "watchdog hold blocks a competing dispatch");
   driver.onMessageStart({ role: "custom", customType: "cotal-inbox", details });
+  await driver.flushPresence();
+  ok(
+    driver.state !== "held" && mesh.statuses.at(-1)?.status === "working" && mesh.statuses.at(-1)?.activity === "thinking",
+    "a late message_start returns the seat to its normal presence",
+  );
   confirm(driver, details);
   driver.onAgentEnd([{ role: "assistant", stopReason: "stop" }], ctx);
   ok(mesh.drained.join() === "slow", "late lifecycle confirmation remains associated with the original batch");
+}
+
+// A dispatch Pi rejects outright is a real error, not a slow start: it stays a visible waiting hold.
+{
+  const mesh = new FakeMesh();
+  mesh.items = [item("refused-dispatch")];
+  const rejecting: PiHost = {
+    sendMessage(): void {
+      throw new Error("pi refused the message");
+    },
+  };
+  const driver = new PiDriver(mesh as unknown as MeshAgent);
+  driver.bind(rejecting);
+  driver.onSessionStart(context());
+  await driver.flushPresence();
+  ok(driver.state === "held", "a rejected dispatch holds the seat");
+  ok(
+    mesh.statuses.at(-1)?.status === "waiting" &&
+      /Pi rejected Cotal dispatch: pi refused the message/.test(mesh.statuses.at(-1)?.activity ?? ""),
+    "a real dispatch error still shows the seat as waiting",
+  );
 }
 
 // Presence writes complete in callback invocation order despite asynchronous operations.

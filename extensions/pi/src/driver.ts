@@ -449,7 +449,7 @@ export class PiDriver {
       if (!batch.started) {
         batch.watchdog = setTimeout(() => {
           if (batch.started) return;
-          this.hold(`Pi did not start dispatched Cotal batch ${batch.id}`);
+          this.hold(`Pi did not start dispatched Cotal batch ${batch.id}`, batch.id);
           this.startHoldBatchId = batch.id;
         }, this.startTimeoutMs);
         batch.watchdog.unref?.();
@@ -605,7 +605,9 @@ export class PiDriver {
     this.dispatch(batch);
   }
 
-  private hold(reason: string): void {
+  /** The start watchdog passes `queuedBatchId`: Pi still holds that steer, so the roster shows it
+   *  working rather than waiting. The hold itself is unchanged. */
+  private hold(reason: string, queuedBatchId?: string): void {
     if (this._state === "shuttingDown") return;
     this.retryableErrorHold = false;
     this.startHoldBatchId = undefined;
@@ -615,7 +617,8 @@ export class PiDriver {
     // A once task in a batch Pi has not confirmed may have run in part: it is sealed and reported,
     // never dispatched again.
     for (const batch of this.batches) if (!batch.confirmed && batch.turnIds) this.mesh.releaseTurns(batch.turnIds);
-    this.enqueuePresence("waiting", reason);
+    if (queuedBatchId) this.enqueuePresence("working", `steer queued (batch ${queuedBatchId})`);
+    else this.enqueuePresence("waiting", reason);
     if (this.context?.hasUI) this.context.ui.notify(`Cotal delivery held: ${reason}`, "warning");
   }
 
