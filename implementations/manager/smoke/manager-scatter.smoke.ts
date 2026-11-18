@@ -15,7 +15,7 @@
  * Run: pnpm smoke:manager-scatter   (needs nats-server + node on PATH; boots its own JWT broker)
  */
 import { randomUUID } from "node:crypto";
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { SMOKE_BROKER_TOKEN, freePort, teardownOnSignal } from "@cotal-ai/smoke-kit";
 import { tmpdir } from "node:os";
@@ -35,6 +35,9 @@ const {
 const { authDir, saveSpaceAuth, recordMesh } = await import("@cotal-ai/workspace");
 const { Manager } = await import("../src/manager.js");
 const { MANAGER_ENDPOINT } = await import("../src/manager-service-contract.js");
+// Dynamic because these modules read COTAL_HOME at load, which line 28 sets first.
+const { scatterManager } = await import("@cotal-ai/workspace/control");
+const { allowlistStatusAmbiguity } = await import("../../cli/src/commands/allowlist.js");
 
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
 let pass = 0, fail = 0;
@@ -190,6 +193,61 @@ try {
   await wait(200);
   rmSync(dir, { recursive: true, force: true });
   releaseBroker?.(); // last: ownership is held until this teardown has actually finished
+}
+
+// An unpinned `allowlist set` preflight on a ONE-manager space must not refuse as ambiguous.
+// It scatters `managerStatus` through the real `scatterManager` on its own one-manager broker. The
+// cells above scatter only `ps`, which is why none of them caught a `status` row missing from the
+// `all` rail.
+{
+  const sdir = mkdtempSync(join(tmpdir(), SMOKE_BROKER_TOKEN));
+  const sport = await freePort();
+  const sservers = `nats://127.0.0.1:${sport}`;
+  const sspace = `mgrallow-${randomUUID().slice(0, 8)}`;
+  const sauth = await createSpaceAuth(sspace);
+  const sroot = join(sdir, "ws1");
+  mkdirSync(join(sroot, ".cotal", "agents"), { recursive: true });
+  saveSpaceAuth(authDir(sroot), sauth);
+  writeFileSync(join(sdir, "server.conf"), serverConfig(sauth, [sauth], { transport: { kind: "plaintext" }, port: sport, storeDir: join(sdir, "js") }));
+  const skids: ChildProcess[] = [];
+  let sm: InstanceType<typeof Manager> | undefined;
+  let srelease: (() => void) | undefined;
+  try {
+    const srv = spawn("nats-server", ["-c", join(sdir, "server.conf")], { stdio: "ignore" });
+    skids.push(srv);
+    srelease = teardownOnSignal(srv, sdir);
+    let up = false;
+    for (let i = 0; i < 60; i++) { if (await isReachable(sservers)) { up = true; break; } await wait(200); }
+    if (!up) throw new Error(`one-manager nats-server did not come up on ${sport}`);
+    await setupSpaceStreams({ servers: sservers, space: sspace, creds: await mintCreds(sauth, newIdentity(), "provisioner") });
+    recordMesh({ space: sspace, server: sservers, root: sroot, mode: "auth", ts: new Date().toISOString() });
+    sm = new Manager({ space: sspace, servers: sservers, runtime: "pty", workspaceRoot: sroot });
+    await sm.start();
+    const sid = (sm as unknown as MgrPriv).managerInstanceId;
+    // The mint `resolveControlTarget` gives `cotal allowlist set` on a static mesh, with no --on pin.
+    const cid = newIdentity();
+    const cuid = mintLifecycleUid();
+    const creds = await mintCreds(sauth, cid, "control-caller-privileged", { lifecycleUid: cuid });
+    const epCaller: EpCaller = { owner: DEV_OWNER, actor: cid.id, uid: cuid };
+    const status = await scatterManager(
+      { versionSkew: (detail) => detail, roster: async () => [] },
+      sspace, sservers, "managerStatus", { creds, epCaller }, sauth,
+    );
+    const ambiguity = status.ok ? allowlistStatusAmbiguity(status.instances) : `scatter refused: ${status.error}`;
+    check("the one manager answered the status scatter with its data", status.ok && status.instances.some((i) => i.instanceId === sid && i.reachable && i.data !== undefined), status);
+    check("an unpinned allowlist-set preflight on a one-manager space passes (no ambiguity)", ambiguity === undefined, { ambiguity });
+  } catch (e) {
+    fail++;
+    console.log(`  ✗ FAIL: one-manager allowlist preflight threw: ${e instanceof Error ? e.message : String(e)}`);
+  } finally {
+    await sm?.stop({ withAgents: true }).catch(() => {});
+    for (const k of skids) { try { k.kill("SIGKILL"); } catch { /* best effort */ } }
+    await wait(200);
+    rmSync(sdir, { recursive: true, force: true });
+    // recordMesh recreated COTAL_HOME under dir after the first block removed it.
+    rmSync(dir, { recursive: true, force: true });
+    srelease?.();
+  }
 }
 
 console.log(`\n${fail === 0 ? "MANAGER CLASS-SCATTER SMOKE OK ✅" : "MANAGER CLASS-SCATTER SMOKE FAILED"}  (${pass} passed, ${fail} failed)`);
