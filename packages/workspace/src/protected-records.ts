@@ -193,6 +193,8 @@ export interface AccountDatabase {
  *  user private group, on an entry with no extended ACL. */
 export interface ProtectedPathPolicy {
   readonly uid: number;
+  /** The platform whose system rules apply; only macOS trusts a root-owned ancestor in group daemon. */
+  readonly platform: NodeJS.Platform;
   /** Why `gid` is not proven to be the caller's user private group, or undefined when it is. */
   readonly privateGroupGap: (gid: number) => string | undefined;
   /** `getfacl --skip-base --absolute-names -- <path>` output, empty when the path has only base
@@ -270,10 +272,11 @@ export function privateGroupGap(accounts: AccountDatabase, uid: number, gid: num
 /** A proven private group holds for the life of the policy, which for the system policy is the
  *  process. Every other verdict is read again on the next check, so a transient lookup failure
  *  does not stick in a long-lived service. */
-export function protectedPathPolicy(accounts: AccountDatabase, extendedAcl: (path: string) => string, uid: number): ProtectedPathPolicy {
+export function protectedPathPolicy(accounts: AccountDatabase, extendedAcl: (path: string) => string, uid: number, platform: NodeJS.Platform = process.platform): ProtectedPathPolicy {
   const proven = new Set<number>();
   return {
     uid,
+    platform,
     privateGroupGap: (gid) => {
       if (proven.has(gid)) return undefined;
       const gap = privateGroupGap(accounts, uid, gid);
@@ -325,7 +328,7 @@ const systemAccounts: AccountDatabase = {
 const systemAcl = (path: string) => boundedRead("getfacl", "getfacl", ["--skip-base", "--absolute-names", "--", path]);
 
 let processPolicy: ProtectedPathPolicy | undefined;
-const systemPolicy = (): ProtectedPathPolicy => processPolicy ??= protectedPathPolicy(systemAccounts, systemAcl, process.getuid!());
+const systemPolicy = (): ProtectedPathPolicy => processPolicy ??= protectedPathPolicy(systemAccounts, systemAcl, process.getuid!(), process.platform);
 
 type EntryStat = Pick<Stats, "uid" | "gid" | "mode" | "isDirectory" | "isSymbolicLink">;
 
@@ -339,7 +342,8 @@ type ProtectionGap = { path: string; reason: string; fix: "physical" | "o-w" | "
 /** Why an existing entry is not protected against other local writers, or nothing when it is. Root
  *  or the caller must own it. Group write needs the caller's proven user private group and no
  *  extended ACL, whose named entries the group bits only mask. World write is never accepted. An
- *  `ancestor` walk also accepts a root-owned sticky directory such as /tmp. */
+ *  `ancestor` walk also accepts a root-owned sticky directory such as /tmp, and on macOS a root-owned
+ *  one in group daemon (1), such as /private/var/run. */
 function protectionGap(path: string, stat: EntryStat, options: { ancestor?: boolean; policy?: ProtectedPathPolicy }): ProtectionGap | undefined {
   const gap = (reason: string, fix: ProtectionGap["fix"]): ProtectionGap => ({ path, reason, fix });
   if (stat.isSymbolicLink()) return gap("is a symbolic link", "physical");
@@ -350,6 +354,8 @@ function protectionGap(path: string, stat: EntryStat, options: { ancestor?: bool
   if ((stat.mode & 0o002) !== 0) return gap("is writable by every local account", (stat.mode & 0o020) !== 0 ? "go-w" : "o-w");
   if ((stat.mode & 0o020) === 0) return undefined;
   const policy = options.policy ?? systemPolicy();
+  // macOS's daemon group (1) holds the root-owned /private/var/run; gid 1 is wheel on NixOS.
+  if (options.ancestor && stat.isDirectory() && stat.uid === 0 && stat.gid === 1 && policy.platform === "darwin") return undefined;
   const group = stat.uid === policy.uid ? policy.privateGroupGap(stat.gid) : "it is not owned by you";
   if (group) return gap(`is group-writable and ${group}`, "g-w");
   let acl: string;

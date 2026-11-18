@@ -3,13 +3,14 @@
  * database proves the group is the caller's user private group, as Debian's OpenSSH does for
  * StrictModes, the account list comes only from local name services, and the entry has no
  * extended ACL. World write, a foreign owner and a symlink always refuse, a root-owned sticky
- * ancestor is accepted, and a credential file keeps its owner-only rule. A declared adapter path in
- * Cotal's own install, as the launcher runs it, names `cotal update` as the fix. The account database and
- * the ACL read are injected, so no case reads this machine's accounts or ACLs. A record this account
- * may not open names the folder that withholds it, as does a store folder it may not enter or write,
- * each chmod step quoting a path a shell would split,
- * and a link keeps the no-follow refusal. Only `win32` selects the Windows record model; the platform
- * is passed in, so that runs here. Broker-free.
+ * ancestor is accepted, a root-owned ancestor in group daemon (1) is accepted on macOS only, and a
+ * credential file keeps its owner-only rule. A declared adapter path in Cotal's own install, as the
+ * launcher runs it, names `cotal update` as the fix. The account database and the ACL read are
+ * injected, so no case reads this machine's accounts or ACLs.
+ * A record this account may not open names the folder that withholds it, as does a store folder it
+ * may not enter or write, each chmod step quoting a path a shell would split, and a link keeps the
+ * no-follow refusal. Only `win32` selects the Windows record model; the platform is passed in, so
+ * that runs here. Broker-free.
  *
  * Run: pnpm smoke:protected-paths
  */
@@ -113,7 +114,7 @@ for (const [name, nsswitch, reason] of [
     user: (uid) => { calls.user++; return base.user(uid); },
     group: (gid) => { calls.group++; return base.group(gid); },
     users: () => { calls.users++; if (enumerationDown) throw new Error("getent passwd timed out"); return base.users(); },
-  }, noAcl, ME);
+  }, noAcl, ME, "linux");
   assert.match(policy.privateGroupGap(1000) ?? "accepted", /unavailable: getent passwd timed out$/, "a transient lookup failure refuses");
   enumerationDown = false;
   assert.equal(policy.privateGroupGap(1000), undefined, "the next check reads again and proves the group");
@@ -123,8 +124,8 @@ for (const [name, nsswitch, reason] of [
 
 // 3. The entry rule over stat shapes no test could create without root.
 const probes: string[] = [];
-const policy = protectedPathPolicy(accounts(), (path) => { probes.push(path); return ""; }, ME);
-const unproven: ProtectedPathPolicy = { uid: ME, privateGroupGap: () => "the private-group proof is unavailable: getent is not installed", extendedAcl: noAcl };
+const policy = protectedPathPolicy(accounts(), (path) => { probes.push(path); return ""; }, ME, "darwin");
+const unproven: ProtectedPathPolicy = { uid: ME, platform: "darwin", privateGroupGap: () => "the private-group proof is unavailable: getent is not installed", extendedAcl: noAcl };
 const DIR = 0o040000, FILE = 0o100000;
 const stat = (mode: number, uid = ME, gid = 1000, link = false) => ({
   uid, gid, mode, isDirectory: () => !link && (mode & 0o170000) === DIR, isSymbolicLink: () => link,
@@ -151,6 +152,18 @@ accepts(() => assertProtectedEntry("the declared adapter path", "/home/dev/bin/n
 accepts(() => assertProtectedEntry("the path", "/tmp", stat(DIR | 0o1777, 0, 0), { ancestor: true, policy }), "a root-owned sticky ancestor");
 refused(() => assertProtectedEntry("the path", "/tmp", stat(DIR | 0o1777, 0, 0), { policy }),
   /: \/tmp is writable by every local account$/, "chmod go-w /tmp", "a root-owned sticky adapter entry keeps the entry rule");
+accepts(() => assertProtectedEntry("the path", "/private/var/run", stat(DIR | 0o775, 0, 1), { ancestor: true, policy }), "a root-owned daemon-group ancestor, as macOS /private/var/run");
+const linux = protectedPathPolicy(accounts(), noAcl, ME, "linux");
+refused(() => assertProtectedEntry("the path", "/private/var/run", stat(DIR | 0o775, 0, 1), { ancestor: true, policy: linux }),
+  /: \/private\/var\/run is group-writable and it is not owned by you$/, "chmod g-w /private/var/run", "the daemon-group ancestor is refused on linux, where gid 1 is wheel");
+refused(() => assertProtectedEntry("the path", "/private/var/run", stat(DIR | 0o775, 0, 1), { policy }),
+  /: \/private\/var\/run is group-writable and it is not owned by you$/, "chmod g-w /private/var/run", "a root-owned daemon-group entry is not an ancestor");
+refused(() => assertProtectedEntry("the path", "/private/var/run", stat(DIR | 0o775, 0, 20), { ancestor: true, policy }),
+  /: \/private\/var\/run is group-writable and it is not owned by you$/, "chmod g-w /private/var/run", "a root-owned staff-group (gid 20) ancestor");
+refused(() => assertProtectedEntry("the path", "/private/var/run", stat(DIR | 0o777, 0, 1), { ancestor: true, policy }),
+  /: \/private\/var\/run is writable by every local account$/, "chmod go-w /private/var/run", "a root-owned world-writable daemon-group ancestor");
+refused(() => assertProtectedEntry("the path", "/private/var/run", stat(DIR | 0o775, 1001, 1), { ancestor: true, policy }),
+  /: \/private\/var\/run is owned by another account$/, "use a physical path owned by you or root, without symlinks", "a uid-1001 daemon-group ancestor");
 refused(() => assertProtectedEntry("the project root", "/home/dev/shared", stat(DIR | 0o777), { ancestor: true, policy }),
   /^the project root is not protected against other local writers: \/home\/dev\/shared is writable by every local account$/,
   "chmod go-w /home/dev/shared", "world write, even with a private group, removes group write in the same step");
@@ -168,7 +181,7 @@ refused(() => assertProtectedEntry("the path", "/home/dev/my work", stat(DIR | 0
 assert.deepEqual(probes, ["/home/dev/Projects", "/home/dev/bin/nats-server"], "the ACL is read only where the private-group proof accepts group write");
 
 // 4. An extended ACL can grant write that the group bits only mask, so a proven group is not enough.
-const aclPolicy = (acl: (path: string) => string) => protectedPathPolicy(accounts(), acl, ME);
+const aclPolicy = (acl: (path: string) => string) => protectedPathPolicy(accounts(), acl, ME, "linux");
 refused(() => assertProtectedEntry("the path", "/home/dev/acl", stat(DIR | 0o775), { ancestor: true, policy: aclPolicy(() => "# file: /home/dev/acl\nuser::rwx\nuser:eve:rwx\ngroup::rwx\nmask::rwx\nother::r-x\n\n") }),
   /: \/home\/dev\/acl is group-writable and has an extended ACL$/, "chmod g-w /home/dev/acl", "a named-user ACL entry");
 refused(() => assertProtectedEntry("the path", "/home/dev/acl", stat(DIR | 0o775), { ancestor: true, policy: aclPolicy(() => "# file: /home/dev/acl\nuser::rwx\ngroup::rwx\nother::r-x\ndefault:user:eve:rwx\n\n") }),
@@ -183,7 +196,7 @@ refused(() => assertProtectedEntry("the path", "/home/dev/Projects", stat(FILE |
 // 5. The same rule on real paths. The walk reads the whole chain, so the temporary directory and its
 //    ancestors must themselves be protected. These paths belong to the real caller, and no group on
 //    them is proven.
-const local: ProtectedPathPolicy = { uid: process.getuid!(), privateGroupGap: unproven.privateGroupGap, extendedAcl: noAcl };
+const local: ProtectedPathPolicy = { uid: process.getuid!(), platform: process.platform, privateGroupGap: unproven.privateGroupGap, extendedAcl: noAcl };
 const dir = mkdtempSync(join(tmpdir(), "cotal-protected-paths-"));
 try {
   const open = join(dir, "open");
@@ -448,5 +461,5 @@ for (const platform of ["linux", "darwin", "freebsd"] as const)
 assert.equal(localRecordAccess(), "posix", "this host selects the POSIX model");
 assert.equal(protectedFileAccessAvailable(), true, "this host has protected local-record access");
 
-console.log("protected-paths smoke: OK - a proven user private group without an extended ACL is accepted, other members, other primary accounts, non-local name services, extended ACLs and unavailable proofs refuse, only a proven group is cached, world write, foreign owners and symlinks always refuse, a root sticky ancestor is accepted, a credential keeps its owner-only rule, and only win32 selects the Windows record model");
+console.log("protected-paths smoke: OK - a proven user private group without an extended ACL is accepted, other members, other primary accounts, non-local name services, extended ACLs and unavailable proofs refuse, only a proven group is cached, world write, foreign owners and symlinks always refuse, a root sticky ancestor and a root-owned daemon-group ancestor are accepted on darwin only, a credential keeps its owner-only rule, and only win32 selects the Windows record model");
 emitSentinel({ passed: cells(), failed: 0 });
