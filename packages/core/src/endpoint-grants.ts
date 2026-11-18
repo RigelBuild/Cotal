@@ -404,11 +404,9 @@ export function operatorInstrumentCapabilities(tier: "privileged" | "admin", cal
   const caps: EpCapability[] = [
     ...MANAGER_READ_SNAP.map((command) => ({
       endpoint: BASELINE_LIFECYCLE_ENDPOINT, command,
-      // `ps` is the CLASS-SCATTER read (the `cotal ps` default): the instrument publishes it
-      // on the `all` scatter rail to gather every instance's rows in a multi-manager space. `slots`
-      // (`cotal ps --slots`, #1274) scatters the same way, one durable-row list per manager. The
-      // other reads stay `one`-only (anycast, or `inst` when a resolve pins `--on`).
-      ...(command === "ps" || command === "slots" ? { routes: ["one", "all"] as ("one" | "all")[] } : {}),
+      // `ps`, `slots` and `status` scatter across every instance: `cotal ps`, `ps --slots` (#1274), and the
+      // `allowlist set` preflight, which scatters `status` to find every manager. The rest stay `one`-only.
+      ...(command === "ps" || command === "slots" || command === "status" ? { routes: ["one", "all"] as ("one" | "all")[] } : {}),
     })),
     ...SPAWN_CREATE_SNAP.map((command) => ({ endpoint: BASELINE_LIFECYCLE_ENDPOINT, command })),
     // The placement read of the same `manager.spawn` class as the `spawn` row above: it has one

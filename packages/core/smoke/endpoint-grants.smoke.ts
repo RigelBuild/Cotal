@@ -227,11 +227,12 @@ c("chat-session-open/retire are untargeted operator rows and absent from the spa
   operatorInstrumentCapabilities("privileged").filter((cap) => cap.command.startsWith("chat-session-")).every((cap) => cap.target === undefined && cap.routes === undefined)
   && ![...spawnCallerCapabilities("u_abc"), ...runCallerCapabilities("u_abc"), ...baselineCallerCapabilities()].some((cap) => cap.command.startsWith("chat-session-"))
   && !(SPAWN_CREATE_COMMANDS as readonly string[]).some((cmd) => cmd.startsWith("chat-session-")));
-// The two class-scatter reads (`cotal ps` and `cotal ps --slots`) carry the `all` route beside
-// `one`; every other read is anycast-only. A `slots` row without `all` is exactly the #1274 hand
-// test's broker refusal on a static mesh: the CLI scatters it like `ps`.
-c("the instrument's `ps` and `slots` rows are the only reads minted on the scatter rail",
-  operatorInstrumentCapabilities("privileged").filter((cap) => cap.routes?.includes("all")).map((cap) => cap.command).join(",") === "ps,slots");
+// The class-scatter reads (`cotal ps`, `cotal ps --slots`, and the `status` read the `allowlist set`
+// preflight scatters to find every manager) carry the `all` route beside `one`; every other read is
+// anycast-only. A `status` row without `all` leaves that scatter silent: the broker refuses the
+// `all`-rail publish and the CLI reports the manager as unanswered.
+c("the instrument's `ps`, `slots` and `status` rows are the only reads minted on the scatter rail",
+  operatorInstrumentCapabilities("privileged").filter((cap) => cap.routes?.includes("all")).map((cap) => cap.command).join(",") === "status,ps,slots");
 // The `run` capability (SPEC 14.3): seven untargeted run-* rows (the keyed pair and run-cancel
 // included), self-targeted run-answer, PLUS the whole spawn set, and
 // nothing targeted beyond what spawn already carries. The implication is one-way: a spawn-only
