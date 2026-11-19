@@ -1,14 +1,12 @@
 /**
- * Placement wiring: the production reconciler authenticator, the reconciler principal config (the
- * `--reconciler-principal` flag and the manifest's `reconcilerPrincipal` field), and placement staying
- * unconfigured while only the authenticator is set. Each case prints one ✓ or ✗ line; the process
- * exits non-zero when any case fails.
+ * Placement wiring: the production reconciler authenticator, the reconciler key derived from the
+ * auth identity, and placement staying unconfigured while only the authenticator is set. Each case
+ * prints one ✓ or ✗ line; the process exits non-zero when any case fails.
  */
 import assert from "node:assert/strict";
-import { EpEnvelopeError, type EpServeContext } from "@cotal-ai/core";
 import * as enrollment from "../src/placement-enrollment.js";
 import * as service from "../src/service.js";
-import { createPlacementDoorHandlers } from "../src/placement-participant-door.js";
+import { platformControlOwner } from "../src/derive.js";
 
 const OWNER = `u_${"a".repeat(26)}`;
 const OTHER_OWNER = `u_${"b".repeat(26)}`;
@@ -16,8 +14,6 @@ const RECONCILER_KEY = `${OWNER}.reconciler`;
 const OPERATION = "auth.verify-placement-enrollment";
 const DIGEST = `sha256:${"0".repeat(64)}`;
 
-const ctx = (caller: { owner: string; actor: string; uid: string }, args: Record<string, unknown>): EpServeContext =>
-  ({ subject: { caller }, request: { args } }) as unknown as EpServeContext;
 
 let failed = 0;
 async function check(name: string, run: () => unknown): Promise<void> {
@@ -30,58 +26,53 @@ async function check(name: string, run: () => unknown): Promise<void> {
   }
 }
 
-// ---- A2: the production authenticator admits exactly the configured owner.actor key ---------------
-await check("A2 admits the exact reconciler owner.actor key", async () => {
+const admits = async (auth: enrollment.ServiceAuthenticator, transportPrincipal: string) =>
+  auth.authenticateService({ transportPrincipal, operation: OPERATION, requestDigest: DIGEST });
+
+await check("the exact reconciler owner.actor key is admitted", async () => {
   const auth = enrollment.reconcilerServiceAuthenticator(RECONCILER_KEY);
-  assert.deepEqual(await auth.authenticateService({ transportPrincipal: RECONCILER_KEY, operation: OPERATION, requestDigest: DIGEST }), { principal: "reconciler" });
+  assert.deepEqual(await admits(auth, RECONCILER_KEY), { principal: "reconciler" });
 });
 
-await check("A2 refuses another owner's reconciler actor", async () => {
+await check("another owner's reconciler actor is refused", async () => {
   const auth = enrollment.reconcilerServiceAuthenticator(RECONCILER_KEY);
-  assert.deepEqual(await auth.authenticateService({ transportPrincipal: `${OTHER_OWNER}.reconciler`, operation: OPERATION, requestDigest: DIGEST }), { principal: "unauthorized" });
+  assert.deepEqual(await admits(auth, `${OTHER_OWNER}.reconciler`), { principal: "unauthorized" });
 });
 
-await check("A2 refuses an actor-only name and a suffix match", async () => {
+await check("an actor-only name and a suffix match are refused", async () => {
   const auth = enrollment.reconcilerServiceAuthenticator(RECONCILER_KEY);
   for (const transportPrincipal of ["reconciler", `${OWNER}x.reconciler`, `x${RECONCILER_KEY}`]) {
-    assert.deepEqual(await auth.authenticateService({ transportPrincipal, operation: OPERATION, requestDigest: DIGEST }), { principal: "unauthorized" }, transportPrincipal);
+    assert.deepEqual(await admits(auth, transportPrincipal), { principal: "unauthorized" }, transportPrincipal);
   }
 });
 
-// ---- A4: the reconciler principal reaches the lane options; placement stays unconfigured -----------
-await check("A4 manifest reconcilerPrincipal reaches the parsed lane settings", () => {
-  const text = JSON.stringify({ version: 2, spaces: [{ space: "main", reconcilerPrincipal: RECONCILER_KEY }, { space: "side" }] });
-  const manifest = service.parseAuthHostManifest(text);
-  assert.equal(manifest.settings.get("main")?.reconcilerPrincipal, RECONCILER_KEY);
-  assert.equal(manifest.settings.get("side")?.reconcilerPrincipal, undefined);
+await check("a key that extends the real key by one character is refused", async () => {
+  const auth = enrollment.reconcilerServiceAuthenticator(RECONCILER_KEY);
+  assert.deepEqual(await admits(auth, `${RECONCILER_KEY}x`), { principal: "unauthorized" });
 });
 
-await check("A4 --reconciler-principal reaches the single-space options", () => {
-  const parsed = service.authServiceConfiguration({
-    values: { space: "main", server: "nats://127.0.0.1:1", "reconciler-principal": RECONCILER_KEY },
-    positionals: [], raw: [], positionalIndices: [],
-  } as unknown as Parameters<typeof service.authServiceConfiguration>[0]);
-  assert.equal(parsed.reconcilerPrincipal, RECONCILER_KEY);
+await check("a key that differs only in case is refused", async () => {
+  const auth = enrollment.reconcilerServiceAuthenticator(RECONCILER_KEY);
+  assert.deepEqual(await admits(auth, `${OWNER}.Reconciler`), { principal: "unauthorized" });
 });
 
-await check("A4 only the authenticator leaves placement unconfigured", () => {
-  const configured = service.placementPortsConfigured({ placementAuthenticator: enrollment.reconcilerServiceAuthenticator(RECONCILER_KEY) });
-  assert.equal(configured, false);
+await check("the empty string is refused, also by an empty configured key", async () => {
+  assert.deepEqual(await admits(enrollment.reconcilerServiceAuthenticator(RECONCILER_KEY), ""), { principal: "unauthorized" });
+  assert.deepEqual(await admits(enrollment.reconcilerServiceAuthenticator(""), ""), { principal: "unauthorized" });
 });
 
-await check("A4 with only the authenticator, placement commands answer unimplemented", async () => {
-  const configured = service.placementPortsConfigured({ placementAuthenticator: enrollment.reconcilerServiceAuthenticator(RECONCILER_KEY) });
-  const handlers = createPlacementDoorHandlers({ configured, port: () => undefined });
-  const reconciler = { owner: OWNER, actor: "reconciler", uid: "reconcileruid" };
-  const runs: [string, () => Promise<unknown>][] = [
-    ["verify", () => handlers.verifyPlacementEnrollment(ctx(reconciler, {}))],
-    ["status", () => handlers.enrollmentEffectStatus(ctx(reconciler, {}))],
-    ["close", () => handlers.closeEnrollmentEffect(ctx(reconciler, {}))],
-    ["retire", () => handlers.retirePlacementEnrollment(ctx(reconciler, {}))],
-  ];
-  for (const [name, run] of runs) {
-    await assert.rejects(run(), (e: unknown) => e instanceof EpEnvelopeError && e.code === "unimplemented", name);
-  }
+await check("the reconciler key is the derived auth identity, owner.reconciler", () => {
+  const seed = "p".repeat(32);
+  const accountPublicKey = "A".repeat(56);
+  const derived = service.reconcilerPrincipalFor(seed, "main", accountPublicKey);
+  assert.equal(derived, `${platformControlOwner(seed, "main", accountPublicKey)}.reconciler`);
+});
+
+await check("the derived key is the one the authenticator admits", async () => {
+  const seed = "p".repeat(32);
+  const accountPublicKey = "A".repeat(56);
+  const auth = enrollment.reconcilerServiceAuthenticator(service.reconcilerPrincipalFor(seed, "main", accountPublicKey));
+  assert.deepEqual(await admits(auth, `${platformControlOwner(seed, "main", accountPublicKey)}.reconciler`), { principal: "reconciler" });
 });
 
 console.log(failed === 0 ? "placement wiring smoke passed" : `placement wiring smoke FAILED (${failed} failed)`);
