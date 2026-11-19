@@ -26,6 +26,39 @@ const HANDOFF_OP_ID = "22222222-2222-4222-8222-222222222222";
 const op = { operationId: OP_ID, name: "alpha", expectedSeatRevision: 6 };
 const handoffRequest = { restartOperationId: HANDOFF_OP_ID, name: "alpha", predecessorGeneration: 3, restartGeneration: 4 };
 
+// Valid bodies for the three execution commands: the closed shapes in launch-protocol.md § Agent management.
+const ACCEPT_ID = "66666666-6666-4666-8666-666666666666";
+const ENROLL_ID = "77777777-7777-4777-8777-777777777777";
+const DIGEST = `sha256:${"ab".repeat(32)}`;
+const claimOf = (uid: string) => ({ accountPublicKey: `A${"B".repeat(55)}`, instanceId: uid, managerLifecycleUid: uid, assignmentRevision: 1, currentRegistrationRevision: 1, serveEpoch: 1 });
+const lifecycleOf = (uid: string) => ({ space: "seats", owner: "local", actor: "operator", lifecycleUid: uid });
+const authorityOf = (uid: string) => ({
+  subject: { acceptanceId: ACCEPT_ID, enrollmentOperationId: ENROLL_ID, phase: "accepted" },
+  placementOperationId: OP_ID, intentDigest: DIGEST, claim: claimOf(uid), launchRevision: 1,
+});
+const executionBodies = (uid: string) => ({
+  acceptIntent: {
+    operationId: OP_ID, claim: claimOf(uid),
+    intent: {
+      placement: { space: "main", name: "alpha", desiredRevision: 6, seatRevision: 6, claim: claimOf(uid), generation: 1, operationId: OP_ID, workspace: "ws-alpha" },
+      cwd: "/work/alpha", workspaceDigest: DIGEST, persona: "reviewer", personaDigest: DIGEST,
+      profile: { name: "default", revision: "r1", configRevision: "c1", modelRoles: { main: "model-a" }, sha256: DIGEST },
+      role: "worker", roleTreeRevision: 3,
+      assets: {
+        revision: "a1", digest: DIGEST, imageDigest: "img-1", baselineConfigDigest: DIGEST, modelCatalogDigest: DIGEST, personaCatalogDigest: DIGEST,
+        extensionsDigest: DIGEST, rulesSkillsDigest: DIGEST, cliClosureDigest: DIGEST, toolBindings: [{ id: "t1", endpoint: "tools", entitlementRef: "e1" }],
+      },
+      key: { routing: { claude: "shared" }, limits: { keyCap: { usd: 5, window: { kind: "rolling", seconds: 3600 } } }, policyId: "policy-1" },
+      policyRevision: 2, restartGeneration: 0, digest: DIGEST,
+    },
+  },
+  acceptedIntent: { acceptanceId: ACCEPT_ID, authority: authorityOf(uid), actorTokenHash: "cd".repeat(32) },
+  bindEnrollment: {
+    operationId: OP_ID, authority: authorityOf(uid),
+    identity: { acceptanceId: ACCEPT_ID, enrollmentOperationId: ENROLL_ID, enrollmentRef: "enroll-ref-1", target: { seatName: "alpha", lifecycle: lifecycleOf(uid), generation: 1 }, intentDigest: DIGEST },
+  },
+});
+
 const suite = createSuite();
 const dir = mkdtempSync(join(tmpdir(), SMOKE_BROKER_TOKEN));
 const fake = await startFakeReconciler(dir);
@@ -164,6 +197,22 @@ try {
     "value" in upload && sent?.command === "wave-seats.handoff-upload" && sent.args.content === content
       && Buffer.from(String(sent.args.content), "base64").equals(bytes),
     { upload, sent, shimError });
+
+  // The three execution commands are served: each is forwarded under its own command name. A token
+  // the catalogue does not list is refused before it reaches the socket.
+  const bodies = executionBodies(lifecycleUid);
+  for (const [command, body] of [["accept-intent", bodies.acceptIntent], ["accepted-intent", bodies.acceptedIntent], ["bind-enrollment", bodies.bindEnrollment]] as const) {
+    const outcome = await invoke(command, body);
+    const sent = fake.received.at(-1);
+    suite.check(`${command} is served and forwarded as wave-seats.${command}`,
+      "value" in outcome && sent?.command === `wave-seats.${command}` && sent.subject.command === command && JSON.stringify(sent.args) === JSON.stringify(body),
+      { command, outcome: codeOf(outcome), shimError });
+  }
+  const beforeUnlisted = fake.received.length;
+  const unlisted = await invoke("enroll-placement", {});
+  suite.check("a token outside the seat catalogue is refused as not-found and never reaches the socket",
+    codeOf(unlisted) === "not-found" && fake.received.length === beforeUnlisted,
+    { unlisted: codeOf(unlisted), shimError });
 
   for (let i = 0; i < 20 && fake.openSockets() > 0; i++) await new Promise((r) => setTimeout(r, 50));
   suite.check("every reconciler connection is closed after its call", fake.received.length > 0 && fake.openSockets() === 0,
