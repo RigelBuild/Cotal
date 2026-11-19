@@ -266,6 +266,7 @@
     "smoke:reconciler-wire": "tsx implementations/auth/smoke/reconciler-wire.smoke.ts",
     "smoke:reconciler-fault": "tsx implementations/auth/smoke/reconciler-fault.smoke.ts",
     "smoke:reconciler-kube-tls": "tsx implementations/auth/smoke/reconciler-kube-tls.smoke.ts",
+    "smoke:serve-bundle": "tsx implementations/auth/smoke/serve-bundle.smoke.ts",
     "smoke:creds-supply-expiry": "tsx packages/core/smoke/creds-supply-expiry-auth.smoke.ts",
     "smoke:reconnect-fence-close": "tsx packages/core/smoke/reconnect-fence-close.smoke.ts",
     "smoke:transport-ping-defaults": "tsx packages/core/smoke/transport-ping-defaults.smoke.ts",
