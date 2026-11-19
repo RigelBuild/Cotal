@@ -604,6 +604,9 @@ importers:
       '@cotal-ai/lang':
         specifier: workspace:*
         version: link:../../packages/lang
+      '@cotal-ai/reconciler-shim':
+        specifier: workspace:*
+        version: link:../reconciler-shim
       '@cotal-ai/workspace':
         specifier: workspace:*
         version: link:../../packages/workspace
