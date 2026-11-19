@@ -166,7 +166,8 @@ try {
     { upload, sent, shimError });
 
   for (let i = 0; i < 20 && fake.openSockets() > 0; i++) await new Promise((r) => setTimeout(r, 50));
-  suite.check("every reconciler connection is closed after its call", fake.openSockets() === 0, { open: fake.openSockets(), shimError });
+  suite.check("every reconciler connection is closed after its call", fake.received.length > 0 && fake.openSockets() === 0,
+    { open: fake.openSockets(), received: fake.received.length, shimError });
 } finally {
   await caller?.stop().catch(() => {});
   await shim?.stop().catch(() => {});
