@@ -843,7 +843,7 @@ credential diverge (§2): the principal keys subjects/durables/presence; the con
 | `dm-reader` | `CONSUMER.INFO` and `CONSUMER.MSG.NEXT` on its own lifecycle-scoped `dm_…`, and its `$JS.ACK` subtree | own `_INBOX_<connId>.>` | no message publish, presence, channel, CHAT, `dlv_`, `$JS.API.INFO` or stream INFO row; bound to the bearer's expiry |
 | `webhook-publisher` | `inst.*.*.<owner>.<actor>` and `svc.*.<owner>.<actor>` | live presence roster; own `_INBOX_<connId>.>` replies | dedicated integration publisher; no chat, channel registry, control or presence writes |
 | `transfer-reader` | the stock delete marker on its own transfer bucket's meta subjects | its own `OBJ_cotal_xfer_<space>_<instanceId>` stream: info, message get, its push consumer, purge | one-shot per `transcript-receive` or sweep; no other instance's bucket |
-| `reconciler` | four untargeted `ep.one.auth.<command>.<owner>.<actor>.<uid>.*` placement request rows (nonce-only wildcard), caller-pinned `describe`, and EPC Direct Get | own `ep.reply.*.*.*.<owner>.<actor>.<uid>.*` rail and `_INBOX_<connId>.>` | standing-renewable, 24-hour default; the reconciler service renews the same caller triple before expiry and holds the space account signer; the host account signer can issue wider credentials and remains a trusted residual; no `ep.all`, `ep.inst`, `retire-lifecycle`, store reads beyond EPC, or executing rights |
+| `reconciler` | four untargeted `ep.one.auth.<command>.<owner>.<actor>.<uid>.*` placement request rows (nonce-only wildcard), caller-pinned `describe`, and EPC Direct Get | own `ep.reply.*.*.*.<owner>.<actor>.<uid>.*` rail and `_INBOX_<connId>.>` | standing-renewable, 24-hour default; auth issues and renews it at 75% of the lifetime for the same caller triple and nkey, where the owner is the account's platform control owner, and writes it to one Secret that only auth writes and only auth and the reconciler read; the reconciler holds no signer; no `ep.all`, `ep.inst`, `retire-lifecycle`, store reads beyond EPC, or executing rights |
 | scoped host profiles | least-privilege per function | least-privilege per function | The former allow-all `manager` is **deleted**; its host duties split into scoped, single-function creds (`supervisor`, `provisioner`, `delivery`, `membership-rw`, `operator`, `purger`, `teardown`, `channel-writer`, …). No allow-all credential exists. Appendix B summarizes them; the concrete grant lists are **generated from the §13.9 ownership matrix** into `provision.ts` (the matrix is the single oracle; `provision.ts` is its artifact, Appendix B its summary). |
 
 A Manager with explicit `execution: "none"` MUST construct no Runtime or connector workload.
@@ -7062,9 +7062,10 @@ single-function profiles, each granting only the verbs its function needs and no
   `ep.one.auth.<command>.<owner>.<actor>.<uid>.*` placement requests (nonce-only wildcard),
   caller-pinned wildcard-endpoint `describe`, and
   `$JS.API.DIRECT.GET.EPC_<space>.cotal.<space>.epc.>`; it subscribes only to its own
-  `ep.reply.*.*.*.<owner>.<actor>.<uid>.*` rail and `_INBOX_<connId>.>`. The 24-hour
-  credential is renewed by the reconciler service for the same caller triple. No `ep.all`,
-  `ep.inst`, `retire-lifecycle`, or other store or executing authority.
+  `ep.reply.*.*.*.<owner>.<actor>.<uid>.*` rail and `_INBOX_<connId>.>`. Auth issues the
+  24-hour credential and renews it at 75% of its lifetime for the same caller triple and nkey;
+  the reconciler holds no signer. No `ep.all`, `ep.inst`, `retire-lifecycle`, or other store or
+  executing authority.
 - `run-admitter`: one run's admission record or revocation marker (§14.8), minted per run for
   60 seconds; two exact keys and nothing else.
 - `transfer-writer`: one carried resume transcript (§8), minted per CLI call for five minutes, or on
@@ -7141,6 +7142,7 @@ Normative revisions of this document, newest first. Dated snapshots per §11; th
 
 | Date | Revision |
 | --- | --- |
+| 2026-11-19 | **Auth issues and renews the reconciler credential (§9, Appendix B).** The renewal owner moves from the reconciler service to auth. Auth renews at 75% of the 24-hour lifetime for the same caller triple and nkey, and writes only the user credential to one Secret that only auth writes. The reconciler holds no signer. Grants are unchanged. |
 | 2026-11-13 | **The reconciler caller profile grants the auth placement operations (§9, §13.9), additive.** Its standing-renewable 24-hour credential pins the caller triple and grants only the four untargeted placement requests, caller-pinned `describe`, EPC Direct Get, its reply rail and connection inbox. It adds no `ep.all`/`ep.inst`, `retire-lifecycle`, or store authority beyond EPC. |
 | 2026-11-11 | **Placement participant operations are auth endpoint commands, additive (§13.2, auth rail).** `verify-placement-enrollment`, `enrollment-effect-status`, `close-enrollment-effect`, and `retire-placement-enrollment` are served on the auth endpoint under capability `auth.placement`, untargeted, with closed input and output schemas. The transport principal is the broker-authenticated caller on the subject, admitted only as the configured reconciler. No caller credential profile mints these requests yet. A reader that does not call them sees no change. |
 | 2026-11-09 | **A spawn result says when its seat is not woken by mesh traffic (§13.6 item 6), additive.** A connector MAY declare that an idle seat is woken only after a confirmed startup. A plain spawn of such a seat whose startup watch ended `ready` succeeds, and its result's `startupNotice` carries the connector's clause; the seat's `ps` row carries the same field. A `once` spawn of such a seat is refused as before. A reader that does not read `startupNotice` sees an ordinary success. |

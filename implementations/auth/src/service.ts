@@ -74,6 +74,8 @@ import { findCotalRoot, loadManagerInstanceIdentity, parseSpaceManifest, runSpac
 import type { JournalEntry } from "@cotal-ai/lang";
 import { decodeJwt } from "jose";
 import { deriveOwnerForIdpSubject, platformControlOwner } from "./derive.js";
+import { KubeSecretStore, IN_CLUSTER_API_BASE } from "./kube-secret-store.js";
+import { RECONCILER_CREDS_KEY, secretRecordStore, startReconcilerCredential } from "./reconciler-credential.js";
 import { makePlatformControlAuthority, makePlatformControlReadiness, requireManagerAuthorityHolder, type ManagerAuthorityHolder } from "./platform-control.js";
 import { OwnedConnections, type AuthConnectionState, type AuthServiceClosed } from "./owned-connections.js";
 import { makePlatformSupervisorAuthority, makePlatformSupervisorEnd, platformSupervisorEnded, requirePlatformSupervisorAdmin, type PlatformSupervisorInput, type PlatformSupervisorAuthorityRequest } from "./platform-supervisor.js";
@@ -442,7 +444,8 @@ async function supervisorGeneration(session: IssuerSession, space: string, owner
   return accepted.ref;
 }
 
-/** Not wired yet: accepted and ignored. */
+/** Default off. Auth issues and renews the reconciler credential into this Secret. `store` is the
+ *  test seam; absent, the in-cluster Kubernetes Secret. */
 export interface ReconcilerSecretOptions {
   namespace: string;
   name: string;
@@ -463,6 +466,8 @@ export interface AuthServiceRuntimeOptions {
   registry?: RegistryService;
   /** Trusted-host only, 5..900 seconds. The native credential source owns renewal. */
   registryCredentialTtlSeconds?: number;
+  /** Default off: auth issues and renews the reconciler credential into this Secret. Only the
+   *  single-space `runAuthService` wires it. */
   reconcilerSecret?: ReconcilerSecretOptions;
 }
 
@@ -2385,7 +2390,20 @@ export function authServiceConfiguration(args: ParsedArgs) {
   const limits: AuthCalloutLimits | undefined = authTimeout === undefined ? undefined : { authTimeoutMs: authTimeout * 1000 };
   if (limits !== undefined) calloutLimits(limits);
 
-  return { space, spaces, server, port, publicFace, serviceEndpoints, registry: v.registry !== undefined, calloutOnly, calloutLimits: limits };
+  const reconcilerSecret = parseReconcilerSecret(v["reconciler-secret"], spaces !== undefined || calloutOnly);
+  return { space, spaces, server, port, publicFace, serviceEndpoints, registry: v.registry !== undefined, calloutOnly, calloutLimits: limits, reconcilerSecret };
+}
+
+/** Parse `--reconciler-secret <namespace/name>`. Absent is off. It wires one full single-space service,
+ *  so it is refused with `--spaces` and `--callout-only`, as the other single-space flags are. */
+function parseReconcilerSecret(raw: unknown, refused: boolean): ReconcilerSecretOptions | undefined {
+  if (raw === undefined) return undefined;
+  if (refused) throw new Error("auth-service: --reconciler-secret wires one full single-space service; drop it for --spaces and --callout-only");
+  const parts = typeof raw === "string" ? raw.split("/") : [];
+  const [namespace, name, ...rest] = parts;
+  if (parts.length !== 2 || !namespace || !name || rest.length > 0)
+    throw new Error(`auth-service: --reconciler-secret must be <namespace/name>, got "${String(raw)}"`);
+  return { namespace, name };
 }
 
 /** Trusted local embedding hooks. They carry no prepared key material or loopback capability. */
@@ -2411,9 +2429,10 @@ export interface AuthDaemonLifecycle extends AuthServiceRuntimeOptions {
 export async function runAuthService(args: ParsedArgs, store?: SecretStore, options: AuthServiceRuntimeOptions | AuthDaemonLifecycle = {}): Promise<void> {
   const interactiveManagerSelection = runtimeSelection(options);
   const lifecycle = "root" in options ? options : undefined;
-  const { space, spaces, server, port, publicFace, serviceEndpoints, registry: registryEnabled, calloutOnly, calloutLimits: limits } = authServiceConfiguration(args);
+  const { space, spaces, server, port, publicFace, serviceEndpoints, registry: registryEnabled, calloutOnly, calloutLimits: limits, reconcilerSecret: reconcilerFlag } = authServiceConfiguration(args);
   if (calloutOnly && (options.registry !== undefined || options.registryCredentialTtlSeconds !== undefined))
     throw new Error("auth-service: a callout-only replica cannot host a registry");
+  const reconcilerSecret = options.reconcilerSecret ?? reconcilerFlag;
   const registry = options.registry ?? (registryEnabled ? await extensionRegistry.load<RegistryService>("registry-service", "builtin") : undefined);
   // The provider's space-scoped state dir for NON-SEAM material (ledger, IdP pin, discovery). The
   // layout fact is workspace-owned (userAuthStateDir); this daemon never touches `.cotal/auth/auth.json`.
@@ -2467,6 +2486,7 @@ export async function runAuthService(args: ParsedArgs, store?: SecretStore, opti
     ...(registry !== undefined ? { registry } : {}),
     ...(options.registryCredentialTtlSeconds !== undefined ? { registryCredentialTtlSeconds: options.registryCredentialTtlSeconds } : {}),
     ...(limits !== undefined ? { calloutLimits: limits } : {}),
+    ...(reconcilerSecret !== undefined ? { reconcilerSecret } : {}),
   }).catch((e: unknown) => {
     // The launching `up` sees only this process exit. Leave a typed refusal (a plane-claim
     // refusal's code and reason, SPEC 13.13) where its readiness wait reads it (#3947).
@@ -2918,6 +2938,8 @@ interface AuthContextOptions extends AuthServiceRuntimeOptions {
   issuerSessionTtlSeconds?: number;
   serviceEndpoints?: OpenAuthAuthorityPlaneOptions["serviceEndpoints"];
   calloutLimits?: AuthCalloutLimits;
+  /** Default off. Present only when the single-space service enables the reconciler credential. */
+  reconcilerSecret?: ReconcilerSecretOptions;
   connectLimits?: Partial<ConnectLimits>;
   /** Diagnostics sink. Default `console.error`. */
   log?: (line: string) => void;
@@ -2989,7 +3011,20 @@ async function startAuthContext(o: AuthContextOptions): Promise<{ handle: Omit<A
     srv.closeAllConnections();
     await closed;
   };
+  let stopReconciler: (() => void) | undefined;
   try {
+    // Issued in the background after the plane opens: a failing Secret write retries there and never
+    // fails this start.
+    if (o.reconcilerSecret !== undefined) {
+      stopReconciler = startReconcilerCredential({
+        space,
+        auth: dataAccountAuth(space, keys.dataAccount),
+        owner: platformControlOwner(ownerSecret, space, keys.dataAccount.pub),
+        secrets: o.reconcilerSecret.store ?? new KubeSecretStore({ apiBase: IN_CLUSTER_API_BASE, namespace: o.reconcilerSecret.namespace, name: o.reconcilerSecret.name }),
+        records: secretRecordStore(secrets, space, RECONCILER_CREDS_KEY),
+        log,
+      });
+    }
     // ---- Plane 2: the callout, on its own callout-account connection ----
     nc = await dialerFor(server)({
       servers: server,
@@ -3147,6 +3182,7 @@ async function startAuthContext(o: AuthContextOptions): Promise<{ handle: Omit<A
       closeStarted = true;
       if (state === "ready") state = "draining";
       const flight = (async () => {
+        stopReconciler?.();
         const admissionFlight = closeAdmission ??= (async () => {
           await Promise.all([closeServer(http), closeServer(publicHttp)]);
           await reader?.client.then((c) => c.close(), () => {});
@@ -3323,6 +3359,7 @@ async function startAuthContext(o: AuthContextOptions): Promise<{ handle: Omit<A
     };
     return { handle: service, status, ended, abandon };
   } catch (e) {
+    stopReconciler?.();
     // A failed start releases only what THIS context acquired, in reverse order.
     await closeServer(publicHttp).catch(() => {});
     await closeServer(http).catch(() => {});
