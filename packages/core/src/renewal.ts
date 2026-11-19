@@ -79,6 +79,11 @@ export function renewalDeadlineMs(issuedAtMs: number, expiresAtMs: number): numb
   return issuedAtMs + RENEWAL_WINDOW.to * Math.max(0, expiresAtMs - issuedAtMs);
 }
 
+/** Not implemented yet: arms nothing. */
+export function armFixedRenewal(_issuedAtMs: number, _expiresAtMs: number, _renew: () => void): () => void {
+  return () => {};
+}
+
 /** The wait before retry `attempt` (0-based) of a failed renewal or cleanup: `baseMs` doubling to
  *  `capMs`, drawn from the upper half of that step so clients that failed together retry apart. */
 export function jitteredBackoffMs(attempt: number, baseMs: number, capMs: number): number {

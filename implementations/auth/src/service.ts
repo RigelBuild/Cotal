@@ -442,6 +442,13 @@ async function supervisorGeneration(session: IssuerSession, space: string, owner
   return accepted.ref;
 }
 
+/** Not wired yet: accepted and ignored. */
+export interface ReconcilerSecretOptions {
+  namespace: string;
+  name: string;
+  store?: SecretStore;
+}
+
 /** Trusted composition policy for unpinned interactive manager-caller requests. No request or CLI
  *  flag sets it. The local-primary policy refuses an unavailable local Manager without substitution. */
 export interface AuthServiceRuntimeOptions {
@@ -456,6 +463,7 @@ export interface AuthServiceRuntimeOptions {
   registry?: RegistryService;
   /** Trusted-host only, 5..900 seconds. The native credential source owns renewal. */
   registryCredentialTtlSeconds?: number;
+  reconcilerSecret?: ReconcilerSecretOptions;
 }
 
 function runtimeSelection(options: AuthServiceRuntimeOptions): AuthServiceRuntimeOptions["interactiveManagerSelection"] {
