@@ -586,3 +586,13 @@ export function createPlacementEnrollmentAuthority(options: PlacementEnrollmentA
   return { enrollPlacement, verifyPlacementEnrollment, enrollmentEffectStatus, closeEnrollmentEffect, retirePlacementEnrollment };
 }
 
+/** The production {@link ServiceAuthenticator}: admits exactly the configured reconciler `owner.actor`
+ *  key and nothing else. Any other key, including an actor-only name or a suffix match, is `unauthorized`. */
+export function reconcilerServiceAuthenticator(reconcilerKey: string): ServiceAuthenticator {
+  return {
+    authenticateService: async ({ transportPrincipal }) => ({
+      principal: transportPrincipal === reconcilerKey ? "reconciler" : "unauthorized",
+    }),
+  };
+}
+

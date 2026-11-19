@@ -360,7 +360,7 @@ const GOLDEN: Record<string, { flags: string[]; positionals: boolean; rawArgs?: 
       // its twin take it; the native service child, which runs the one primary, does not.
       "callout-only:boolean",
       "exchange-public-port:string", "exchange-public-url:string", "exchange-trusted-proxy:boolean",
-      "port:string", "registry:boolean", "server:string", "service-endpoints:boolean", "space:string",
+      "port:string", "reconciler-principal:string", "registry:boolean", "server:string", "service-endpoints:boolean", "space:string",
       // `--auth-timeout` (2026-10): the broker's auth callout timeout in seconds, from `up`.
       "auth-timeout:string",
       // `--spaces` (2026-10, #4819): several spaces served from one callout process.
@@ -372,7 +372,7 @@ const GOLDEN: Record<string, { flags: string[]; positionals: boolean; rawArgs?: 
     flags: [
       "advertised-server:string", "agent-provisioning-url:string", "callout-only:boolean",
       "exchange-public-port:string", "exchange-public-url:string", "exchange-trusted-proxy:boolean",
-      "port:string", "registry:boolean", "server:string", "service-endpoints:boolean", "space:string", "auth-timeout:string", "spaces:string",
+      "port:string", "reconciler-principal:string", "registry:boolean", "server:string", "service-endpoints:boolean", "space:string", "auth-timeout:string", "spaces:string",
     ],
     positionals: false,
   },
@@ -403,7 +403,7 @@ const GOLDEN: Record<string, { flags: string[]; positionals: boolean; rawArgs?: 
     flags: [
       "advertised-server:string", "agent-provisioning-url:string", "exchange-public-port:string",
       "exchange-public-url:string", "exchange-trusted-proxy:boolean", "launch-request:string", "port:string",
-      "ready-file:string", "registry:boolean", "root:string", "server:string", "service-endpoints:boolean", "service-instance:string",
+      "ready-file:string", "reconciler-principal:string", "registry:boolean", "root:string", "server:string", "service-endpoints:boolean", "service-instance:string",
       "space:string", "auth-timeout:string",
     ],
     positionals: false,

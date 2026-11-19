@@ -12,6 +12,7 @@ export const authServiceFlags = [
   { name: "agent-provisioning-url", type: "string", value: "<https://…>", description: "with --exchange-public-port: the deployment's remote agent-provisioning endpoint the public bundle advertises (spawn POSTs it with the login bearer)" },
   { name: "service-endpoints", type: "boolean", description: "host service endpoints: the public /service-endpoint-authority door and the /service-endpoint-host route for owner decisions and operator name binding" },
   { name: "registry", type: "boolean", description: "host this space's permission-scoped endpoint registry inside the auth service (default: off)" },
+  { name: "reconciler-principal", type: "string", value: "<owner.actor>", description: "the placement reconciler's broker-authenticated owner.actor key; the only principal admitted to the placement participant commands" },
   { name: "auth-timeout", type: "string", value: "<seconds>", description: "the broker's authorization timeout in whole seconds, which the callout answers inside (default: 2, nats-server's default)" },
   { name: "reconciler-secret", type: "string", value: "<namespace/name>", description: "issue and renew the reconciler credential into this Kubernetes Secret, written by auth (default: off; refused with --spaces and --callout-only)" },
 ] as const satisfies readonly FlagSpec[];

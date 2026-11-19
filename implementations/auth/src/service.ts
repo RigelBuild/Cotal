@@ -1,6 +1,6 @@
 import { registryStores } from "./lifecycle-registry.js";
 import { createToolResultConsentSigner, makeToolResultConsentRecorder, type ToolResultConsentRecorder, type ToolResultConsentSignerOptions } from "./tool-result-consent.js";
-import { boundPlacementDelivery, createPlacementEnrollmentAuthority, type PlacementEnrollmentAuthority } from "./placement-enrollment.js";
+import { boundPlacementDelivery, createPlacementEnrollmentAuthority, reconcilerServiceAuthenticator, type PlacementEnrollmentAuthority } from "./placement-enrollment.js";
 import type { PlacementEnrollmentResult } from "@cotal-ai/core";
 import type { ReconcilerPort, RolePolicyPort, ServiceAuthenticator } from "./placement-enrollment.js";
 /**
@@ -2391,7 +2391,9 @@ export function authServiceConfiguration(args: ParsedArgs) {
   if (limits !== undefined) calloutLimits(limits);
 
   const reconcilerSecret = parseReconcilerSecret(v["reconciler-secret"], spaces !== undefined || calloutOnly);
-  return { space, spaces, server, port, publicFace, serviceEndpoints, registry: v.registry !== undefined, calloutOnly, calloutLimits: limits, reconcilerSecret };
+  // The placement reconciler's broker-authenticated key. Absent: placement stays unconfigured.
+  const reconcilerPrincipal = v["reconciler-principal"];
+  return { space, spaces, server, port, publicFace, serviceEndpoints, registry: v.registry !== undefined, calloutOnly, calloutLimits: limits, reconcilerSecret, reconcilerPrincipal };
 }
 
 /** Parse `--reconciler-secret <namespace/name>`. Absent is off. It wires one full single-space service,
@@ -2404,6 +2406,11 @@ function parseReconcilerSecret(raw: unknown, refused: boolean): ReconcilerSecret
   if (parts.length !== 2 || !namespace || !name || rest.length > 0)
     throw new Error(`auth-service: --reconciler-secret must be <namespace/name>, got "${String(raw)}"`);
   return { namespace, name };
+}
+
+/** Whether all three placement ports are set. A plane with fewer refuses placement `unimplemented`. */
+export function placementPortsConfigured(o: Pick<AuthServiceRuntimeOptions, "placementReconciler" | "placementAuthenticator" | "placementRolePolicy">): boolean {
+  return Boolean(o.placementReconciler && o.placementAuthenticator && o.placementRolePolicy);
 }
 
 /** Trusted local embedding hooks. They carry no prepared key material or loopback capability. */
@@ -2429,7 +2436,7 @@ export interface AuthDaemonLifecycle extends AuthServiceRuntimeOptions {
 export async function runAuthService(args: ParsedArgs, store?: SecretStore, options: AuthServiceRuntimeOptions | AuthDaemonLifecycle = {}): Promise<void> {
   const interactiveManagerSelection = runtimeSelection(options);
   const lifecycle = "root" in options ? options : undefined;
-  const { space, spaces, server, port, publicFace, serviceEndpoints, registry: registryEnabled, calloutOnly, calloutLimits: limits, reconcilerSecret: reconcilerFlag } = authServiceConfiguration(args);
+  const { space, spaces, server, port, publicFace, serviceEndpoints, registry: registryEnabled, calloutOnly, calloutLimits: limits, reconcilerSecret: reconcilerFlag, reconcilerPrincipal } = authServiceConfiguration(args);
   if (calloutOnly && (options.registry !== undefined || options.registryCredentialTtlSeconds !== undefined))
     throw new Error("auth-service: a callout-only replica cannot host a registry");
   const reconcilerSecret = options.reconcilerSecret ?? reconcilerFlag;
@@ -2487,6 +2494,7 @@ export async function runAuthService(args: ParsedArgs, store?: SecretStore, opti
     ...(options.registryCredentialTtlSeconds !== undefined ? { registryCredentialTtlSeconds: options.registryCredentialTtlSeconds } : {}),
     ...(limits !== undefined ? { calloutLimits: limits } : {}),
     ...(reconcilerSecret !== undefined ? { reconcilerSecret } : {}),
+    ...(reconcilerPrincipal !== undefined ? { placementAuthenticator: reconcilerServiceAuthenticator(reconcilerPrincipal) } : {}),
   }).catch((e: unknown) => {
     // The launching `up` sees only this process exit. Leave a typed refusal (a plane-claim
     // refusal's code and reason, SPEC 13.13) where its readiness wait reads it (#3947).
@@ -2550,7 +2558,7 @@ const AUTH_HOST_FACE_FIELDS = ["exchangePublicPort", "exchangePublicUrl", "excha
 
 /** The fields of an `auth-service --spaces` manifest entry besides `space`: the public face, and
  *  `serviceEndpoints`, the per-space form of `--service-endpoints`. */
-const AUTH_HOST_ENTRY_FIELDS = [...AUTH_HOST_FACE_FIELDS, "serviceEndpoints", "registry"] as const;
+const AUTH_HOST_ENTRY_FIELDS = [...AUTH_HOST_FACE_FIELDS, "serviceEndpoints", "registry", "reconcilerPrincipal"] as const;
 
 /** One space's settings in an `auth-service --spaces` manifest, read from its entry. */
 export interface AuthHostEntry {
@@ -2561,6 +2569,8 @@ export interface AuthHostEntry {
   serviceEndpoints: boolean;
   /** Default off; only this lane hosts the registry when true. */
   registry?: boolean;
+  /** The placement reconciler's `owner.actor` key for this space. Absent: placement stays unconfigured. */
+  reconcilerPrincipal?: string;
 }
 
 /** Reads one space's public face from its entry's public-face fields, under the rules the flags
@@ -2595,10 +2605,11 @@ const authHostSettings: SpaceSettings<AuthHostEntry> = {
     const unknown = Object.keys(fields).filter((k) => !(AUTH_HOST_ENTRY_FIELDS as readonly string[]).includes(k));
     if (unknown.length) throw new Error(`unknown field(s) ${unknown.join(", ")}; an entry takes space, ${AUTH_HOST_ENTRY_FIELDS.join(", ")}`);
     const publicFace = authHostPublicFace(fields);
-    const { serviceEndpoints, registry } = fields;
+    const { serviceEndpoints, registry, reconcilerPrincipal } = fields;
     if (serviceEndpoints !== undefined && typeof serviceEndpoints !== "boolean") throw new Error(`serviceEndpoints must be true or false, got ${JSON.stringify(serviceEndpoints)}`);
     if (registry !== undefined && typeof registry !== "boolean") throw new Error("registry must be true or false");
-    return { publicFace, serviceEndpoints: serviceEndpoints === true, registry: registry === true };
+    if (reconcilerPrincipal !== undefined && typeof reconcilerPrincipal !== "string") throw new Error("reconcilerPrincipal must be a string");
+    return { publicFace, serviceEndpoints: serviceEndpoints === true, registry: registry === true, ...(reconcilerPrincipal !== undefined ? { reconcilerPrincipal } : {}) };
   },
   across(settings) {
     const ports = new Map<number, string>();
@@ -2631,6 +2642,7 @@ async function openAuthServiceLane(o: {
   publicFace: PublicFaceInput | null;
   serviceEndpoints: boolean;
   registry: boolean;
+  reconcilerPrincipal?: string;
   limits?: AuthCalloutLimits;
   runtime: AuthServiceRuntimeOptions;
   log: (line: string) => void;
@@ -2658,6 +2670,7 @@ async function openAuthServiceLane(o: {
     ...(o.runtime.runCancelLimits !== undefined ? { runCancelLimits: o.runtime.runCancelLimits } : {}),
     ...(registry !== undefined ? { registry, ...(o.runtime.registryCredentialTtlSeconds !== undefined ? { registryCredentialTtlSeconds: o.runtime.registryCredentialTtlSeconds } : {}) } : {}),
     ...(o.limits !== undefined ? { calloutLimits: o.limits } : {}),
+    ...(o.reconcilerPrincipal !== undefined ? { placementAuthenticator: reconcilerServiceAuthenticator(o.reconcilerPrincipal) } : {}),
     log,
   });
   const { url, publicUrl, cap } = started.handle;
@@ -2712,7 +2725,7 @@ async function runAuthServiceHost(args: { manifest: string; server: string; root
     startup: "servable",
     open: (space, entry) => openAuthServiceLane({
       space, server, root, secrets, hostedStore: store !== undefined, publicFace: entry.publicFace,
-      serviceEndpoints: entry.serviceEndpoints, registry: entry.registry === true, runtime: args.runtime, log: (l) => log(`[${space}] ${l}`),
+      serviceEndpoints: entry.serviceEndpoints, registry: entry.registry === true, reconcilerPrincipal: entry.reconcilerPrincipal, runtime: args.runtime, log: (l) => log(`[${space}] ${l}`),
       ...(args.limits !== undefined ? { limits: args.limits } : {}),
     }),
     label: "auth service host",
