@@ -18,7 +18,7 @@ import { readZellijPlacement, type AgentPlacement } from "./placement.js";
 const CONFIRM_BUDGET_MS = 1_000;
 
 export interface PrivateLauncher {
-  /** Runs the launcher script from `cwd`, so zellij's fallback pane title reads `./<agent>`. */
+  /** Runs the launcher script from `cwd`, so zellij's fallback pane title reads `./<agent>.cjs`. */
   readonly argv: string[];
   readonly cwd: string;
   readonly dir: string;
@@ -61,7 +61,8 @@ export function privateLauncher(spec: LaunchSpec, cwd: string, name: string): Pr
   const payload = join(dir, "launch payload.json");
   writeSecretFile(payload, JSON.stringify({ cwd, command: spec.command, args: spec.args, env: spec.env ?? {} }));
   // Named after the agent for the pane title; it outlives the payload so a rerun reaches the "already run" message.
-  const file = name.replace(/[^A-Za-z0-9_.-]/g, "_") || "agent";
+  // The .cjs extension fixes node's module type at the file, so a parent package.json cannot make it ESM.
+  const file = `${name.replace(/[^A-Za-z0-9_.-]/g, "_") || "agent"}.cjs`;
   const script = join(dir, file);
   writeFileSync(script, launcherSource(dir, payload, name), { mode: 0o700 });
   chmodSync(script, 0o700);
