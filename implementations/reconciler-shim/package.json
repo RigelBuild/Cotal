@@ -1,0 +1,38 @@
+{
+  "name": "@cotal-ai/reconciler-shim",
+  "description": "Serves the reconciler's seat commands as a Cotal endpoint and forwards each call to the Go reconciler over a private Unix socket.",
+  "version": "0.0.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Cotal-AI/Cotal.git",
+    "directory": "implementations/reconciler-shim"
+  },
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.smoke.json",
+    "build": "tsc -p tsconfig.json",
+    "test": "tsx smoke/shim.smoke.ts",
+    "prepublishOnly": "pnpm run build"
+  },
+  "dependencies": {
+    "@cotal-ai/core": "workspace:*",
+    "@nats-io/transport-node": "^3.4.0"
+  },
+  "devDependencies": {
+    "@cotal-ai/smoke-kit": "workspace:*",
+    "zod": "^4.6.7"
+  },
+  "files": [
+    "dist"
+  ]
+}
