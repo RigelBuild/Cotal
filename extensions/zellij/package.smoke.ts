@@ -211,8 +211,8 @@ try {
   };
   const launcher = privateLauncher(spec, temp, "launcher-smoke-agent");
   if (process.platform !== "win32") check("launcher payload is owner-only", (statSync(launcher.payload).mode & 0o777) === 0o600);
-  const script = join(launcher.dir, "launcher-smoke-agent");
-  check("launcher script is named after the agent so zellij's fallback pane title shows it", launcher.cwd === launcher.dir && launcher.argv.at(-1)?.endsWith("launcher-smoke-agent") === true);
+  const script = join(launcher.dir, "launcher-smoke-agent.cjs");
+  check("launcher script is named after the agent so zellij's fallback pane title shows it", launcher.cwd === launcher.dir && launcher.argv.at(-1)?.endsWith("launcher-smoke-agent.cjs") === true);
   check("launcher script contains no connector env values", !readFileSync(script, "utf8").includes(secret));
   const runLauncher = (preload: string[] = []) => spawnSync(process.execPath, [...preload, script], { cwd: launcher.cwd, encoding: "utf8" });
   const firstRun = runLauncher();
@@ -227,7 +227,7 @@ try {
   {
     const live = privateLauncher({ command: process.execPath, args: ["-e", "setTimeout(() => process.exit(3), 1500)"] }, temp, "exit-watch");
     check("a launcher not yet started reads as running", launcherState(live.dir) === "running");
-    const child = spawn(process.execPath, [join(live.dir, "exit-watch")], { cwd: live.cwd, stdio: "ignore" });
+    const child = spawn(process.execPath, [join(live.dir, "exit-watch.cjs")], { cwd: live.cwd, stdio: "ignore" });
     const started = Date.now();
     while (!existsSync(join(live.dir, "pid")) && Date.now() - started < 5_000) await new Promise((r) => setTimeout(r, 20));
     check("a running launcher reads as running, with no zellij call", launcherState(live.dir) === "running");
@@ -235,7 +235,7 @@ try {
     check("a seat exit is detected from the launcher's exit file", readFileSync(join(live.dir, "exit"), "utf8") === "3" && launcherState(live.dir) === "exited");
     child.kill();
     const killed = privateLauncher({ command: process.execPath, args: ["-e", "setTimeout(() => {}, 60_000)"] }, temp, "exit-kill");
-    const victim = spawn(process.execPath, [join(killed.dir, "exit-kill")], { cwd: killed.cwd, stdio: "ignore" });
+    const victim = spawn(process.execPath, [join(killed.dir, "exit-kill.cjs")], { cwd: killed.cwd, stdio: "ignore" });
     const t0 = Date.now();
     while (!existsSync(join(killed.dir, "pid")) && Date.now() - t0 < 5_000) await new Promise((r) => setTimeout(r, 20));
     victim.kill("SIGKILL");
@@ -245,7 +245,7 @@ try {
     check("a removed launcher dir reads as exited", launcherState(killed.dir) === "exited");
   }
   const escaped = privateLauncher(spec, temp, "evil\x9d0;owned\x9c\x1b[2Jname");
-  const escapedRun = spawnSync(process.execPath, [join(escaped.dir, "evil_0_owned___2Jname")], { encoding: "utf8" });
+  const escapedRun = spawnSync(process.execPath, [join(escaped.dir, "evil_0_owned___2Jname.cjs")], { encoding: "utf8" });
   check("launcher strips C0 and C1 controls from the pane title", escapedRun.stdout.startsWith("\x1b]0;evil0;owned[2Jname\x07"));
   if (process.platform !== "win32") {
     chmodSync(launcher.dir, 0o755);
@@ -281,6 +281,32 @@ try {
   }
 } finally {
   rmSync(temp, { recursive: true, force: true });
+}
+
+// Node takes a script's module type from the nearest package.json unless its extension fixes it.
+// A parent of "type": "module" must not stop the launcher or its seat.
+{
+  const esmRoot = mkdtempSync(join(tmpdir(), "cotal-zellij-esm-"));
+  const savedTmp = process.env.TMPDIR;
+  try {
+    writeFileSync(join(esmRoot, "package.json"), JSON.stringify({ type: "module" }));
+    process.env.TMPDIR = esmRoot;
+    const esm = privateLauncher(
+      { command: process.execPath, args: ["-e", "process.exit(process.env.PRIVATE_VALUE ? 0 : 1)"], env: { PRIVATE_VALUE: "1" } },
+      esmRoot,
+      "esm-agent",
+    );
+    const run = spawnSync(esm.argv[0] ?? "", esm.argv.slice(1), { cwd: esm.cwd, encoding: "utf8" });
+    check(
+      `a launcher under a "type": "module" parent starts its seat: ${JSON.stringify(run.stderr)}`,
+      run.status === 0 && run.stdout.startsWith("\x1b]0;esm-agent\x07") && readFileSync(join(esm.dir, "exit"), "utf8") === "0",
+    );
+    rmSync(esm.dir, { recursive: true, force: true });
+  } finally {
+    if (savedTmp === undefined) delete process.env.TMPDIR;
+    else process.env.TMPDIR = savedTmp;
+    rmSync(esmRoot, { recursive: true, force: true });
+  }
 }
 
 await withFakeZellij("missing-session", (logPath, session) => {

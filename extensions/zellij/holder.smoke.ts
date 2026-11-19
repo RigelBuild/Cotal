@@ -113,7 +113,7 @@ await check("spawn passes the private launcher to holder and records both proces
     const call = f.calls[0];
     assert.deepEqual(call, {
       file: holder,
-      args: ["start", "--name", seatName, "--", "./ztest-holder"],
+      args: ["start", "--name", seatName, "--", "./ztest-holder.cjs"],
       cwd: call?.cwd,
       timeout: 15_000,
     });
