@@ -9,6 +9,9 @@
  * at least {@link RENEWAL_SPACING_MS} apart.
  */
 
+/** The share of a lifetime at which a fixed-point renewal fires (the reconciler credential). */
+const FIXED_RENEWAL_POINT = 0.75;
+
 /** The share of a credential's lifetime the renewal point is drawn from. */
 const RENEWAL_WINDOW = Object.freeze({ from: 0.5, to: 0.8 });
 
@@ -77,6 +80,25 @@ export function armRenewal(space: string, issuedAtMs: number, expiresAtMs: numbe
  *  overdue: a renewal should already have replaced it. */
 export function renewalDeadlineMs(issuedAtMs: number, expiresAtMs: number): number {
   return issuedAtMs + RENEWAL_WINDOW.to * Math.max(0, expiresAtMs - issuedAtMs);
+}
+
+/** The instant a reconciler-style credential renews: exactly 75% of its lifetime. The one fixed point
+ *  in this module; every other caller keeps the randomized window of {@link armRenewal}. */
+export function fixedRenewalPointMs(issuedAtMs: number, expiresAtMs: number): number {
+  return issuedAtMs + FIXED_RENEWAL_POINT * Math.max(0, expiresAtMs - issuedAtMs);
+}
+
+/** Arm `renew` at {@link fixedRenewalPointMs}. */
+export function armFixedRenewal(issuedAtMs: number, expiresAtMs: number, renew: () => void): () => void {
+  const at = fixedRenewalPointMs(issuedAtMs, expiresAtMs);
+  let timer: NodeJS.Timeout;
+  const wait = (): void => {
+    const left = at - Date.now();
+    timer = setTimeout(left > MAX_TIMER_MS ? wait : renew, Math.min(Math.max(0, left), MAX_TIMER_MS));
+    timer.unref?.();
+  };
+  wait();
+  return () => clearTimeout(timer);
 }
 
 /** The wait before retry `attempt` (0-based) of a failed renewal or cleanup: `baseMs` doubling to

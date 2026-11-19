@@ -228,3 +228,6 @@ export { createToolResultRevocationCustody, recordToolResultRevocation, snapshot
 export * from "./service-host-contract.js";
 
 export { SERVICE_RENEWAL_TYP, validateServiceRenewalProof, type ServiceRenewalClaims, type ValidatedServiceRenewal } from "./service-renewal.js";
+export { KubeSecretStore, IN_CLUSTER_API_BASE, RECONCILER_SECRET_NAMESPACE, RECONCILER_SECRET_NAME, type KubeSecretStoreOptions } from "./kube-secret-store.js";
+export { createReconcilerCredentialAuthority, keepReconcilerCredentialRenewed, reconcilerRecordKey, secretRecordStore, startReconcilerCredential, RECONCILER_CREDS_KEY, type ReconcilerCaller, type ReconcilerCredentialAuthority, type ReconcilerIssued, type ReconcilerRecord, type ReconcilerRecordStore, type StartReconcilerCredentialOptions } from "./reconciler-credential.js";
+export type { ReconcilerSecretOptions } from "./service.js";

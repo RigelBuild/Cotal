@@ -214,7 +214,7 @@ try {
   check("reconciler has a bounded standing-renewable lifetime and its minted credential carries the 24-hour exp",
     reconcilerLifetime.class === "standing-renewable"
       && reconcilerLifetime.defaultTtlSeconds === STANDING_RENEWABLE_TTL_SEC
-      && reconcilerLifetime.renewalOwner === "reconciler service"
+      && reconcilerLifetime.renewalOwner === "auth-service"
       && Boolean(reconcilerClaims.uc.exp && reconcilerClaims.uc.exp - now <= STANDING_RENEWABLE_TTL_SEC + 5
         && reconcilerClaims.uc.exp - now > STANDING_RENEWABLE_TTL_SEC - 60),
     { lifetime: reconcilerLifetime, claims: reconcilerClaims.uc });
