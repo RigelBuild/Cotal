@@ -1,0 +1,3 @@
+# Placement participant operations over an owned broker with injected placement ports:
+# admission, lost-reply replay, cancellation and unrelated-caller progress.
+smoke:placement-wire:auth
