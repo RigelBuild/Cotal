@@ -1,36 +1,11 @@
 /**
- * Placement participant operations over the NATS wire, with the placement ports INJECTED: the
- * reconciler, authenticator and role-policy ports are set here; the production auth bin does not
- * set them, so this exercises the auth side of the wire, not production composition.
- *
- * The four operations (`verify-placement-enrollment`, `enrollment-effect-status`,
- * `close-enrollment-effect`, `retire-placement-enrollment`) are driven by a caller credential
- * minted with the `reconciler` profile.
- *
- * Proven:
- *  1. admission. Broker-level refusals: a manager-caller is refused at the auth describe, and a
- *     seat (agent) is refused at each command publish. Auth-level refusal: a reconciler-profile
- *     credential minted for ANOTHER principal is admitted by the broker and refused by auth's own
- *     reconciler check. The reconciler is admitted on every command.
- *  2. lost-reply replay: the close reaches auth and auth answers (seen on the wire), but the
- *     caller drops the reply; the retry gets the same answer and the effect exists once.
- *  3. cancellation: a close stalled inside auth is cancelled after publish; the caller is told the
- *     outcome is unknown, no effect exists while it is stalled, and the effect state read after
- *     the cancel is the one auth then committed.
- *  4. unrelated-seat progress: one caller's close is stalled in flight inside auth while a distinct
- *     caller's close on another effect completes; the stalled close completes once released.
- *
- * Every wait is event-gated (the command publish, a reply observed on the wire, or a held lock),
- * each bounded by a deadline. A stall is a held effect lock, never a sleep.
- *
- * Not covered from the design's auth task: authority renewal (owned by the renewal work), and
- * manager isolation beyond the broker-level manager refusal in case 1.
- *
+ * Placement participant operations over the NATS wire, with the placement ports injected (the production auth bin does not set them).
+ * Covers admission, lost-reply replay, cancellation and unrelated-caller progress; not authority renewal.
  * Run: pnpm smoke:placement-wire:auth   (needs nats-server on PATH)
  */
 import { randomUUID } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, rmSync, watch, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Kvm } from "@nats-io/kv";
@@ -217,7 +192,7 @@ let wide: AuthorityClient | undefined;
 
 /** Observe auth's replies to `caller` on the wire (the harness sees what the caller may drop).
  *  Resolves with the reply data for `effectId` the first time auth answers it. */
-function watchReply(caller: EpCaller, effectId: string): { reply: Promise<EffectView>; stop(): void } {
+async function watchReply(caller: EpCaller, effectId: string): Promise<{ reply: Promise<EffectView>; stop(): void }> {
   if (!wide) throw new Error("harness client not open");
   const { promise, resolve } = Promise.withResolvers<EffectView>();
   const sub = wide.nc.subscribe(epCallerReplyFilter(space, caller), {
@@ -231,6 +206,7 @@ function watchReply(caller: EpCaller, effectId: string): { reply: Promise<Effect
       }
     },
   });
+  await wide.nc.flush();
   return { reply: promise, stop: () => sub.unsubscribe() };
 }
 
@@ -238,6 +214,18 @@ function watchReply(caller: EpCaller, effectId: string): { reply: Promise<Effect
 const holdEffect = (effectId: string): Promise<HeldLock> =>
   acquireLockAsync(join(journal, `${effectId}.effect.lock`), { label: "smoke stall", waitMs: 5_000 });
 const closedOnDisk = (effectId: string): boolean => existsSync(join(journal, `${effectId}.closed.json`));
+
+/** Watch the journal for auth's own attempt on the effect lock (`publishAtomic`'s temp file), or for
+ *  the close record. Resolves "stalled" only if auth tried the held lock before any close landed. */
+function watchStall(effectId: string): { stalled: Promise<"stalled" | "closed">; stop(): void } {
+  const { promise, resolve } = Promise.withResolvers<"stalled" | "closed">();
+  const attempt = new RegExp(`^${effectId}\\.effect\\.lock\\.[0-9a-f]+\\.tmp$`);
+  const watcher = watch(journal, (_event, name) => {
+    if (name === `${effectId}.closed.json`) resolve("closed");
+    else if (name !== null && attempt.test(name)) resolve("stalled");
+  });
+  return { stalled: promise, stop: () => watcher.close() };
+}
 
 let plane: Awaited<ReturnType<typeof openAuthAuthorityPlane>> | undefined;
 try {
@@ -317,7 +305,7 @@ try {
   {
     const nc = await reconcilerConnection(RECONCILER);
     const effectId = randomUUID(), fenceId = randomUUID();
-    const watch = watchReply(RECONCILER, effectId);
+    const replies = await watchReply(RECONCILER, effectId);
     try {
       const ac = new AbortController();
       let sent = false;
@@ -325,7 +313,7 @@ try {
         { signal: ac.signal, onCommandPublished: () => { sent = true; ac.abort(); } });
       check("the first close was published, and the caller dropped its reply (outcome unknown)",
         sent && cancelledAfterSend(dropped), { sent, dropped });
-      const lost = await within(watch.reply, 10_000, "auth's reply to the first close");
+      const lost = await within(replies.reply, 10_000, "auth's reply to the first close");
       check("auth answered the first close on the wire (the effect was applied)",
         lost.state === "cancelled" && lost.noLateEffects === true && closedOnDisk(effectId), lost);
       const retry = await placement(nc, RECONCILER, EP_CMD_CLOSE_ENROLLMENT_EFFECT, { effectId, fenceId });
@@ -334,15 +322,16 @@ try {
       const status = await placement(nc, RECONCILER, EP_CMD_ENROLLMENT_EFFECT_STATUS, { effectId });
       check("the effect exists exactly once (status cancelled, no late effects)",
         dataOf(status)?.state === "cancelled" && dataOf(status)?.noLateEffects === true, status);
-    } finally { watch.stop(); await nc.close().catch(() => {}); }
+    } finally { replies.stop(); await nc.close().catch(() => {}); }
   }
 
   console.log("3. cancellation (close stalled in auth, cancelled after publish, then the state is read)");
   {
     const nc = await reconcilerConnection(RECONCILER);
     const effectId = randomUUID(), fenceId = randomUUID();
-    const watch = watchReply(RECONCILER, effectId);
+    const replies = await watchReply(RECONCILER, effectId);
     let lease: HeldLock | undefined = await holdEffect(effectId);
+    const gate = watchStall(effectId);
     try {
       const ac = new AbortController();
       let sent = false;
@@ -350,16 +339,17 @@ try {
         { signal: ac.signal, onCommandPublished: () => { sent = true; ac.abort(); } });
       check("the close was published and the cancelled caller is told the outcome is unknown",
         sent && cancelledAfterSend(outcome), { sent, outcome });
-      check("while the close is stalled in auth, no effect exists", !closedOnDisk(effectId));
+      const seen = await within(gate.stalled, 15_000, "auth's attempt on the held effect lock");
+      check("while the close is stalled in auth, no effect exists", seen === "stalled" && !closedOnDisk(effectId), seen);
       lease.release(); lease = undefined;
-      const landed = await within(watch.reply, 40_000, "auth's reply to the cancelled close");
+      const landed = await within(replies.reply, 40_000, "auth's reply to the cancelled close");
       check("after release, auth completes the cancelled caller's close", landed.state === "cancelled", landed);
       const status = await placement(nc, RECONCILER, EP_CMD_ENROLLMENT_EFFECT_STATUS, { effectId });
       check("the effect state read after the cancel is the committed close (cancelled, no late effects)",
         dataOf(status)?.state === "cancelled" && dataOf(status)?.noLateEffects === true, status);
       const retry = await placement(nc, RECONCILER, EP_CMD_CLOSE_ENROLLMENT_EFFECT, { effectId, fenceId });
       check("a later retry of the same close is clean", dataOf(retry)?.state === "cancelled", retry);
-    } finally { lease?.release(); watch.stop(); await nc.close().catch(() => {}); }
+    } finally { lease?.release(); gate.stop(); replies.stop(); await nc.close().catch(() => {}); }
   }
 
   console.log("4. unrelated-seat progress (one caller's close stalled in flight; another caller's close completes)");
@@ -368,20 +358,22 @@ try {
     const otherNc = await reconcilerConnection(RECONCILER_2);
     const stalledEffect = randomUUID(), otherEffect = randomUUID();
     let lease: HeldLock | undefined = await holdEffect(stalledEffect);
+    const gate = watchStall(stalledEffect);
     try {
       const { promise: sentA, resolve: markSentA } = Promise.withResolvers<void>();
       let stalledDone = false;
       const stalled = placement(stalledNc, RECONCILER, EP_CMD_CLOSE_ENROLLMENT_EFFECT, { effectId: stalledEffect, fenceId: randomUUID() },
         { deadlineMs: 40_000, onCommandPublished: markSentA }).finally(() => { stalledDone = true; });
       await within(sentA, 15_000, "the stalled close's publish");
+      const seen = await within(gate.stalled, 15_000, "auth's attempt on the held effect lock");
       const other = await placement(otherNc, RECONCILER_2, EP_CMD_CLOSE_ENROLLMENT_EFFECT, { effectId: otherEffect, fenceId: randomUUID() });
       check("a distinct caller's close completes while the first close is stalled in flight",
-        dataOf(other)?.state === "cancelled" && !stalledDone && !closedOnDisk(stalledEffect), { other, stalledDone });
+        seen === "stalled" && dataOf(other)?.state === "cancelled" && !stalledDone && !closedOnDisk(stalledEffect), { seen, other, stalledDone });
       lease.release(); lease = undefined;
       const done = await stalled;
       check("the stalled close completes once released", dataOf(done)?.state === "cancelled", done);
     } finally {
-      lease?.release();
+      lease?.release(); gate.stop();
       await stalledNc.close().catch(() => {});
       await otherNc.close().catch(() => {});
     }
