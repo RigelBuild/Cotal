@@ -11,7 +11,7 @@ import {
 } from "@cotal-ai/core";
 import { SMOKE_BROKER_TOKEN, createSuite, killAndAwaitExit, teardownOnSignal } from "@cotal-ai/smoke-kit";
 import {
-  SEATS_ENDPOINT, SEAT_CONTRACTS, runReconcilerShim, seatCallerCapabilities, seatClusterDocument, seatContractArtifactValues,
+  SEATS_ENDPOINT, SEAT_COMMANDS, SEAT_CONTRACTS, runReconcilerShim, seatCallerCapabilities, seatClusterDocument, seatContractArtifactValues,
   type ReconcilerShimHandle, type SeatsServeBundle,
 } from "../src/index.js";
 import { registerFixture, type FixtureMesh } from "../../registry/smoke/_fixture.js";
@@ -57,6 +57,30 @@ const executionBodies = (uid: string) => ({
     operationId: OP_ID, authority: authorityOf(uid),
     identity: { acceptanceId: ACCEPT_ID, enrollmentOperationId: ENROLL_ID, enrollmentRef: "enroll-ref-1", target: { seatName: "alpha", lifecycle: lifecycleOf(uid), generation: 1 }, intentDigest: DIGEST },
   },
+});
+const BIND_ID = "88888888-8888-4888-8888-888888888888";
+const RESERVATION_ID = "99999999-9999-4999-8999-999999999999";
+const STAGE_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+const EFFECT_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+const FENCE_ID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+const targetOf = (uid: string) => ({ seatName: "alpha", lifecycle: lifecycleOf(uid), generation: 1 });
+const boundAuthorityOf = (uid: string) => ({
+  ...authorityOf(uid),
+  subject: { acceptanceId: ACCEPT_ID, enrollmentOperationId: ENROLL_ID, phase: "bound", bindingId: BIND_ID, target: targetOf(uid) },
+});
+const podExecutionOf = (uid: string) => ({
+  target: targetOf(uid), runtimeKey: "runtime-1", operationId: OP_ID, podUid: "pod-uid-1", namespace: "cotal-seats", podName: "alpha-0", pvcUid: "pvc-uid-1",
+});
+// Valid bodies for the seven key and stage commands, shaped by launch-protocol.md § Agent management,
+// § Execution admission and launch fence and § Lifecycle keys and routing.
+const keyAndStageBodies = (uid: string) => ({
+  keyPlacement: { bindingId: BIND_ID, target: targetOf(uid), intentDigest: DIGEST },
+  reserveKeyAuthorization: { operationId: OP_ID, bindingId: BIND_ID, target: targetOf(uid), expectedAuthorizationRevision: 3 },
+  finishKeyAuthorization: { reservationId: RESERVATION_ID, operationId: OP_ID },
+  executionAdmit: { authority: boundAuthorityOf(uid), operationId: OP_ID, kind: "bootstrap", stageId: STAGE_ID, execution: podExecutionOf(uid) },
+  executionSettle: { effectId: EFFECT_ID },
+  executionRegisterStage: { authority: boundAuthorityOf(uid), stageId: STAGE_ID, operationId: OP_ID, keyId: "key-1" },
+  terminalizePrelaunch: { operationId: OP_ID, acceptanceId: ACCEPT_ID, fenceId: FENCE_ID },
 });
 
 const suite = createSuite();
@@ -157,7 +181,9 @@ try {
   // proves the shim's own schema check refuses before the socket.
   const rawNc = await dialerFor(servers)({ servers, ...standaloneConnectOpts({ creds: callerCreds, tls: false }) });
   const unchecked = (command: string, args: Record<string, unknown>): Promise<Outcome> => {
-    const real = SEAT_CONTRACTS[command]!;
+    const real = SEAT_CONTRACTS[command];
+    // An unserved token has no contract to validate against; the endpoint's not-found is the answer.
+    if (!real) return Promise.resolve({ error: new EpEnvelopeError("not-found", `${command} is not served by the shim`) });
     // SAFETY: smoke-only; the stub validator replaces the caller's check so the body reaches the shim.
     const admitAll = Object.assign(() => true, { errors: null }) as unknown as typeof real.input.validate;
     return epCall(rawNc, space, { mode: "one" }, {
@@ -168,6 +194,30 @@ try {
       (error: unknown): Outcome => ({ error }),
     );
   };
+  // Refusals before the socket: one malformed body per new command, plus the bound subject that accepted-intent
+  // and bind-enrollment now refuse (launch-protocol.md § Execution admission and launch fence), and the review's M2 cases.
+  const bodies = executionBodies(lifecycleUid);
+  const stage = keyAndStageBodies(lifecycleUid);
+  const refusals: [name: string, command: string, body: Record<string, unknown>][] = [
+    ["key-placement refuses a bare-hex intentDigest as bad-request, and it never reaches the socket", "key-placement", { ...stage.keyPlacement, intentDigest: "ab".repeat(32) }],
+    ["reserve-key-authorization refuses a negative revision as bad-request, and it never reaches the socket", "reserve-key-authorization", { ...stage.reserveKeyAuthorization, expectedAuthorizationRevision: -1 }],
+    ["finish-key-authorization refuses a body without operationId as bad-request, and it never reaches the socket", "finish-key-authorization", { reservationId: RESERVATION_ID }],
+    ["execution-admit refuses a non-string podUid as bad-request, and it never reaches the socket", "execution-admit", { ...stage.executionAdmit, execution: { ...podExecutionOf(lifecycleUid), podUid: 7 } }],
+    ["execution-settle refuses a short effectId as bad-request, and it never reaches the socket", "execution-settle", { effectId: "short" }],
+    ["execution-register-stage refuses a body without keyId as bad-request, and it never reaches the socket", "execution-register-stage", { authority: boundAuthorityOf(lifecycleUid), stageId: STAGE_ID, operationId: OP_ID }],
+    ["terminalize-prelaunch refuses a body without fenceId as bad-request, and it never reaches the socket", "terminalize-prelaunch", { operationId: OP_ID, acceptanceId: ACCEPT_ID }],
+    ["accepted-intent refuses a bound subject as bad-request, and it never reaches the socket", "accepted-intent", { acceptanceId: ACCEPT_ID, authority: boundAuthorityOf(lifecycleUid), actorTokenHash: "cd".repeat(32) }],
+    ["bind-enrollment refuses a bound subject as bad-request, and it never reaches the socket", "bind-enrollment", { operationId: OP_ID, authority: boundAuthorityOf(lifecycleUid), identity: bodies.bindEnrollment.identity }],
+    ["accept-intent refuses an extra key on intent as bad-request, and it never reaches the socket", "accept-intent", { ...bodies.acceptIntent, intent: { ...bodies.acceptIntent.intent, bogus: true } }],
+    ["accepted-intent refuses a bare-hex intentDigest with a sha256-prefixed actorTokenHash as bad-request, and it never reaches the socket", "accepted-intent", { acceptanceId: ACCEPT_ID, authority: { ...authorityOf(lifecycleUid), intentDigest: "ab".repeat(32) }, actorTokenHash: `sha256:${"cd".repeat(32)}` }],
+    ["bind-enrollment refuses an identity without a target as bad-request, and it never reaches the socket", "bind-enrollment", { operationId: OP_ID, authority: authorityOf(lifecycleUid), identity: { acceptanceId: ACCEPT_ID, enrollmentOperationId: ENROLL_ID, enrollmentRef: "enroll-ref-1", intentDigest: DIGEST } }],
+  ];
+  for (const [name, command, body] of refusals) {
+    const beforeCase = fake.received.length;
+    const outcome = await unchecked(command, body);
+    suite.check(name, codeOf(outcome) === "bad-request" && fake.received.length === beforeCase,
+      { code: codeOf(outcome), received: fake.received.length - beforeCase, shimError });
+  }
   const before = fake.received.length;
   const extraKey = await unchecked("pause", { ...op, bogus: true });
   const badBase64 = await unchecked("handoff-upload", { request: handoffRequest, content: "not base64!" });
@@ -198,10 +248,17 @@ try {
       && Buffer.from(String(sent.args.content), "base64").equals(bytes),
     { upload, sent, shimError });
 
-  // The three execution commands are served: each is forwarded under its own command name. A token
+  // The execution and key commands are served: each is forwarded under its own command name. A token
   // the catalogue does not list is refused before it reaches the socket.
-  const bodies = executionBodies(lifecycleUid);
-  for (const [command, body] of [["accept-intent", bodies.acceptIntent], ["accepted-intent", bodies.acceptedIntent], ["bind-enrollment", bodies.bindEnrollment]] as const) {
+  suite.check("the endpoint serves exactly the 22 Wire v1 commands", SEAT_COMMANDS.length === 22, { served: SEAT_COMMANDS.length });
+  const forwards = [
+    ["accept-intent", bodies.acceptIntent], ["accepted-intent", bodies.acceptedIntent], ["bind-enrollment", bodies.bindEnrollment],
+    ["key-placement", stage.keyPlacement], ["reserve-key-authorization", stage.reserveKeyAuthorization],
+    ["finish-key-authorization", stage.finishKeyAuthorization], ["execution-admit", stage.executionAdmit],
+    ["execution-settle", stage.executionSettle], ["execution-register-stage", stage.executionRegisterStage],
+    ["terminalize-prelaunch", stage.terminalizePrelaunch],
+  ] as const;
+  for (const [command, body] of forwards) {
     const outcome = await invoke(command, body);
     const sent = fake.received.at(-1);
     suite.check(`${command} is served and forwarded as wave-seats.${command}`,
@@ -209,10 +266,11 @@ try {
       { command, outcome: codeOf(outcome), shimError });
   }
   const beforeUnlisted = fake.received.length;
-  const unlisted = await invoke("enroll-placement", {});
-  suite.check("a token outside the seat catalogue is refused as not-found and never reaches the socket",
-    codeOf(unlisted) === "not-found" && fake.received.length === beforeUnlisted,
-    { unlisted: codeOf(unlisted), shimError });
+  const unlisted: Outcome[] = [];
+  for (const command of ["enroll-placement", "execution-effect", "execution-fence", "execution-fence-status"]) unlisted.push(await invoke(command, {}));
+  suite.check("tokens outside the seat catalogue are refused as not-found and never reach the socket",
+    unlisted.every((o) => codeOf(o) === "not-found") && fake.received.length === beforeUnlisted,
+    { unlisted: unlisted.map(codeOf), shimError });
 
   for (let i = 0; i < 20 && fake.openSockets() > 0; i++) await new Promise((r) => setTimeout(r, 50));
   suite.check("every reconciler connection is closed after its call", fake.received.length > 0 && fake.openSockets() === 0,
